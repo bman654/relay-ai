@@ -23,6 +23,8 @@ export interface CodexProxyRoute {
   baseURL?: string;
   upstreamModelId: string;
   providerId?: string;
+  authType?: 'api' | 'oauth' | 'none';
+  oauthAccountId?: string;
   supportedParameters?: string[];
   reasoning?: boolean;
   interleavedReasoningField?: string;
@@ -120,6 +122,8 @@ export async function startCodexProxy(
       apiKey: route.apiKey,
       baseURL: route.baseURL,
       providerId: route.modelId,
+      authType: route.authType,
+      oauthAccountId: route.oauthAccountId,
       vertex: route.vertex,
     }));
   }

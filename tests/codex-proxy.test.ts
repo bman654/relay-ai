@@ -177,6 +177,17 @@ describe('resolveCodexRoute', () => {
     expect(route.tier).toBe('direct');
   });
 
+  it('routes OpenAI OAuth through the proxy', async () => {
+    const { resolveCodexRoute } = await import('../src/codex/routing.js');
+    const route = resolveCodexRoute(
+      { id: 'openai', name: 'OpenAI', apiKey: 'oauth-token', authType: 'oauth', models: [] },
+      { id: 'gpt-5.5', name: 'GPT', family: '', brand: '', modelFormat: 'openai', upstreamModelId: 'gpt-5.5', npm: '@ai-sdk/openai' },
+      'oauth-token',
+    );
+    expect(route.tier).toBe('proxy');
+    expect(route.authType).toBe('oauth');
+  });
+
   it('routes Anthropic to tier 2 proxy', async () => {
     const { resolveCodexRoute } = await import('../src/codex/routing.js');
     const route = resolveCodexRoute(

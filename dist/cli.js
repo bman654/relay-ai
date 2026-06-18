@@ -78,6 +78,104 @@ function classifyModelFormat(modelId, providerNpm) {
 }
 var VERSION = "0.2.6";
 
+// src/oauth/pkce.ts
+function positiveSecondsToMs(value, defaultMs) {
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1e3 : defaultMs;
+}
+async function sleepMs(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// src/oauth/openai.ts
+var CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+var ISSUER = "https://auth.openai.com";
+var OAUTH_POLLING_SAFETY_MARGIN_MS = 3e3;
+var DEVICE_CODE_DEFAULT_EXPIRES_MS = 5 * 60 * 1e3;
+function extractOpenAiAccountId(tokens) {
+  const token = tokens.id_token ?? tokens.access_token;
+  if (!token) return void 0;
+  const parts = token.split(".");
+  if (parts.length !== 3) return void 0;
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    return claims.chatgpt_account_id ?? claims["https://api.openai.com/auth"]?.chatgpt_account_id ?? claims.organizations?.[0]?.id;
+  } catch {
+    return void 0;
+  }
+}
+async function refreshOpenAiAccessToken(refreshToken) {
+  const response = await fetch(`${ISSUER}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID
+    }).toString()
+  });
+  if (!response.ok) {
+    throw new Error(`OpenAI token refresh failed (${response.status})`);
+  }
+  return response.json();
+}
+async function runOpenAiDeviceCodeFlow(onDeviceCode, opts) {
+  const sleep3 = opts?.sleep ?? sleepMs;
+  const now = opts?.now ?? (() => Date.now());
+  const deviceResponse = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": `relay-ai/${VERSION}`
+    },
+    body: JSON.stringify({ client_id: CLIENT_ID })
+  });
+  if (!deviceResponse.ok) {
+    throw new Error("Failed to initiate OpenAI device authorization");
+  }
+  const deviceData = await deviceResponse.json();
+  const intervalMs = Math.max(parseInt(deviceData.interval, 10) || 5, 1) * 1e3;
+  const deadline = now() + positiveSecondsToMs(deviceData.expires_in, DEVICE_CODE_DEFAULT_EXPIRES_MS);
+  onDeviceCode({ url: `${ISSUER}/codex/device`, userCode: deviceData.user_code });
+  while (now() < deadline) {
+    const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": `relay-ai/${VERSION}`
+      },
+      body: JSON.stringify({
+        device_auth_id: deviceData.device_auth_id,
+        user_code: deviceData.user_code
+      })
+    });
+    if (response.ok) {
+      const data = await response.json();
+      const tokenResponse = await fetch(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: data.authorization_code,
+          redirect_uri: `${ISSUER}/deviceauth/callback`,
+          client_id: CLIENT_ID,
+          code_verifier: data.code_verifier
+        }).toString()
+      });
+      if (!tokenResponse.ok) {
+        throw new Error(`OpenAI token exchange failed (${tokenResponse.status})`);
+      }
+      const tokens = await tokenResponse.json();
+      return { tokens, accountId: extractOpenAiAccountId(tokens) };
+    }
+    if (response.status !== 403 && response.status !== 404) {
+      throw new Error(`OpenAI device authorization failed (${response.status})`);
+    }
+    await sleep3(Math.min(intervalMs + OAUTH_POLLING_SAFETY_MARGIN_MS, Math.max(0, deadline - now())));
+  }
+  throw new Error("OpenAI device authorization timed out");
+}
+
 // src/provider-factory.ts
 var RESPONSES_ONLY_PREFIXES = [
   "gpt-5.4",
@@ -144,7 +242,15 @@ async function createLanguageModel(spec) {
   }
   if (npm === "@ai-sdk/openai") {
     const { createOpenAI } = await import("@ai-sdk/openai");
-    const openai = createOpenAI({ apiKey });
+    const accountId = spec.authType === "oauth" ? spec.oauthAccountId ?? extractOpenAiAccountId({ access_token: apiKey }) : void 0;
+    const openai = createOpenAI(spec.authType === "oauth" ? {
+      apiKey,
+      baseURL: "https://chatgpt.com/backend-api/codex",
+      headers: {
+        ...accountId ? { "ChatGPT-Account-Id": accountId } : {},
+        originator: "relay-ai"
+      }
+    } : { apiKey });
     return modelPrefersResponsesApi(modelId) ? openai.responses(modelId) : openai.chat(modelId);
   }
   if (npm === "@ai-sdk/xai") {
@@ -1756,11 +1862,13 @@ function resolveCodexRoute(provider, model, apiKey) {
     contextWindow: model.contextWindow,
     modelId: model.id,
     providerId: provider.id,
+    authType: provider.authType,
+    oauthAccountId: provider.oauthAccountId,
     supportedParameters: model.supportedParameters,
     reasoning: model.reasoning,
     interleavedReasoningField: model.interleavedReasoningField
   };
-  if (provider.id === "openai" && model.modelFormat === "openai") {
+  if (provider.id === "openai" && provider.authType !== "oauth" && model.modelFormat === "openai") {
     return { tier: "direct", ...base };
   }
   return { tier: "proxy", ...base };
@@ -1783,6 +1891,8 @@ function buildCodexProxyRoutesForProvider(provider, apiKey, selectedModelId, age
       baseURL: route.baseURL,
       upstreamModelId: route.upstreamModelId,
       providerId: route.providerId,
+      authType: route.authType,
+      oauthAccountId: route.oauthAccountId,
       supportedParameters: route.supportedParameters,
       reasoning: route.reasoning,
       interleavedReasoningField: route.interleavedReasoningField
@@ -2446,104 +2556,6 @@ function supportsNativeOAuth(providerId) {
   return NATIVE_OAUTH_PROVIDER_IDS.includes(providerId);
 }
 
-// src/oauth/pkce.ts
-function positiveSecondsToMs(value, defaultMs) {
-  const seconds = Number(value);
-  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1e3 : defaultMs;
-}
-async function sleepMs(ms) {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// src/oauth/openai.ts
-var CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-var ISSUER = "https://auth.openai.com";
-var OAUTH_POLLING_SAFETY_MARGIN_MS = 3e3;
-var DEVICE_CODE_DEFAULT_EXPIRES_MS = 5 * 60 * 1e3;
-function extractOpenAiAccountId(tokens) {
-  const token = tokens.id_token ?? tokens.access_token;
-  if (!token) return void 0;
-  const parts = token.split(".");
-  if (parts.length !== 3) return void 0;
-  try {
-    const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString());
-    return claims.chatgpt_account_id ?? claims["https://api.openai.com/auth"]?.chatgpt_account_id ?? claims.organizations?.[0]?.id;
-  } catch {
-    return void 0;
-  }
-}
-async function refreshOpenAiAccessToken(refreshToken) {
-  const response = await fetch(`${ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID
-    }).toString()
-  });
-  if (!response.ok) {
-    throw new Error(`OpenAI token refresh failed (${response.status})`);
-  }
-  return response.json();
-}
-async function runOpenAiDeviceCodeFlow(onDeviceCode, opts) {
-  const sleep3 = opts?.sleep ?? sleepMs;
-  const now = opts?.now ?? (() => Date.now());
-  const deviceResponse = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": `relay-ai/${VERSION}`
-    },
-    body: JSON.stringify({ client_id: CLIENT_ID })
-  });
-  if (!deviceResponse.ok) {
-    throw new Error("Failed to initiate OpenAI device authorization");
-  }
-  const deviceData = await deviceResponse.json();
-  const intervalMs = Math.max(parseInt(deviceData.interval, 10) || 5, 1) * 1e3;
-  const deadline = now() + positiveSecondsToMs(deviceData.expires_in, DEVICE_CODE_DEFAULT_EXPIRES_MS);
-  onDeviceCode({ url: `${ISSUER}/codex/device`, userCode: deviceData.user_code });
-  while (now() < deadline) {
-    const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": `relay-ai/${VERSION}`
-      },
-      body: JSON.stringify({
-        device_auth_id: deviceData.device_auth_id,
-        user_code: deviceData.user_code
-      })
-    });
-    if (response.ok) {
-      const data = await response.json();
-      const tokenResponse = await fetch(`${ISSUER}/oauth/token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code: data.authorization_code,
-          redirect_uri: `${ISSUER}/deviceauth/callback`,
-          client_id: CLIENT_ID,
-          code_verifier: data.code_verifier
-        }).toString()
-      });
-      if (!tokenResponse.ok) {
-        throw new Error(`OpenAI token exchange failed (${tokenResponse.status})`);
-      }
-      const tokens = await tokenResponse.json();
-      return { tokens, accountId: extractOpenAiAccountId(tokens) };
-    }
-    if (response.status !== 403 && response.status !== 404) {
-      throw new Error(`OpenAI device authorization failed (${response.status})`);
-    }
-    await sleep3(Math.min(intervalMs + OAUTH_POLLING_SAFETY_MARGIN_MS, Math.max(0, deadline - now())));
-  }
-  throw new Error("OpenAI device authorization timed out");
-}
-
 // src/oauth/github.ts
 var CLIENT_ID2 = "Iv1.b507a08c87ecfe98";
 var DEVICE_CODE_URL = "https://github.com/login/device/code";
@@ -2940,6 +2952,12 @@ async function resolveProviderCredential(providerId, authRef, diag) {
     return readGlobalOpencodeCredential(diag);
   }
   return readProviderSecret(parsed.account, diag);
+}
+async function resolveProviderOAuthAccountId(authRef, diag) {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== "keyring" || !oauthProviderIdFromAccount(parsed.account)) return void 0;
+  const raw = await readKeyringAccount(parsed.account, diag);
+  return parseStoredOAuthCredential(raw)?.accountId;
 }
 function decodeProviderSecret(raw) {
   if (!raw) return null;
@@ -5201,22 +5219,25 @@ function translateRequest(body, npm, options) {
   annotateToolNames(messages);
   const baseSystem = systemToString(body.system);
   const inlineParts = inlineSystemText(messages);
-  const system = [baseSystem, ...inlineParts].filter((s) => s && s.trim()).join("\n\n") || void 0;
+  const systemText = [baseSystem, ...inlineParts].filter((s) => s && s.trim()).join("\n\n") || (options?.openAiOAuth ? "You are a coding assistant." : void 0);
   const upstreamTools = resolveUpstreamTools(
     body.tools,
     messages
   );
   const effort = anthropicEffortFromRequest(body) ?? options?.defaultEffort;
   const providerOptions = deepMergeProviderOptions(
-    thinkingProviderOptions(npm),
-    effortProviderOptions(npm, effort, body.model, options?.reasoningMetadata)
+    deepMergeProviderOptions(
+      thinkingProviderOptions(npm),
+      effortProviderOptions(npm, effort, body.model, options?.reasoningMetadata)
+    ),
+    options?.openAiOAuth && systemText ? { openai: { instructions: systemText } } : void 0
   );
   return {
-    system,
+    system: options?.openAiOAuth ? void 0 : systemText,
     messages: translateMessages(messages, npm),
     tools: translateTools(upstreamTools.length ? upstreamTools : void 0),
     toolChoice: translateToolChoice(body.tool_choice),
-    maxOutputTokens: body.max_tokens,
+    maxOutputTokens: options?.openAiOAuth ? void 0 : body.max_tokens,
     temperature: body.temperature,
     providerOptions
   };
@@ -5534,6 +5555,7 @@ function startProxyCatalog(routes, defaultAliasId, debug = false) {
       }
       if (isSdkMigratedNpm(route.npm)) {
         const params = translateRequest(anthropicBody, route.npm, {
+          openAiOAuth: route.npm === "@ai-sdk/openai" && route.authType === "oauth",
           reasoningMetadata: {
             providerId: route.providerId,
             apiBaseUrl: route.baseURL,
@@ -5551,7 +5573,9 @@ function startProxyCatalog(routes, defaultAliasId, debug = false) {
             modelId: route.realModelId,
             apiKey,
             baseURL: route.baseURL,
-            providerId: route.aliasId
+            providerId: route.aliasId,
+            authType: route.authType,
+            oauthAccountId: route.oauthAccountId
           });
           if (clientWantsStream) {
             res.writeHead(200, {
@@ -5620,6 +5644,8 @@ function startProxy(completionsUrl, modelId, debug = false, contextWindow, sdk) 
     npm: sdk?.npm,
     baseURL: sdk?.baseURL,
     providerId: sdk?.providerId,
+    authType: sdk?.authType,
+    oauthAccountId: sdk?.oauthAccountId,
     supportedParameters: sdk?.supportedParameters,
     reasoning: sdk?.reasoning,
     interleavedReasoningField: sdk?.interleavedReasoningField
@@ -5641,6 +5667,8 @@ function localModelToRoute(lp, model) {
     npm: model.npm,
     baseURL: model.apiBaseUrl,
     providerId: lp.id,
+    authType: lp.authType,
+    oauthAccountId: lp.oauthAccountId,
     supportedParameters: model.supportedParameters,
     reasoning: model.reasoning,
     interleavedReasoningField: model.interleavedReasoningField
@@ -5871,6 +5899,7 @@ function materializeOne(provider, resolveCredential, agent) {
     id: provider.id,
     name: provider.name,
     apiKey,
+    authType: provider.authType,
     models
   };
 }
@@ -5888,11 +5917,19 @@ function materializeRegistry(registry, resolveCredential, opts) {
 async function loadRegistryProviders(diag, opts) {
   const registry = loadRegistry();
   const keys = /* @__PURE__ */ new Map();
+  const oauthAccountIds = /* @__PURE__ */ new Map();
   for (const provider of registry.providers) {
     const key = await resolveProviderCredential(provider.id, provider.authRef, diag);
     if (key) keys.set(provider.id, key);
+    if (provider.authType === "oauth") {
+      const accountId = await resolveProviderOAuthAccountId(provider.authRef, diag);
+      if (accountId) oauthAccountIds.set(provider.id, accountId);
+    }
   }
-  return materializeRegistry(registry, (provider) => keys.get(provider.id) ?? null, opts);
+  return materializeRegistry(registry, (provider) => keys.get(provider.id) ?? null, opts).map((provider) => ({
+    ...provider,
+    oauthAccountId: oauthAccountIds.get(provider.id)
+  }));
 }
 
 // src/provider-catalog.ts
@@ -6042,6 +6079,8 @@ function localProvidersToServerModels(localProviders) {
       npm: model.modelFormat === "openai" ? model.npm || "@ai-sdk/openai-compatible" : model.npm,
       apiBaseUrl: model.apiBaseUrl,
       apiKey: provider.apiKey,
+      authType: provider.authType,
+      oauthAccountId: provider.oauthAccountId,
       contextWindow: model.contextWindow,
       supportedParameters: model.supportedParameters,
       reasoning: model.reasoning,
@@ -6279,12 +6318,15 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
         apiKey,
         baseURL: model.apiBaseUrl,
         providerId: model.providerId ?? model.sourceBackend,
+        authType: model.authType,
+        oauthAccountId: model.oauthAccountId,
         vertex: options.vertex
       });
       modelCache.set(cacheKey, languageModel);
     }
     const params = translateRequest(body, model.npm, {
       defaultEffort: anthropicEffortFromRequest(body) ? void 0 : model.defaultEffort,
+      openAiOAuth: model.npm === "@ai-sdk/openai" && model.authType === "oauth",
       reasoningMetadata: {
         providerId: model.providerId,
         apiBaseUrl: model.apiBaseUrl,
@@ -9159,6 +9201,8 @@ async function startCodexProxy(routes, options = {}) {
       apiKey: route.apiKey,
       baseURL: route.baseURL,
       providerId: route.modelId,
+      authType: route.authType,
+      oauthAccountId: route.oauthAccountId,
       vertex: route.vertex
     }));
   }
@@ -9790,7 +9834,9 @@ function buildCodexProxyRoutesFromResolved(resolved, providersById) {
       apiKey: route.apiKey,
       baseURL: route.baseURL,
       upstreamModelId: route.upstreamModelId,
-      providerId: route.providerId
+      providerId: route.providerId,
+      authType: route.authType,
+      oauthAccountId: route.oauthAccountId
     };
   }).filter((r) => r !== void 0);
 }
@@ -13274,6 +13320,8 @@ Error: ${launchPlan.error}
           baseURL: selectedModel.apiBaseUrl,
           upstreamModelId: selectedModel.upstreamModelId,
           providerId: activeProvider.id,
+          authType: activeProvider.authType,
+          oauthAccountId: activeProvider.oauthAccountId,
           supportedParameters: selectedModel.supportedParameters,
           reasoning: selectedModel.reasoning,
           interleavedReasoningField: selectedModel.interleavedReasoningField

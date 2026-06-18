@@ -171,6 +171,7 @@ describe('materializeRegistry', () => {
       name: 'OpenAI',
       enabled: true,
       authRef: 'keyring:provider:openai',
+      authType: 'oauth',
       api: { npm: '@ai-sdk/openai' },
       addedAt: '2026-06-09T00:00:00.000Z',
       modelsCache: {
@@ -188,6 +189,7 @@ describe('materializeRegistry', () => {
     expect(locals).toHaveLength(1);
     expect(locals[0]?.models[0]?.upstreamModelId).toBe('gpt-5.5');
     expect(locals[0]?.apiKey).toBe('sk-test');
+    expect(locals[0]?.authType).toBe('oauth');
   });
 
   it('returns empty when credential missing', () => {

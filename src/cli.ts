@@ -887,6 +887,8 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
           baseURL: selectedModel.apiBaseUrl,
           upstreamModelId: selectedModel.upstreamModelId,
           providerId: activeProvider.id,
+          authType: activeProvider.authType,
+          oauthAccountId: activeProvider.oauthAccountId,
           supportedParameters: selectedModel.supportedParameters,
           reasoning: selectedModel.reasoning,
           interleavedReasoningField: selectedModel.interleavedReasoningField,
