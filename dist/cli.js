@@ -4079,7 +4079,7 @@ var PROVIDER_TEMPLATES = [
   }
 ];
 function listSupportedTemplates() {
-  return PROVIDER_TEMPLATES.filter((t) => t.supported && t.authType === "api" && t.addable !== false);
+  return PROVIDER_TEMPLATES.filter((t) => t.supported && t.authType === "api" && t.addable !== false).sort((a, b) => a.name.localeCompare(b.name));
 }
 function listAddableTemplates(configuredIds = []) {
   const configured = new Set(configuredIds);
@@ -6059,7 +6059,7 @@ async function resolveProvidersForDisplay() {
       inRegistry: true
     });
   }
-  return entries;
+  return entries.sort((a, b) => a.name.localeCompare(b.name));
 }
 function localProvidersToServerModels(localProviders) {
   return localProviders.flatMap(
@@ -8002,7 +8002,7 @@ ${pc10.bold("Usage:")}
 ${pc10.bold("Subcommands:")}
   (none)      Provider hub wizard ${pc10.dim("[Phase 1.1]")}
   add         Add a provider (Groq, Mistral, Together AI, \u2026) ${pc10.dim("[Phase 1.1]")}
-  import      import providers from 'open code CLI' (one-time) ${pc10.dim("[Phase 1.0]")}
+  import      Import providers from OpenCode CLI (one-time) ${pc10.dim("[Phase 1.0]")}
   auth        Sign in with OAuth (xAI, OpenAI ChatGPT) ${pc10.dim("[Phase 2]")}
   list        Show configured providers ${pc10.dim("[Phase 1.0]")}
   remove      Remove a provider by id ${pc10.dim("[Phase 1.1]")}
@@ -8374,7 +8374,7 @@ async function runProvidersAdd() {
   const options = [
     {
       value: "import",
-      label: "import providers from 'open code CLI'",
+      label: "Import providers from OpenCode CLI",
       hint: hasOpencode ? "Import Groq, OpenAI, etc. from your OpenCode config" : "Requires OpenCode CLI"
     }
   ];
@@ -8533,7 +8533,7 @@ async function runProvidersHub() {
       options.push({ value: "refresh-all", label: "\u21BA Refresh all models", hint: "Update model lists for all providers" });
     }
     if (hasOpencode) {
-      options.push({ value: "import", label: "\u2192 import providers from 'open code CLI'", hint: "One-time import" });
+      options.push({ value: "import", label: "\u2192 Import providers from OpenCode CLI", hint: "One-time import" });
     }
     options.push({ value: "done", label: "Done", hint: "" });
     const choice = await p10.select({

@@ -125,10 +125,10 @@ describe('resolveProvidersForDisplay', () => {
     ]);
 
     const entries = await resolveProvidersForDisplay();
-    expect(entries.map(e => e.id)).toEqual(['opencode-cloud', 'groq']);
-    expect(entries[0]?.name).toBe('OpenCode Zen / Go');
-    expect(entries[0]?.cloudBuiltin).toBe('opencode');
-    expect(entries[0]?.modelCount).toBe(2);
+    expect(entries.map(e => e.id)).toEqual(['groq', 'opencode-cloud']);
+    expect(entries[1]?.name).toBe('OpenCode Zen / Go');
+    expect(entries[1]?.cloudBuiltin).toBe('opencode');
+    expect(entries[1]?.modelCount).toBe(2);
   });
 
   it('does not show separate Zen and Go rows when registry stubs exist', async () => {

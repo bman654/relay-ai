@@ -192,7 +192,7 @@ export async function resolveProvidersForDisplay(): Promise<ProviderDisplayEntry
     });
   }
 
-  return entries;
+  return entries.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** True when Zen/Go are already usable (registry entry or live OpenCode API key). */

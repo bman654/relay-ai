@@ -253,7 +253,9 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
 ];
 
 export function listSupportedTemplates(): ProviderTemplate[] {
-  return PROVIDER_TEMPLATES.filter(t => t.supported && t.authType === 'api' && t.addable !== false);
+  return PROVIDER_TEMPLATES
+    .filter(t => t.supported && t.authType === 'api' && t.addable !== false)
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Supported templates not yet present in the user's registry. */

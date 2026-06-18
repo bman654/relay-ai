@@ -114,7 +114,7 @@ ${pc.bold('Usage:')}
 ${pc.bold('Subcommands:')}
   (none)      Provider hub wizard ${pc.dim('[Phase 1.1]')}
   add         Add a provider (Groq, Mistral, Together AI, …) ${pc.dim('[Phase 1.1]')}
-  import      import providers from 'open code CLI' (one-time) ${pc.dim('[Phase 1.0]')}
+  import      Import providers from OpenCode CLI (one-time) ${pc.dim('[Phase 1.0]')}
   auth        Sign in with OAuth (xAI, OpenAI ChatGPT) ${pc.dim('[Phase 2]')}
   list        Show configured providers ${pc.dim('[Phase 1.0]')}
   remove      Remove a provider by id ${pc.dim('[Phase 1.1]')}
@@ -566,7 +566,7 @@ export async function runProvidersAdd(): Promise<number> {
   const options: Array<{ value: string; label: string; hint: string }> = [
     {
       value: 'import',
-      label: "import providers from 'open code CLI'",
+      label: 'Import providers from OpenCode CLI',
       hint: hasOpencode ? 'Import Groq, OpenAI, etc. from your OpenCode config' : 'Requires OpenCode CLI',
     },
   ];
@@ -746,7 +746,7 @@ export async function runProvidersHub(): Promise<number> {
       options.push({ value: 'refresh-all', label: '↺ Refresh all models', hint: 'Update model lists for all providers' });
     }
     if (hasOpencode) {
-      options.push({ value: 'import', label: "→ import providers from 'open code CLI'", hint: 'One-time import' });
+      options.push({ value: 'import', label: '→ Import providers from OpenCode CLI', hint: 'One-time import' });
     }
     options.push({ value: 'done', label: 'Done', hint: '' });
 
