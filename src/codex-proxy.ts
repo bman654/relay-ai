@@ -249,6 +249,9 @@ export async function startCodexProxy(
         const modelId = String(body.model ?? '');
         const resolved = resolveModel(routes, models, modelId);
         if (!resolved) {
+          if (debug) {
+            log(`resolveModel failed: requested="${modelId}" known=[${routes.map(r => r.modelId).join(', ')}]`);
+          }
           sendJson(res, 404, { error: { message: `Unknown model: ${modelId}`, type: 'invalid_request_error' } });
           return;
         }

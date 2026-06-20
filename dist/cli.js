@@ -9675,6 +9675,9 @@ async function startCodexProxy(routes, options = {}) {
         const modelId = String(body.model ?? "");
         const resolved = resolveModel(routes, models, modelId);
         if (!resolved) {
+          if (debug) {
+            log17(`resolveModel failed: requested="${modelId}" known=[${routes.map((r) => r.modelId).join(", ")}]`);
+          }
           sendJson(res, 404, { error: { message: `Unknown model: ${modelId}`, type: "invalid_request_error" } });
           return;
         }
@@ -10313,13 +10316,18 @@ function buildFavoritesAppCatalog(resolved) {
 // src/codex/favorites-launch.ts
 import * as p12 from "@clack/prompts";
 function buildCodexProxyRoutesFromResolved(resolved, providersById) {
-  return resolved.map((r) => {
+  const skippedOAuth = [];
+  const routes = resolved.map((r) => {
     const provider = providersById.get(r.providerId);
     if (!provider) return void 0;
     const model = r.model;
+    if (!r.apiKey && provider.authType === "oauth") {
+      skippedOAuth.push(`${r.providerId}/${model.id}`);
+      return void 0;
+    }
     const route = resolveCodexRoute(provider, model, r.apiKey);
     return {
-      modelId: route.modelId,
+      modelId: codexCliFavoritesSlug(r.providerId, model.id),
       npm: route.npm,
       apiKey: route.apiKey,
       baseURL: route.baseURL,
@@ -10329,6 +10337,12 @@ function buildCodexProxyRoutesFromResolved(resolved, providersById) {
       oauthAccountId: route.oauthAccountId
     };
   }).filter((r) => r !== void 0);
+  if (skippedOAuth.length > 0) {
+    p12.log.warn(
+      `Skipped ${skippedOAuth.length} OAuth favorite(s) (OAuth auth not supported in favorites catalog): ${skippedOAuth.join(", ")}`
+    );
+  }
+  return routes;
 }
 function resolveCodexFavorites(activeProvider, selectedModel, compatible, favorites, agent, zenGoApiKey) {
   const ctx = {

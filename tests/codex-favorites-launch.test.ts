@@ -62,8 +62,39 @@ describe('buildCodexProxyRoutesFromResolved', () => {
       new Map([['anthropic', anthropicProvider]]),
     );
     expect(routes).toHaveLength(1);
-    expect(routes[0]?.modelId).toBe('claude-sonnet-4.5');
+    expect(routes[0]?.modelId).toBe('anthropic__claude-sonnet-4.5');
     expect(routes[0]?.upstreamModelId).toBe('claude-sonnet-4-5-20250929');
+  });
+
+  it('skips OAuth favorites without API key, and warns', () => {
+    const oauthProvider: LocalProvider = {
+      id: 'xai-oauth',
+      name: 'xAI (OAuth)',
+      apiKey: '',
+      authType: 'oauth',
+      models: [{
+        id: 'grok-build-0.1',
+        name: 'Grok Build 0.1',
+        family: 'grok',
+        brand: 'xAI',
+        modelFormat: 'openai',
+        upstreamModelId: 'grok-build-0.1',
+        contextWindow: 128000,
+      }],
+    };
+    const resolved: ResolvedFavorite[] = [
+      {
+        providerId: 'xai-oauth',
+        providerName: 'xAI (OAuth)',
+        model: oauthProvider.models[0]!,
+        apiKey: '',
+      },
+    ];
+    const routes = buildCodexProxyRoutesFromResolved(
+      resolved,
+      new Map([['xai-oauth', oauthProvider]]),
+    );
+    expect(routes).toHaveLength(0);
   });
 
   it('skips entries whose provider is missing from the map', () => {

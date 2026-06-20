@@ -5,19 +5,28 @@ import type { ResolveContext, ResolvedFavorite } from '../favorites-resolver.js'
 import type { CompatibilityAgent } from '../model-compatibility.js';
 import { resolveCodexRoute } from './routing.js';
 import type { LocalProvider, LocalProviderModel, FavoriteModel } from '../types.js';
+import { codexCliFavoritesSlug } from './favorites-catalog.js';
 
 export function buildCodexProxyRoutesFromResolved(
   resolved: ResolvedFavorite[],
   providersById: Map<string, LocalProvider>,
 ): CodexProxyRoute[] {
-  return resolved
+  const skippedOAuth: string[] = [];
+  const routes = resolved
     .map(r => {
       const provider = providersById.get(r.providerId);
       if (!provider) return undefined;
       const model = r.model as LocalProviderModel;
+
+      // Skip if OAuth provider has empty apiKey (OAuth refresh flows not supported in favorites proxy)
+      if (!r.apiKey && provider.authType === 'oauth') {
+        skippedOAuth.push(`${r.providerId}/${model.id}`);
+        return undefined;
+      }
+
       const route = resolveCodexRoute(provider, model, r.apiKey);
       return {
-        modelId: route.modelId,
+        modelId: codexCliFavoritesSlug(r.providerId, model.id),
         npm: route.npm,
         apiKey: route.apiKey,
         baseURL: route.baseURL,
@@ -28,7 +37,16 @@ export function buildCodexProxyRoutesFromResolved(
       } as CodexProxyRoute;
     })
     .filter((r): r is CodexProxyRoute => r !== undefined);
+
+  if (skippedOAuth.length > 0) {
+    p.log.warn(
+      `Skipped ${skippedOAuth.length} OAuth favorite(s) (OAuth auth not supported in favorites catalog): ${skippedOAuth.join(', ')}`,
+    );
+  }
+
+  return routes;
 }
+
 
 export function resolveCodexFavorites(
   activeProvider: LocalProvider,
