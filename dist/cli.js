@@ -7238,12 +7238,12 @@ async function selectLargeCatalog(models, browseList, toOption, message, initial
             value: MODE_BROWSE,
             label: pc7.cyan("Browse all models"),
             hint: `${MODEL_PAGE_SIZE} per page \xB7 ${Math.ceil(browseList.length / MODEL_PAGE_SIZE)} pages`
-          }
+          },
+          navOption("__back__", "\u2190 Go back", "Select a different provider")
         ]
       });
-      if (p7.isCancel(method)) {
-        p7.cancel("Cancelled.");
-        return null;
+      if (p7.isCancel(method) || String(method) === "__back__") {
+        return "back";
       }
       mode = method === MODE_BROWSE ? "browse" : "search";
       continue;
@@ -7303,16 +7303,18 @@ async function selectModelWithSearch(models, toOption, message, initialModelId, 
   if (models.length === 0) return null;
   const orderedBrowse = browseList ?? sortModelsByBrand(models);
   if (models.length <= MODEL_SEARCH_THRESHOLD) {
-    const options = models.map(toOption);
+    const options = [
+      ...models.map(toOption),
+      navOption("__back__", "\u2190 Go back", "")
+    ];
     const initialValue = initialModelId && options.some((o) => o.value === initialModelId) ? initialModelId : options[0]?.value;
     const picked = await p7.select({
       message,
       options,
       initialValue
     });
-    if (p7.isCancel(picked)) {
-      p7.cancel("Cancelled.");
-      return null;
+    if (p7.isCancel(picked) || String(picked) === "__back__") {
+      return "back";
     }
     const selected = models.find((m) => m.id === String(picked));
     if (!selected) return null;
@@ -7337,32 +7339,43 @@ async function browseAllModels(provider, prefs) {
 async function pickLocalModel(provider, conflicts, prefs) {
   const recentIds = (prefs.recentModelsByProvider?.[provider.id] ?? []).slice(0, MAX_RECENT);
   const recentModels = recentIds.map((id) => provider.models.find((m) => m.id === id)).filter((m) => m !== void 0);
-  let selectedModel;
-  if (recentModels.length > 0) {
-    const options = [
-      ...recentModels.map((m) => modelToOption(m, "recent")),
-      navOption(BROWSE_ALL, "Browse all models \u2192", `${provider.models.length} available`)
-    ];
-    const picked = await p7.select({
-      message: "Which model?",
-      options,
-      initialValue: recentModels[0].id
-    });
-    if (p7.isCancel(picked)) {
-      p7.cancel("Cancelled.");
-      return null;
-    }
-    if (String(picked) === BROWSE_ALL) {
+  let selectedModel = null;
+  while (true) {
+    if (recentModels.length > 0) {
+      const options = [
+        ...recentModels.map((m) => modelToOption(m, "recent")),
+        navOption(BROWSE_ALL, "Browse all models \u2192", `${provider.models.length} available`),
+        navOption("__back__", "\u2190 Go back", "Select a different provider")
+      ];
+      const picked = await p7.select({
+        message: "Which model?",
+        options,
+        initialValue: recentModels[0].id
+      });
+      if (p7.isCancel(picked) || String(picked) === "__back__") {
+        return "back";
+      }
+      if (String(picked) === BROWSE_ALL) {
+        const browsed = await browseAllModels(provider, prefs);
+        if (browsed === "back") {
+          continue;
+        }
+        if (!browsed) return null;
+        selectedModel = browsed;
+        break;
+      } else {
+        selectedModel = recentModels.find((m) => m.id === String(picked));
+        break;
+      }
+    } else {
       const browsed = await browseAllModels(provider, prefs);
+      if (browsed === "back") {
+        return "back";
+      }
       if (!browsed) return null;
       selectedModel = browsed;
-    } else {
-      selectedModel = recentModels.find((m) => m.id === String(picked));
+      break;
     }
-  } else {
-    const browsed = await browseAllModels(provider, prefs);
-    if (!browsed) return null;
-    selectedModel = browsed;
   }
   noteEnvConflicts(conflicts);
   const modelLabel = formatCodexModelLabel(selectedModel);
@@ -10104,7 +10117,7 @@ function launchCodex(modelId, env, extraArgs) {
 // src/codex/prompts.ts
 import pc11 from "picocolors";
 import * as p11 from "@clack/prompts";
-async function pickCodexProvider(providers, prefs, hasFavorites = false) {
+async function pickCodexProvider(providers, prefs, hasFavorites = false, initialProviderId) {
   if (providers.length === 0 && !hasFavorites) return null;
   const options = providers.map((lp) => providerSelectOption(lp));
   if (hasFavorites) {
@@ -10114,7 +10127,7 @@ async function pickCodexProvider(providers, prefs, hasFavorites = false) {
       hint: `${prefs.favoriteModels?.length ?? 0} saved favorites`
     });
   }
-  const initial = prefs.lastCodexProvider && options.some((o) => o.value === prefs.lastCodexProvider) ? prefs.lastCodexProvider : options[0].value;
+  const initial = initialProviderId && options.some((o) => o.value === initialProviderId) ? initialProviderId : prefs.lastCodexProvider && options.some((o) => o.value === prefs.lastCodexProvider) ? prefs.lastCodexProvider : options[0].value;
   const chosen = await p11.select({
     message: "Which provider for Codex?",
     options,
@@ -10130,32 +10143,43 @@ async function pickCodexProvider(providers, prefs, hasFavorites = false) {
 async function pickCodexModel(provider, prefs) {
   const recentIds = (prefs.recentModelsByProvider?.[provider.id] ?? []).slice(0, 3);
   const recentModels = recentIds.map((id) => provider.models.find((m) => m.id === id)).filter((m) => m !== void 0);
-  let selectedModel;
-  if (recentModels.length > 0) {
-    const options = [
-      ...recentModels.map((m) => modelSelectOption(m, "recent")),
-      navOption("__browse_all__", "Browse all models \u2192", `${provider.models.length} available`)
-    ];
-    const picked = await p11.select({
-      message: `Model for ${provider.name}?`,
-      options,
-      initialValue: recentModels[0].id
-    });
-    if (p11.isCancel(picked)) {
-      p11.cancel("Cancelled.");
-      return null;
-    }
-    if (String(picked) === "__browse_all__") {
+  let selectedModel = null;
+  while (true) {
+    if (recentModels.length > 0) {
+      const options = [
+        ...recentModels.map((m) => modelSelectOption(m, "recent")),
+        navOption("__browse_all__", "Browse all models \u2192", `${provider.models.length} available`),
+        navOption("__back__", "\u2190 Go back", "Select a different provider")
+      ];
+      const picked = await p11.select({
+        message: `Model for ${provider.name}?`,
+        options,
+        initialValue: recentModels[0].id
+      });
+      if (p11.isCancel(picked) || String(picked) === "__back__") {
+        return "back";
+      }
+      if (String(picked) === "__browse_all__") {
+        const browsed = await browseAllModels(provider, prefs);
+        if (browsed === "back") {
+          continue;
+        }
+        if (!browsed) return null;
+        selectedModel = browsed;
+        break;
+      } else {
+        selectedModel = recentModels.find((m) => m.id === String(picked));
+        break;
+      }
+    } else {
       const browsed = await browseAllModels(provider, prefs);
+      if (browsed === "back") {
+        return "back";
+      }
       if (!browsed) return null;
       selectedModel = browsed;
-    } else {
-      selectedModel = recentModels.find((m) => m.id === String(picked));
+      break;
     }
-  } else {
-    const browsed = await browseAllModels(provider, prefs);
-    if (!browsed) return null;
-    selectedModel = browsed;
   }
   return selectedModel;
 }
@@ -10813,26 +10837,35 @@ Error: ${launchPlan.error}
       p13.log.step(`Using ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
     }
   } else if (!configOnly) {
-    const pickedProvider = await pickCodexProvider(compatible, prefs, favoritesActive);
-    if (!pickedProvider) return 0;
-    if (pickedProvider === "__favorites__") {
-      const favoriteProviders = compatible.map((provider) => ({
-        ...provider,
-        models: routableModelsForProvider(provider, "codex")
-      }));
-      const favoriteStart = resolveFirstAvailableFavorite(favorites, favoriteProviders);
-      if (!favoriteStart) {
-        p13.log.warn("No saved Codex favorites are currently available.");
-        return 0;
+    let currentInitialProvider = prefs.lastCodexProvider && compatible.some((o) => o.id === prefs.lastCodexProvider) ? prefs.lastCodexProvider : compatible[0].id;
+    while (true) {
+      const pickedProvider = await pickCodexProvider(compatible, prefs, favoritesActive, currentInitialProvider);
+      if (!pickedProvider) return 0;
+      if (pickedProvider === "__favorites__") {
+        const favoriteProviders = compatible.map((provider) => ({
+          ...provider,
+          models: routableModelsForProvider(provider, "codex")
+        }));
+        const favoriteStart = resolveFirstAvailableFavorite(favorites, favoriteProviders);
+        if (!favoriteStart) {
+          p13.log.warn("No saved Codex favorites are currently available.");
+          return 0;
+        }
+        activeProvider = favoriteStart.provider;
+        selectedModel = favoriteStart.model;
+        p13.log.step(`Loaded Favorites Catalog. Starting model: ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
+        break;
+      } else {
+        activeProvider = pickedProvider;
+        const pickedModelResult = await pickCodexModel(activeProvider, prefs);
+        if (pickedModelResult === "back") {
+          currentInitialProvider = activeProvider.id;
+          continue;
+        }
+        if (!pickedModelResult) return 0;
+        selectedModel = pickedModelResult;
+        break;
       }
-      activeProvider = favoriteStart.provider;
-      selectedModel = favoriteStart.model;
-      p13.log.step(`Loaded Favorites Catalog. Starting model: ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
-    } else {
-      activeProvider = pickedProvider;
-      const pickedModel = await pickCodexModel(activeProvider, prefs);
-      if (!pickedModel) return 0;
-      selectedModel = pickedModel;
     }
   }
   let resolvedFavorites = [];
@@ -11812,23 +11845,32 @@ async function runCodexAppCommand(args, opts = {}) {
   );
   let selectedModel = activeProvider.models.find((m) => m.id === prefs.lastCodexModel) ?? activeProvider.models[0];
   if (!configOnly) {
-    const pickedProvider = await pickCodexProvider(compatible, prefs, favoritesActive);
-    if (!pickedProvider) return 0;
-    if (pickedProvider === "__favorites__") {
-      const favoriteProviders = compatible.map(providerForCodexPicker);
-      const favoriteStart = resolveFirstAvailableFavorite(favorites, favoriteProviders);
-      if (!favoriteStart) {
-        p15.log.warn("No saved Codex App favorites are currently available.");
-        return 0;
+    let currentInitialProvider = prefs.lastCodexProvider && compatible.some((o) => o.id === prefs.lastCodexProvider) ? prefs.lastCodexProvider : compatible[0].id;
+    while (true) {
+      const pickedProvider = await pickCodexProvider(compatible, prefs, favoritesActive, currentInitialProvider);
+      if (!pickedProvider) return 0;
+      if (pickedProvider === "__favorites__") {
+        const favoriteProviders = compatible.map(providerForCodexPicker);
+        const favoriteStart = resolveFirstAvailableFavorite(favorites, favoriteProviders);
+        if (!favoriteStart) {
+          p15.log.warn("No saved Codex App favorites are currently available.");
+          return 0;
+        }
+        activeProvider = favoriteStart.provider;
+        selectedModel = favoriteStart.model;
+        p15.log.step(`Loaded Favorites Catalog. Starting model: ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
+        break;
+      } else {
+        activeProvider = providerForCodexPicker(pickedProvider);
+        const pickedModelResult = await pickCodexModel(activeProvider, prefs);
+        if (pickedModelResult === "back") {
+          currentInitialProvider = activeProvider.id;
+          continue;
+        }
+        if (!pickedModelResult) return 0;
+        selectedModel = pickedModelResult;
+        break;
       }
-      activeProvider = favoriteStart.provider;
-      selectedModel = favoriteStart.model;
-      p15.log.step(`Loaded Favorites Catalog. Starting model: ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
-    } else {
-      activeProvider = providerForCodexPicker(pickedProvider);
-      const pickedModel = await pickCodexModel(activeProvider, prefs);
-      if (!pickedModel) return 0;
-      selectedModel = pickedModel;
     }
   }
   const regEntry = loadRegistry().providers.find((pr) => pr.id === activeProvider.id);
@@ -13528,14 +13570,25 @@ async function runModelsCommand() {
         }
       }
       if (!browsed) {
-        const providerOptions = allProviders.map((ap) => providerSelectOption(ap));
-        const pickedProviderId = await p18.select({
-          message: "Which provider?",
-          options: providerOptions
-        });
-        if (p18.isCancel(pickedProviderId)) continue;
-        provider = allProviders.find((ap) => ap.id === pickedProviderId);
-        browsed = await browseAllModels(provider, prefs) ?? void 0;
+        let currentInitialProvider = void 0;
+        while (true) {
+          const providerOptions = allProviders.map((ap) => providerSelectOption(ap));
+          const pickedProviderId = await p18.select({
+            message: "Which provider?",
+            options: providerOptions,
+            initialValue: currentInitialProvider
+          });
+          if (p18.isCancel(pickedProviderId)) break;
+          provider = allProviders.find((ap) => ap.id === pickedProviderId);
+          const browsedResult = await browseAllModels(provider, prefs);
+          if (browsedResult === "back") {
+            currentInitialProvider = provider.id;
+            continue;
+          }
+          if (!browsedResult) break;
+          browsed = browsedResult;
+          break;
+        }
         if (!browsed) continue;
       }
       const fav = { providerId: provider.id, modelId: browsed.id };
@@ -13658,31 +13711,40 @@ Error: ${launchPlan.error}
     }
     if (!dryRun) recordLaunchSelection("claude", activeProvider.id, selectedModel.id, prefs);
   } else {
-    const chosen = await p18.select({
-      message: "Which provider?",
-      options: providerOptions,
-      initialValue: initialProvider
-    });
-    if (p18.isCancel(chosen)) {
-      p18.cancel("Cancelled.");
-      return 0;
-    }
-    const providerChoice = chosen;
-    if (providerChoice === "__favorites__") {
-      const favoriteStart = resolveFirstAvailableFavorite(favorites, allProviders);
-      if (!favoriteStart) {
-        p18.log.warn("No saved favorites are currently available.");
+    let currentInitialProvider = initialProvider;
+    while (true) {
+      const chosen = await p18.select({
+        message: "Which provider?",
+        options: providerOptions,
+        initialValue: currentInitialProvider
+      });
+      if (p18.isCancel(chosen)) {
+        p18.cancel("Cancelled.");
         return 0;
       }
-      activeProvider = favoriteStart.provider;
-      selectedModel = favoriteStart.model;
-      p18.log.step(`Loaded Favorites Catalog. Starting model: ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
-    } else {
-      activeProvider = allProviders.find((lp) => lp.id === providerChoice);
-      const pickedModel = await pickLocalModel(activeProvider, conflicts, prefs);
-      if (!pickedModel) return 0;
-      selectedModel = pickedModel;
-      if (!dryRun) recordLaunchSelection("claude", activeProvider.id, selectedModel.id, prefs);
+      const providerChoice = chosen;
+      if (providerChoice === "__favorites__") {
+        const favoriteStart = resolveFirstAvailableFavorite(favorites, allProviders);
+        if (!favoriteStart) {
+          p18.log.warn("No saved favorites are currently available.");
+          return 0;
+        }
+        activeProvider = favoriteStart.provider;
+        selectedModel = favoriteStart.model;
+        p18.log.step(`Loaded Favorites Catalog. Starting model: ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
+        break;
+      } else {
+        activeProvider = allProviders.find((lp) => lp.id === providerChoice);
+        const pickedModelResult = await pickLocalModel(activeProvider, conflicts, prefs);
+        if (pickedModelResult === "back") {
+          currentInitialProvider = activeProvider.id;
+          continue;
+        }
+        if (!pickedModelResult) return 0;
+        selectedModel = pickedModelResult;
+        if (!dryRun) recordLaunchSelection("claude", activeProvider.id, selectedModel.id, prefs);
+        break;
+      }
     }
   }
   const localProviders = catalog.localProviders.length > 0 ? catalog.localProviders : null;
