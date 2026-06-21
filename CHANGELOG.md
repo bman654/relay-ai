@@ -2,6 +2,9 @@
 
 ## [0.3.0] - 2026-06-21
 
+*Happy Father's Day!* 👨‍👦
+
+
 ### Added
 - **New Native Providers** — Added native provider templates and registry support for DeepSeek (`deepseek`), Zhipu (`zhipu`), and Moonshot (`moonshot`), facilitating direct integration of Chinese LLM providers.
 - **Experimental Gemini Support** — Introduced experimental support for Google Gemini models via a custom SDK adapter and local proxy, enabling `relay-ai gemini`.
