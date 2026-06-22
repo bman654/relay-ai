@@ -35,7 +35,7 @@ import { join } from "path";
 // package.json
 var package_default = {
   name: "@jacobbd/relay-ai",
-  version: "0.3.0",
+  version: "0.3.1",
   publishConfig: {
     access: "public"
   },
@@ -3640,7 +3640,7 @@ function printTraceLog(debugLogPath) {
   const raw = readFileSync6(debugLogPath, "utf8");
   const log19 = redactTraceLog(raw);
   const errorLines = log19.split("\n").filter(
-    (l) => l.includes("error") || l.includes("Error") || l.includes('"type":"error"') || l.includes("status")
+    (l) => l.includes("error") || l.includes("Error") || l.includes('"type":"error"') || l.includes("status") || l.includes("resolveModel failed") || l.includes("resolveModel fallback")
   );
   console.log("\n" + pc2.bold(pc2.cyan("\u2500\u2500 Debug trace \u2500\u2500")));
   if (errorLines.length > 0) {
@@ -10007,13 +10007,22 @@ async function startCodexProxy(routes, options = {}) {
           return;
         }
         const modelId = String(body.model ?? "");
-        const resolved = resolveModel(routes, models, modelId);
+        let resolved = resolveModel(routes, models, modelId);
         if (!resolved) {
-          if (debug) {
-            log19(`resolveModel failed: requested="${modelId}" known=[${routes.map((r) => r.modelId).join(", ")}]`);
+          const fallbackRoute = routes[0];
+          const fallbackLm = fallbackRoute ? models.get(fallbackRoute.modelId) : void 0;
+          if (fallbackRoute && fallbackLm) {
+            if (debug) {
+              log19(`resolveModel fallback: requested="${modelId}" \u2192 ${fallbackRoute.modelId}`);
+            }
+            resolved = { route: fallbackRoute, languageModel: fallbackLm };
+          } else {
+            if (debug) {
+              log19(`resolveModel failed: requested="${modelId}" known=[${routes.map((r) => r.modelId).join(", ")}]`);
+            }
+            sendJson(res, 404, { error: { message: `Unknown model: ${modelId}`, type: "invalid_request_error" } });
+            return;
           }
-          sendJson(res, 404, { error: { message: `Unknown model: ${modelId}`, type: "invalid_request_error" } });
-          return;
         }
         const { route, languageModel } = resolved;
         try {
@@ -10063,6 +10072,10 @@ async function startCodexProxy(routes, options = {}) {
           log19(`handler error: ${msg}`);
           sendJson(res, 500, { error: { message: msg, type: "api_error" } });
         }
+        return;
+      }
+      if (req.method === "GET" && url === "/v1/responses") {
+        sendJson(res, 200, { object: "list", data: [] });
         return;
       }
       sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });

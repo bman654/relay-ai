@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.1] - 2026-06-22
+
+### Fixed
+
+- **Codex App: background GPT model requests no longer crash your session** — The Codex desktop app has an internal agent subsystem that sends background requests using hardcoded model IDs (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`), even when you've configured a completely different model like GLM or DeepSeek. These requests were hitting the relay-ai proxy and getting 404 errors, which interrupted your chat session and showed up as confusing error states in the UI. The proxy now silently routes those background requests to your configured starting model instead. Your session keeps running. (Fixes [#8](https://github.com/jacob-bd/relay-ai/issues/8))
+
+- **Codex App: `GET /v1/responses` polling no longer returns 404** — Codex polls this endpoint in the background for session state. The proxy only handled `POST /v1/responses` before, so every poll got a 404. Now it returns an empty list, which is all Codex actually needs.
+
+- **`--trace` output was a false negative** — `relay-ai codex-app --trace` would print `(no errors found in debug log)` even when the proxy had been silently dropping dozens of model-not-found failures the whole session. Trace output now surfaces `resolveModel failed` and `resolveModel fallback` lines so you can actually see what's happening.
+
 ## [0.3.0] - 2026-06-21
 
 *Happy Father's Day!* 👨‍👦

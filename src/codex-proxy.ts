@@ -247,13 +247,22 @@ export async function startCodexProxy(
         }
 
         const modelId = String(body.model ?? '');
-        const resolved = resolveModel(routes, models, modelId);
+        let resolved = resolveModel(routes, models, modelId);
         if (!resolved) {
-          if (debug) {
-            log(`resolveModel failed: requested="${modelId}" known=[${routes.map(r => r.modelId).join(', ')}]`);
+          const fallbackRoute = routes[0];
+          const fallbackLm = fallbackRoute ? models.get(fallbackRoute.modelId) : undefined;
+          if (fallbackRoute && fallbackLm) {
+            if (debug) {
+              log(`resolveModel fallback: requested="${modelId}" → ${fallbackRoute.modelId}`);
+            }
+            resolved = { route: fallbackRoute, languageModel: fallbackLm };
+          } else {
+            if (debug) {
+              log(`resolveModel failed: requested="${modelId}" known=[${routes.map(r => r.modelId).join(', ')}]`);
+            }
+            sendJson(res, 404, { error: { message: `Unknown model: ${modelId}`, type: 'invalid_request_error' } });
+            return;
           }
-          sendJson(res, 404, { error: { message: `Unknown model: ${modelId}`, type: 'invalid_request_error' } });
-          return;
         }
 
         const { route, languageModel } = resolved;
@@ -306,6 +315,11 @@ export async function startCodexProxy(
           log(`handler error: ${msg}`);
           sendJson(res, 500, { error: { message: msg, type: 'api_error' } });
         }
+        return;
+      }
+
+      if (req.method === 'GET' && url === '/v1/responses') {
+        sendJson(res, 200, { object: 'list', data: [] });
         return;
       }
 

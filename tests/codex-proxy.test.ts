@@ -39,7 +39,7 @@ describe('startCodexProxy', () => {
     expect(res.status).toBe(401);
   });
 
-  it('returns 404 for unknown model instead of falling back', async () => {
+  it('falls back to first route for unknown model', async () => {
     handle = await startCodexProxy([
       {
         modelId: 'claude-fable-5',
@@ -60,7 +60,8 @@ describe('startCodexProxy', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: 'relay-ai-launch-codex-app/unknown-model', input: 'hi', stream: false }),
     });
-    expect(res.status).toBe(404);
+    // Fallback to first route — upstream rejects sk-test with 401, not a proxy-level 404
+    expect(res.status).not.toBe(404);
   });
 
   it('resolves namespaced catalog model ids', async () => {

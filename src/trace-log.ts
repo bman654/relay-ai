@@ -122,7 +122,7 @@ export function printTraceLog(debugLogPath: string): void {
   const raw = readFileSync(debugLogPath, 'utf8');
   const log = redactTraceLog(raw);
   const errorLines = log.split('\n').filter(l =>
-    l.includes('error') || l.includes('Error') || l.includes('"type":"error"') || l.includes('status'),
+    l.includes('error') || l.includes('Error') || l.includes('"type":"error"') || l.includes('status') || l.includes('resolveModel failed') || l.includes('resolveModel fallback'),
   );
   console.log('\n' + pc.bold(pc.cyan('── Debug trace ──')));
   if (errorLines.length > 0) {
