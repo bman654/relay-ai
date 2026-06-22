@@ -415,7 +415,7 @@ export async function streamAnthropicResponse(
   write: WriteFn,
   log?: LogFn,
 ): Promise<void> {
-  const result = streamText({ model, ...params } as Parameters<typeof streamText>[0]);
+  const result = streamText({ model, ...params, onError: () => {} } as Parameters<typeof streamText>[0]);
   // Prevent unhandled promise rejections on stream properties:
   Promise.resolve(result.text).catch(() => {});
   Promise.resolve(result.toolCalls).catch(() => {});

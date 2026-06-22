@@ -11,6 +11,8 @@ import {
   streamResponsesResponse,
   generateResponsesResponse,
   writeResponsesErrorStream,
+  writeResponsesRateLimitStream,
+  responsesRateLimitBody,
   type CodexSdkCallParams,
 } from './codex-responses-adapter.js';
 import { silenceSdkWarnings } from './sdk-adapter.js';
@@ -112,11 +114,6 @@ function upstreamHttpStatus(err: unknown, msg: string): number {
   return 500;
 }
 
-function logUpstreamError(err: unknown, modelId?: string): void {
-  const msg = formatUpstreamError(err);
-  const prefix = modelId ? `[relay-ai codex-proxy] ${modelId}: ` : '[relay-ai codex-proxy] ';
-  console.error(`${prefix}${msg}`);
-}
 
 function resolveModel(
   routes: CodexProxyRoute[],
@@ -164,8 +161,7 @@ export async function startCodexProxy(
       ? makeTraceLogger(getCodexProxyDebugLogPath())
       : () => {};
     const onRejection = (reason: unknown) => {
-      logUpstreamError(reason);
-      if (debug) log(formatUpstreamError(reason));
+      if (debug) log(`unhandled-rejection: ${formatUpstreamError(reason)}`);
     };
     process.on('unhandledRejection', onRejection);
 
@@ -339,8 +335,13 @@ export async function startCodexProxy(
               await streamResponsesResponse(languageModel, params, modelId, write);
             } catch (err) {
               const msg = formatUpstreamError(err);
-              logUpstreamError(err, route.modelId);
-              writeResponsesErrorStream(modelId, msg, write, upstreamHttpStatus(err, msg));
+              const status = upstreamHttpStatus(err, msg);
+              if (debug) log(`sdk error: ${route.modelId}: ${msg}`);
+              if (status === 429) {
+                writeResponsesRateLimitStream(modelId, msg, write);
+              } else {
+                writeResponsesErrorStream(modelId, msg, write, status);
+              }
             }
             res.end();
           } else {
@@ -349,9 +350,13 @@ export async function startCodexProxy(
               sendJson(res, 200, response);
             } catch (err) {
               const msg = formatUpstreamError(err);
-              logUpstreamError(err, route.modelId);
               const status = upstreamHttpStatus(err, msg);
-              sendJson(res, status, { error: { message: msg, type: status === 429 ? 'rate_limit_error' : 'api_error' } });
+              if (debug) log(`sdk error: ${route.modelId}: ${msg}`);
+              if (status === 429) {
+                sendJson(res, 200, responsesRateLimitBody(modelId, msg));
+              } else {
+                sendJson(res, status, { error: { message: msg, type: 'api_error' } });
+              }
             }
           }
         } catch (err) {

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.3] - 2026-06-22
+
+### Fixed
+
+- **Codex App: rate limit errors now appear in the conversation instead of crashing silently** — when a model hits its usage limit (e.g. OpenCode Go's 5-hour cap), the proxy now injects a readable error message directly into the Codex App conversation: `"5-hour usage limit reached. Resets in Xmin. To continue using this model now, enable usage from your available balance: ..."`. Previously the session just stalled with no explanation in the UI.
+
+- **Codex App: rate limit errors print a clean one-liner in the terminal** — instead of flooding the terminal with full RetryError stack traces (one per retry attempt, per request), the proxy now prints a single `[relay-ai] <model>: <message>` line per failed request.
+
+- **Codex proxy: removed SDK default `console.error` on stream failures** — the Vercel AI SDK's `streamText` calls `console.error(error)` by default whenever the stream encounters an error. This was the root cause of the full stack trace dumps. The proxy now passes `onError: () => {}` to suppress this. The error is still handled through the stream pipeline and surfaced to the user.
+
 ## [0.3.2] - 2026-06-22
 
 ### Fixed
