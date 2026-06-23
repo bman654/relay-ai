@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.3] - 2026-06-22
+
+### Fixed
+
+- **Codex App: old sessions no longer show "Custom" as the model name** — relay-ai previously wrote its internal alias model ID (e.g. `go__glm-5.2`) into `config.toml`, which Codex baked into every session record. Reopening that conversation in native Codex showed "Custom" because the alias is unrecognized. relay-ai now writes `gpt-5.5` as the display model so sessions record a name Codex recognizes, enabling clean resume without errors.
+
 ## [0.3.2] - 2026-06-22
 
 ### Fixed
