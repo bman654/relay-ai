@@ -822,6 +822,7 @@ function thinkingProviderOptions(npm) {
 
 // src/codex/app-profile.ts
 var CODEX_APP_PROVIDER_ID = "relay-ai-launch-codex-app";
+var CODEX_APP_DISPLAY_MODEL = "gpt-5.5";
 var PREVIEW_PROXY_PORT = 54321;
 function codexAppModelSlug(rawModelId) {
   return rawModelId.startsWith("models/") ? rawModelId.slice("models/".length) : rawModelId;
@@ -831,10 +832,9 @@ function parseCodexAppModelSlug(modelKey) {
   return modelKey.startsWith(prefix) ? modelKey.slice(prefix.length) : modelKey;
 }
 function buildCodexAppRootConfig(spec) {
-  const slug = codexAppModelSlug(spec.route.modelId);
   const ctxWindow = spec.route.contextWindow;
   return {
-    model: slug,
+    model: CODEX_APP_DISPLAY_MODEL,
     model_provider: "openai",
     openai_base_url: `http://127.0.0.1:${spec.proxyPort}/v1`,
     model_catalog_json: spec.catalogPath,

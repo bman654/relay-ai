@@ -9,7 +9,7 @@ import {
   restoreConfigFromState,
   previewAppConfigToml,
 } from '../src/codex/app-config.js';
-import { CODEX_APP_PROVIDER_ID } from '../src/codex/app-profile.js';
+import { CODEX_APP_PROVIDER_ID, CODEX_APP_DISPLAY_MODEL } from '../src/codex/app-profile.js';
 import type { CodexAppConfigSpec } from '../src/codex/app-profile.js';
 
 describe('app-config', () => {
@@ -54,7 +54,7 @@ describe('app-config', () => {
     expect(text).toContain('model_provider = "openai"');
     expect(text).toContain('openai_base_url = "http://127.0.0.1:54321/v1"');
     expect(text).toContain('127.0.0.1:54321');
-    expect(text).toContain('model = "claude-sonnet-4-6"');
+    expect(text).toContain(`model = "${CODEX_APP_DISPLAY_MODEL}"`);
     expect(text).not.toContain(`[model_providers.${CODEX_APP_PROVIDER_ID}]`);
     expect(text).toContain('model_reasoning_effort = "high"');
   });
