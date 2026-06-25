@@ -13,11 +13,16 @@
 
 <p align="center">
   <a href="https://youtu.be/IvsUPHLhX0o">
-    <img src="assets/demo-part1-thumbnail.png" alt="relay-ai demo — installation, configuration, Claude Code, Claude Cowork & Claude Code Desktop (Part 1)" width="100%">
+    <img src="https://img.youtube.com/vi/IvsUPHLhX0o/maxresdefault.jpg" alt="relay-ai demo — installation, configuration, Claude Code, Claude Cowork & Claude Code Desktop (Part 1)" width="49%">
+  </a>
+  <a href="https://youtu.be/42oiOB8IAu4">
+    <img src="https://img.youtube.com/vi/42oiOB8IAu4/maxresdefault.jpg" alt="relay-ai demo — OpenAI Codex CLI & Codex Desktop App (Part 2)" width="49%">
   </a>
 </p>
 
-> **Demo (Part 1):** Installation · Configuration · Claude Code · Claude Cowork · Claude Code Desktop — [watch on YouTube](https://youtu.be/IvsUPHLhX0o)
+> 🎥 **Watch the Demos:**
+> - **Demo (Part 1):** Installation · Configuration · Claude Code · Claude Cowork & Claude Code Desktop — [watch on YouTube](https://youtu.be/IvsUPHLhX0o)
+> - **Demo (Part 2):** OpenAI Codex CLI & Codex Desktop App — [watch on YouTube](https://youtu.be/42oiOB8IAu4)
 
 **relay-ai** is an interactive CLI that launches AI coding tools and runs local API gateways on your machine. Currently, it supports **Claude Code**, **Claude Desktop (Cowork + Code)**, the **OpenAI Codex CLI**, the **Codex desktop app (macOS + Windows)**, and the **Google Gemini CLI**.
 
@@ -43,8 +48,6 @@ Pick your backend:
 | `relay-ai codex-app` | Launch Codex desktop app with registry providers ([guide](docs/CODEX.md)) |
 | `relay-ai gemini` | Launch Google Gemini CLI with registry providers |
 | `relay-ai --ai` | Full agent reference for scripts and alef-agent ([guide](docs/AI-AGENTS.md)) |
-
-Bare `relay-ai` prints help and migration guidance. Use `relay-ai claude` for the wizard.
 
 ## Features
 
