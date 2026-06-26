@@ -25,8 +25,9 @@ export function findClaudeBinary(): string | null {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    // where.exe returns one result per line — take the first
-    const path = result.trim().split('\n')[0].trim();
+    const lines = result.trim().split('\n').map(l => l.trim()).filter(Boolean);
+    // On Windows, prefer .cmd wrappers — spawn() can't execute bare scripts without shell:true
+    const path = (isWindows ? lines.find(l => l.toLowerCase().endsWith('.cmd')) : null) ?? lines[0];
     if (path) return path;
   } catch {
     // command failed — try fallback paths

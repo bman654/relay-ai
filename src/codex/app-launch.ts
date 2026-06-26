@@ -1,5 +1,5 @@
 // Find, open, quit, and restart Codex desktop app (macOS + Windows).
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -155,7 +155,8 @@ function openCodexAppAt(path: string): void {
   }
   if (process.platform === 'win32') {
     if (path.startsWith('shell:AppsFolder\\')) {
-      runPowerShell(`Start-Process '${path.replace(/'/g, "''")}'`);
+      // cmd /c start avoids PowerShell backslash double-escaping issues with shell: URIs
+      spawn('cmd.exe', ['/c', 'start', '', path], { stdio: 'ignore', detached: true }).unref();
     } else {
       runPowerShell(`Start-Process -FilePath '${path.replace(/'/g, "''")}'`);
     }

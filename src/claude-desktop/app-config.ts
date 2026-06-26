@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 
 export function getClaudeDesktopHome(): string {
   if (process.platform === 'win32') {
-    return join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'Claude-3p');
+    return join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'Claude-3p');
   }
   return join(homedir(), 'Library', 'Application Support', 'Claude-3p');
 }

@@ -1154,7 +1154,8 @@ function findClaudeBinary() {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"]
     });
-    const path = result.trim().split("\n")[0].trim();
+    const lines = result.trim().split("\n").map((l) => l.trim()).filter(Boolean);
+    const path = (isWindows ? lines.find((l) => l.toLowerCase().endsWith(".cmd")) : null) ?? lines[0];
     if (path) return path;
   } catch {
   }
@@ -3281,7 +3282,8 @@ function findOpencodeBinary() {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"]
     });
-    const path = result.trim().split("\n")[0].trim();
+    const lines = result.trim().split("\n").map((l) => l.trim()).filter(Boolean);
+    const path = (isWindows2 ? lines.find((l) => l.toLowerCase().endsWith(".cmd")) : null) ?? lines[0];
     if (path) return path;
   } catch {
   }
@@ -3311,9 +3313,7 @@ async function fetchRawOpencodeProviders() {
       finish(null);
     }, TIMEOUT_MS);
     try {
-      child = spawn2(binary, ["serve", "--port", "0"], {
-        stdio: ["pipe", "pipe", "pipe"]
-      });
+      child = isWindows2 ? spawn2("cmd.exe", ["/c", binary, "serve", "--port", "0"], { stdio: ["pipe", "pipe", "pipe"] }) : spawn2(binary, ["serve", "--port", "0"], { stdio: ["pipe", "pipe", "pipe"] });
     } catch {
       finish(null);
       return;
@@ -10558,7 +10558,8 @@ function findCodexBinary() {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"]
     });
-    const path = result.trim().split("\n")[0]?.trim();
+    const lines = result.trim().split("\n").map((l) => l.trim()).filter(Boolean);
+    const path = (isWindows3 ? lines.find((l) => l.toLowerCase().endsWith(".cmd")) : null) ?? lines[0];
     if (path) return path;
   } catch {
   }
@@ -11566,7 +11567,8 @@ function findGeminiBinary() {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"]
     });
-    const path = result.trim().split("\n")[0]?.trim();
+    const lines = result.trim().split("\n").map((l) => l.trim()).filter(Boolean);
+    const path = (isWindows4 ? lines.find((l) => l.toLowerCase().endsWith(".cmd")) : null) ?? lines[0];
     if (path) return path;
   } catch {
   }
@@ -12930,7 +12932,7 @@ function waitForShutdown2() {
 }
 
 // src/codex/app-launch.ts
-import { execSync as execSync5 } from "child_process";
+import { execSync as execSync5, spawn as spawn6 } from "child_process";
 import { existsSync as existsSync16, readdirSync as readdirSync3, statSync as statSync4 } from "fs";
 import { homedir as homedir11 } from "os";
 import { join as join17 } from "path";
@@ -13073,7 +13075,7 @@ function openCodexAppAt(path) {
   }
   if (process.platform === "win32") {
     if (path.startsWith("shell:AppsFolder\\")) {
-      runPowerShell(`Start-Process '${path.replace(/'/g, "''")}'`);
+      spawn6("cmd.exe", ["/c", "start", "", path], { stdio: "ignore", detached: true }).unref();
     } else {
       runPowerShell(`Start-Process -FilePath '${path.replace(/'/g, "''")}'`);
     }
@@ -13628,7 +13630,7 @@ import { join as join18, dirname as dirname7 } from "path";
 import { randomUUID as randomUUID3 } from "crypto";
 function getClaudeDesktopHome() {
   if (process.platform === "win32") {
-    return join18(process.env.APPDATA || join18(homedir12(), "AppData", "Roaming"), "Claude-3p");
+    return join18(process.env.LOCALAPPDATA || join18(homedir12(), "AppData", "Local"), "Claude-3p");
   }
   return join18(homedir12(), "Library", "Application Support", "Claude-3p");
 }
@@ -13789,7 +13791,7 @@ function setupExitCleanup(uuid) {
 }
 
 // src/claude-desktop/app-launch.ts
-import { execSync as execSync6 } from "child_process";
+import { execSync as execSync6, spawn as spawn7 } from "child_process";
 import { existsSync as existsSync19, readdirSync as readdirSync4, statSync as statSync5 } from "fs";
 import { homedir as homedir13 } from "os";
 import { join as join20 } from "path";
@@ -13928,7 +13930,7 @@ function openClaudeAppAt(path) {
   }
   if (process.platform === "win32") {
     if (path.startsWith("shell:AppsFolder\\")) {
-      runPowerShell2(`Start-Process '${path.replace(/'/g, "''")}'`);
+      spawn7("cmd.exe", ["/c", "start", "", path], { stdio: "ignore", detached: true }).unref();
     } else {
       runPowerShell2(`Start-Process -FilePath '${path.replace(/'/g, "''")}'`);
     }

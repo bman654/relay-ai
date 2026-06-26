@@ -29,7 +29,9 @@ export function findOpencodeBinary(): string | null {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const path = result.trim().split('\n')[0].trim();
+    const lines = result.trim().split('\n').map(l => l.trim()).filter(Boolean);
+    // On Windows, prefer .cmd wrappers — spawn() can't execute bare scripts without shell:true
+    const path = (isWindows ? lines.find(l => l.toLowerCase().endsWith('.cmd')) : null) ?? lines[0];
     if (path) return path;
   } catch {
     // command failed — try fallback paths
@@ -67,9 +69,10 @@ export async function fetchRawOpencodeProviders(): Promise<RawProvider[] | null>
     }, TIMEOUT_MS);
 
     try {
-      child = spawn(binary, ['serve', '--port', '0'], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      // On Windows, .cmd wrappers require cmd.exe /c — shell:true triggers DEP0190 in Node 22+
+      child = isWindows
+        ? spawn('cmd.exe', ['/c', binary, 'serve', '--port', '0'], { stdio: ['pipe', 'pipe', 'pipe'] })
+        : spawn(binary, ['serve', '--port', '0'], { stdio: ['pipe', 'pipe', 'pipe'] });
     } catch {
       finish(null);
       return;
