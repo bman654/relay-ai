@@ -3,6 +3,7 @@
 import { positiveSecondsToMs, sleepMs } from './pkce.js';
 import type { OAuthTokenResponse } from './types.js';
 import { VERSION } from '../constants.js';
+import { postOAuthRefresh } from './refresh-http.js';
 
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const ISSUER = 'https://auth.openai.com';
@@ -13,6 +14,13 @@ export interface OpenAiIdTokenClaims {
   chatgpt_account_id?: string;
   organizations?: Array<{ id: string }>;
   'https://api.openai.com/auth'?: { chatgpt_account_id?: string };
+}
+
+export interface OpenAiDeviceCodeData {
+  device_auth_id: string;
+  user_code: string;
+  interval: string;
+  expires_in?: number;
 }
 
 export function extractOpenAiAccountId(tokens: OAuthTokenResponse): string | undefined {
@@ -30,30 +38,8 @@ export function extractOpenAiAccountId(tokens: OAuthTokenResponse): string | und
   }
 }
 
-export async function refreshOpenAiAccessToken(refreshToken: string): Promise<OAuthTokenResponse> {
-  const response = await fetch(`${ISSUER}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }).toString(),
-  });
-  if (!response.ok) {
-    throw new Error(`OpenAI token refresh failed (${response.status})`);
-  }
-  return response.json() as Promise<OAuthTokenResponse>;
-}
-
-export async function runOpenAiDeviceCodeFlow(
-  onDeviceCode: (info: { url: string; userCode: string }) => void,
-  opts?: { sleep?: (ms: number) => Promise<void>; now?: () => number },
-): Promise<{ tokens: OAuthTokenResponse; accountId?: string }> {
-  const sleep = opts?.sleep ?? sleepMs;
-  const now = opts?.now ?? (() => Date.now());
-
-  const deviceResponse = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
+export async function requestOpenAiDeviceCode(): Promise<OpenAiDeviceCodeData> {
+  const response = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -61,20 +47,24 @@ export async function runOpenAiDeviceCodeFlow(
     },
     body: JSON.stringify({ client_id: CLIENT_ID }),
   });
-  if (!deviceResponse.ok) {
+  if (!response.ok) {
     throw new Error('Failed to initiate OpenAI device authorization');
   }
+  return response.json() as Promise<OpenAiDeviceCodeData>;
+}
 
-  const deviceData = await deviceResponse.json() as {
-    device_auth_id: string;
-    user_code: string;
-    interval: string;
-    expires_in?: number;
-  };
+export function openAiDeviceCodeUrl(): string {
+  return `${ISSUER}/codex/device`;
+}
+
+export async function pollOpenAiDeviceCodeToken(
+  deviceData: OpenAiDeviceCodeData,
+  opts?: { sleep?: (ms: number) => Promise<void>; now?: () => number },
+): Promise<{ tokens: OAuthTokenResponse; accountId?: string }> {
+  const sleep = opts?.sleep ?? sleepMs;
+  const now = opts?.now ?? (() => Date.now());
   const intervalMs = Math.max(parseInt(deviceData.interval, 10) || 5, 1) * 1000;
   const deadline = now() + positiveSecondsToMs(deviceData.expires_in, DEVICE_CODE_DEFAULT_EXPIRES_MS);
-
-  onDeviceCode({ url: `${ISSUER}/codex/device`, userCode: deviceData.user_code });
 
   while (now() < deadline) {
     const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
@@ -116,4 +106,29 @@ export async function runOpenAiDeviceCodeFlow(
     await sleep(Math.min(intervalMs + OAUTH_POLLING_SAFETY_MARGIN_MS, Math.max(0, deadline - now())));
   }
   throw new Error('OpenAI device authorization timed out');
+}
+
+export async function refreshOpenAiAccessToken(refreshToken: string): Promise<OAuthTokenResponse> {
+  return postOAuthRefresh(
+    `${ISSUER}/oauth/token`,
+    new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+    }),
+    {
+      contentType: 'form',
+      errorPrefix: 'OpenAI token refresh failed',
+      includeStatus: true,
+    },
+  );
+}
+
+export async function runOpenAiDeviceCodeFlow(
+  onDeviceCode: (info: { url: string; userCode: string }) => void,
+  opts?: { sleep?: (ms: number) => Promise<void>; now?: () => number },
+): Promise<{ tokens: OAuthTokenResponse; accountId?: string }> {
+  const deviceData = await requestOpenAiDeviceCode();
+  onDeviceCode({ url: openAiDeviceCodeUrl(), userCode: deviceData.user_code });
+  return pollOpenAiDeviceCodeToken(deviceData, opts);
 }

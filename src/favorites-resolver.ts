@@ -2,14 +2,16 @@
 import type { FavoriteModel, LocalProvider, LocalProviderModel, ModelInfo } from './types.js';
 import type { ServerModelInfo } from './server/models.js';
 import { shouldHideModel, type CompatibilityAgent } from './model-compatibility.js';
+import { resolveLocalProviderApiKey } from './provider-catalog.js';
 
 export interface ResolvedFavorite {
   providerId: string;
   providerName: string;
   model: LocalProviderModel | ServerModelInfo;
   apiKey: string;
-  /** Zen/Go only — which backend this favorite came from. */
-  sourceBackend?: 'zen' | 'go';
+  authType?: 'api' | 'oauth' | 'none';
+  oauthAccountId?: string;
+  providerData?: Record<string, unknown>;
 }
 
 /**
@@ -22,12 +24,6 @@ export interface ResolveContext {
   agent?: CompatibilityAgent;
   /** Claude: registry providers from opencode. */
   localProviders?: LocalProvider[];
-  /** Claude: Zen free models (for the favorite pointing to zen). */
-  zenModels?: ModelInfo[];
-  /** Claude: Go paid models (for the favorite pointing to go). */
-  goModels?: ModelInfo[];
-  /** Claude: shared Zen/Go API key. */
-  zenGoApiKey?: string | null;
   /** Server: pre-loaded server model list. */
   serverModels?: ServerModelInfo[];
   /** Lookup function for a registry model. Returns the model + its parent provider. */
@@ -47,24 +43,10 @@ const ZEN_GO_PROVIDER_NAME: Record<'zen' | 'go', string> = {
   go: 'OpenCode Go',
 };
 
-export function resolveFavorite(
+export async function resolveFavorite(
   fav: FavoriteModel,
   ctx: ResolveContext,
-): ResolvedFavorite | undefined {
-  if (fav.providerId === 'zen' || fav.providerId === 'go') {
-    if (!ctx.zenGoApiKey) return undefined;
-    const models = fav.providerId === 'zen' ? ctx.zenModels : ctx.goModels;
-    const model = models?.find(m => m.id === fav.modelId);
-    if (!model) return undefined;
-    return {
-      providerId: fav.providerId,
-      providerName: ZEN_GO_PROVIDER_NAME[fav.providerId],
-      model,
-      apiKey: ctx.zenGoApiKey,
-      sourceBackend: fav.providerId,
-    };
-  }
-
+): Promise<ResolvedFavorite | undefined> {
   if (ctx.findLocalModel) {
     const found = ctx.findLocalModel(fav.providerId, fav.modelId);
     if (!found) return undefined;
@@ -75,20 +57,32 @@ export function resolveFavorite(
       providerId: fav.providerId,
       providerName: found.provider.name,
       model: found.model,
-      apiKey: found.provider.apiKey,
+      apiKey: (await resolveLocalProviderApiKey(found.provider)) ?? '',
+      authType: found.provider.authType,
+      oauthAccountId: found.provider.oauthAccountId,
+      providerData: found.provider.providerData,
     };
   }
 
   return undefined;
 }
 
-export function buildFavoritesList(
+export interface BuildFavoritesListOptions {
+  dropEmptyApiKey?: boolean;
+  trackCapacitySkipped?: boolean;
+}
+
+export async function buildFavoritesList(
   starting: ResolvedFavorite | undefined,
   favorites: FavoriteModel[],
   ctx: ResolveContext,
   max = 20,
-): { resolved: ResolvedFavorite[]; droppedFavorites: FavoriteModel[] } {
-  const droppedFavorites: FavoriteModel[] = [];
+  options: BuildFavoritesListOptions = {},
+): Promise<{
+  resolved: ResolvedFavorite[];
+  droppedFavorites: FavoriteModel[];
+  capacitySkippedFavorites: FavoriteModel[];
+}> {
   const seen = new Set<string>();
   const out: ResolvedFavorite[] = [];
 
@@ -97,20 +91,31 @@ export function buildFavoritesList(
     out.push(starting);
   }
 
-  for (const fav of favorites) {
-    if (out.length >= max) break;
+  const uniqueFavorites = favorites.filter(fav => {
     const key = `${fav.providerId}::${fav.modelId}`;
-    if (seen.has(key)) continue;
-    const resolved = resolveFavorite(fav, ctx);
-    if (!resolved) {
-      droppedFavorites.push(fav);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const resolutions = await Promise.all(uniqueFavorites.map(fav => resolveFavorite(fav, ctx)));
+
+  const droppedFavorites: FavoriteModel[] = [];
+  const capacitySkippedFavorites: FavoriteModel[] = [];
+  for (let i = 0; i < uniqueFavorites.length; i++) {
+    const resolved = resolutions[i];
+    if (!resolved || (options.dropEmptyApiKey && !resolved.apiKey.trim())) {
+      droppedFavorites.push(uniqueFavorites[i]!);
       continue;
     }
-    seen.add(key);
-    out.push(resolved);
+    if (out.length < max) {
+      out.push(resolved);
+    } else if (options.trackCapacitySkipped) {
+      capacitySkippedFavorites.push(uniqueFavorites[i]!);
+    }
   }
 
-  return { resolved: out, droppedFavorites };
+  return { resolved: out, droppedFavorites, capacitySkippedFavorites };
 }
 
 export function resolveFirstAvailableFavorite(

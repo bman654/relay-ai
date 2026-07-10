@@ -1,4 +1,5 @@
 import type { FavoriteModel } from '../types.js';
+import { isFreeStatus } from '../free-models.js';
 import type { ServerModelInfo } from './models.js';
 
 export function filterServerModelsByProviders(
@@ -17,6 +18,10 @@ export function filterServerModelsByFavorites(
   if (favorites.length === 0) return [];
   const allowed = new Set(favorites.map(fav => `${fav.providerId}:${fav.modelId}`));
   return models.filter(model => model.providerId && allowed.has(`${model.providerId}:${model.id}`));
+}
+
+export function filterServerModelsByFreeStatus(models: ServerModelInfo[]): ServerModelInfo[] {
+  return models.filter(model => model.isFree || isFreeStatus(model.freeStatus));
 }
 
 export function summarizeServerProviders(models: ServerModelInfo[]): string {

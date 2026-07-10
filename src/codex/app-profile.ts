@@ -5,12 +5,13 @@ import type { CodexRoute } from './routing.js';
 export const CODEX_APP_PROVIDER_ID = 'relay-ai-launch-codex-app';
 
 /**
- * Model ID written to config.toml so Codex records a recognizable name in session history.
- * The proxy routes all requests to the actual selected model via its fallback mechanism.
- * Update this when a newer flagship OpenAI model supersedes gpt-5.5.
+ * @deprecated No longer written to config.toml. The actual model slug from the
+ * selected route is written instead so the Codex App's catalog picker can
+ * match it. Kept for backward compatibility with existing test references.
  */
 export const CODEX_APP_DISPLAY_MODEL = 'gpt-5.5';
 export const PREVIEW_PROXY_PORT = 54321;
+export const CODEX_APP_AUTO_COMPACT_RATIO = 0.55;
 
 export function codexAppModelSlug(rawModelId: string): string {
   return rawModelId.startsWith('models/') ? rawModelId.slice('models/'.length) : rawModelId;
@@ -38,13 +39,13 @@ export function buildCodexAppRootConfig(spec: CodexAppConfigSpec): {
 } {
   const ctxWindow = spec.route.contextWindow;
   return {
-    model: CODEX_APP_DISPLAY_MODEL,
+    model: codexAppModelSlug(spec.route.modelId),
     model_provider: 'openai',
     openai_base_url: `http://127.0.0.1:${spec.proxyPort}/v1`,
     model_catalog_json: spec.catalogPath,
     ...(ctxWindow && ctxWindow > 0 ? {
       model_context_window: ctxWindow,
-      model_auto_compact_token_limit: Math.floor(ctxWindow * 0.7),
+      model_auto_compact_token_limit: Math.floor(ctxWindow * CODEX_APP_AUTO_COMPACT_RATIO),
     } : {}),
   };
 }

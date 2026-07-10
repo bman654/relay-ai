@@ -5,11 +5,19 @@ import { randomUUID } from 'node:crypto';
 import { streamText, generateText, tool, jsonSchema } from 'ai';
 import type { LanguageModel } from 'ai';
 import { readBody, sendJson } from './http-utils.js';
-import { createLanguageModel } from './provider-factory.js';
+import {
+  createLanguageModel,
+  deepMergeProviderOptions,
+  effortProviderOptions,
+  maxToolsForNpm,
+  thinkingProviderOptions,
+} from './provider-factory.js';
+import { applyClaudeCodeOAuthIdentity } from './oauth/claude-code-identity.js';
 import { silenceSdkWarnings } from './sdk-adapter.js';
 import { getGeminiProxyDebugLogPath, makeTraceLogger } from './trace-log.js';
 import type { ProxyRoute, ProxyHandle } from './proxy.js';
 import { routeLookupIds } from './context-model-id.js';
+import { formatUpstreamError } from './codex/upstream-error.js';
 
 function mapFinishReason(reason: string): string {
   if (reason === 'stop' || reason === 'tool-calls') return 'STOP';
@@ -41,6 +49,10 @@ function lookupGeminiRoute(routes: ProxyRoute[], requestedModel: string): ProxyR
   return undefined;
 }
 
+export interface TranslateGeminiRequestOptions {
+  maxTools?: number;
+}
+
 function mergeConsecutiveMessages(messages: any[]): any[] {
   const merged: any[] = [];
   for (const msg of messages) {
@@ -70,7 +82,7 @@ function stripGeminiIdentity(text: string): string {
     .replace(/Gemini CLI/gi, 'AI CLI');
 }
 
-export function translateGeminiRequest(body: any): any {
+export function translateGeminiRequest(body: any, options: TranslateGeminiRequestOptions = {}): any {
   // 1. System instruction
   let system: string | undefined;
   if (body.systemInstruction?.parts) {
@@ -161,13 +173,16 @@ export function translateGeminiRequest(body: any): any {
   let tools: any;
   if (body.tools) {
     tools = {};
+    let toolCount = 0;
     for (const t of body.tools) {
       if (t.functionDeclarations) {
         for (const fd of t.functionDeclarations) {
+          if (options.maxTools !== undefined && toolCount >= options.maxTools) break;
           tools[fd.name] = tool({
             description: fd.description || '',
             inputSchema: jsonSchema(fd.parameters || { type: 'object', properties: {} }),
           });
+          toolCount++;
         }
       }
     }
@@ -230,9 +245,11 @@ export async function startGeminiProxy(
         modelId: route.realModelId,
         apiKey: route.apiKey,
         baseURL: route.baseURL,
-        providerId: route.aliasId,
+        providerId: route.providerId ?? route.aliasId,
         authType: route.authType,
         oauthAccountId: route.oauthAccountId,
+        providerData: route.providerData,
+        headers: route.headers,
       });
       models.set(route.aliasId, m);
     }
@@ -312,7 +329,7 @@ export async function startGeminiProxy(
             const availableList = routes.map(r => `  - ${r.aliasId} (${r.displayName})`).join('\n');
             const exampleId = routes.length > 1 ? routes[1].aliasId : (routes[0]?.aliasId ?? 'deepseek-v4');
             const text = `Current model: ${current.displayName} (${current.aliasId})\n\nAvailable models:\n${availableList}\n\n💡 To switch models, type: .model <id>\nExample: .model ${exampleId}`;
-            sendMockGeminiResponse(res, text, isStream);
+            sendMockGeminiResponse(res, text, isStream, current.aliasId);
             return;
           }
 
@@ -320,7 +337,7 @@ export async function startGeminiProxy(
           if (targetRoute) {
             sessionRouteOverride = targetRoute;
             plog(`.model switch: ${targetRoute.aliasId} (${targetRoute.realModelId})`);
-            sendMockGeminiResponse(res, `✅ Switched model to ${targetRoute.displayName} (${targetRoute.aliasId})`, isStream);
+            sendMockGeminiResponse(res, `✅ Switched model to ${targetRoute.displayName} (${targetRoute.aliasId})`, isStream, targetRoute.aliasId);
           } else {
             const available = routes.map(r => r.aliasId).join(', ');
             sendMockGeminiResponse(res, `❌ Model '${modelCommand}' not found.\n\nAvailable: ${available}`, isStream);
@@ -334,7 +351,17 @@ export async function startGeminiProxy(
         body.contents = sanitizeModelSwitchTurns(body.contents || []);
 
         const languageModel = await getOrInitModel(route);
-        const params = translateGeminiRequest(body);
+        const params = applyClaudeCodeOAuthIdentity(
+          { ...route, upstreamModelId: route.realModelId },
+          translateGeminiRequest(body, { maxTools: maxToolsForNpm(route.npm) }),
+        );
+        params.providerOptions = deepMergeProviderOptions(
+          params.providerOptions,
+          deepMergeProviderOptions(
+            thinkingProviderOptions(route.npm || '@ai-sdk/openai-compatible'),
+            effortProviderOptions(route.npm || '@ai-sdk/openai-compatible', 'high', route.realModelId, route),
+          ),
+        );
         plog(`Translated SDK params:\n${JSON.stringify(params, null, 2)}`);
 
         if (isStream) {
@@ -361,7 +388,8 @@ export async function startGeminiProxy(
             if (isThinking && (p.type === 'tool-input-start' || p.type === 'tool-call' || p.type === 'finish')) {
               isThinking = false;
               const chunk = {
-                candidates: [{ content: { role: 'model', parts: [{ text: `\n</thinking>\n\n` }] } }]
+                candidates: [{ content: { role: 'model', parts: [{ text: `\n</thinking>\n\n` }] } }],
+                modelVersion: route.aliasId,
               };
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
             }
@@ -373,7 +401,8 @@ export async function startGeminiProxy(
                 text = `<thinking>\n` + text;
               }
               const chunk = {
-                candidates: [{ content: { role: 'model', parts: [{ text }] } }]
+                candidates: [{ content: { role: 'model', parts: [{ text }] } }],
+                modelVersion: route.aliasId,
               };
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
             } else if (p.type === 'text-delta') {
@@ -388,7 +417,8 @@ export async function startGeminiProxy(
                     role: 'model',
                     parts: [{ text }]
                   }
-                }]
+                }],
+                modelVersion: route.aliasId,
               };
               const data = `data: ${JSON.stringify(chunk)}\n\n`;
               plog(`Streaming text delta: ${p.textDelta}`);
@@ -412,7 +442,8 @@ export async function startGeminiProxy(
                       functionCall: { name, args }
                     }]
                   }
-                }]
+                }],
+                modelVersion: route.aliasId,
               };
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
             } else if (p.type === 'finish') {
@@ -423,7 +454,8 @@ export async function startGeminiProxy(
                 usageMetadata: {
                   promptTokenCount: p.totalUsage?.inputTokens || 0,
                   candidatesTokenCount: p.totalUsage?.outputTokens || 0,
-                }
+                },
+                modelVersion: route.aliasId,
               };
               plog(`Stream finish. Reason: ${p.finishReason}`);
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
@@ -450,7 +482,7 @@ export async function startGeminiProxy(
           if (result.toolCalls?.length) {
             for (const tc of result.toolCalls) {
               parts.push({
-                functionCall: { name: tc.toolName, args: (tc as any).args }
+                functionCall: { name: tc.toolName, args: tc.input }
               });
             }
           }
@@ -466,7 +498,8 @@ export async function startGeminiProxy(
             usageMetadata: {
               promptTokenCount: result.usage?.inputTokens || 0,
               candidatesTokenCount: result.usage?.outputTokens || 0,
-            }
+            },
+            modelVersion: route.aliasId,
           };
 
           plog(`Response:\n${JSON.stringify(response, null, 2)}`);
@@ -481,17 +514,16 @@ export async function startGeminiProxy(
       res.end('Not Found');
     } catch (err) {
       plog(`Error handling request: ${err instanceof Error ? err.stack || err.message : String(err)}`);
+      const errMsg = formatUpstreamError(err);
       if (debug) {
-        console.error('[Gemini Proxy] Critical error in handler:', err);
+        console.error(`[Gemini Proxy] ${errMsg}`);
       }
-      const errMsg = err instanceof Error ? err.message : String(err);
       if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: errMsg } }));
+        sendMockGeminiResponse(res, `⚠ ${errMsg}`, req.url?.includes('streamGenerateContent') ?? false);
       } else {
-        // Headers already sent — we're mid-SSE stream; emit an error event before closing
+        // Headers already sent — we're mid-SSE stream; emit a normal Gemini text chunk before closing.
         try {
-          res.write(`data: ${JSON.stringify({ error: { message: errMsg } })}\n\n`);
+          writeGeminiStreamText(res, `⚠ ${errMsg}`);
         } catch {
           // ignore write errors on a closing socket
         }
@@ -580,26 +612,14 @@ export function parseModelCommand(turn: any): string | null {
   return trimmed.slice(7).trim();
 }
 
-function sendMockGeminiResponse(res: ServerResponse, text: string, isStream: boolean): void {
+function sendMockGeminiResponse(res: ServerResponse, text: string, isStream: boolean, modelVersion?: string): void {
   if (isStream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
     });
-    const chunk = {
-      candidates: [{
-        content: { role: 'model', parts: [{ text }] },
-        finishReason: 'STOP',
-      }],
-      usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0 },
-    };
-    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    const finishChunk = {
-      candidates: [{ finishReason: 'STOP' }],
-      usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0 }
-    };
-    res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
+    writeGeminiStreamText(res, text, modelVersion);
     res.end();
   } else {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -609,6 +629,25 @@ function sendMockGeminiResponse(res: ServerResponse, text: string, isStream: boo
         finishReason: 'STOP',
       }],
       usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0 },
+      ...(modelVersion ? { modelVersion } : {}),
     }));
   }
+}
+
+function writeGeminiStreamText(res: ServerResponse, text: string, modelVersion?: string): void {
+  const chunk = {
+    candidates: [{
+      content: { role: 'model', parts: [{ text }] },
+      finishReason: 'STOP',
+    }],
+    usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0 },
+    ...(modelVersion ? { modelVersion } : {}),
+  };
+  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  const finishChunk = {
+    candidates: [{ finishReason: 'STOP' }],
+    usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0 },
+    ...(modelVersion ? { modelVersion } : {}),
+  };
+  res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
 }

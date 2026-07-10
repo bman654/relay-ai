@@ -1,6 +1,6 @@
 // provider-auth.ts — relay-ai providers auth (native device-code + OpenCode broker)
 
-import { printOAuthStepsPanel } from '../ui.js';
+import { printOAuthStepsPanel, confirmSubscriptionOAuthRisk } from '../ui.js';
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
 import open from 'open';
@@ -8,11 +8,17 @@ import { saveProviderCredential } from '../env.js';
 import { runOpenAiDeviceCodeFlow } from '../oauth/openai.js';
 import {
   supportsNativeOAuth,
+  isBrowserRedirectOAuth,
   tokensToStoredCredential,
   type NativeOAuthProviderId,
 } from '../oauth/types.js';
 import { runXaiDeviceCodeFlow } from '../oauth/xai.js';
 import { runGithubDeviceCodeFlow } from '../oauth/github.js';
+import {
+  runClaudeCodeOAuthFlow,
+  generateCliUserID,
+} from '../oauth/claude-code.js';
+import { runAntigravityOAuthFlow } from '../oauth/antigravity-oauth.js';
 import { getTemplateById } from '../provider-templates.js';
 import { fetchRawOpencodeProviders } from '../opencode-serve.js';
 import { findOpencodeBinary } from '../opencode-serve.js';
@@ -23,6 +29,8 @@ import { loadRegistry, saveRegistry } from './io.js';
 import { oauthCredentialToKeychainJson, type OpencodeOAuthCredential } from './opencode-auth.js';
 import { refreshProviderModels } from './refresh-models.js';
 import type { RegistryProvider } from './types.js';
+
+export type { OpencodeOAuthCredential } from './opencode-auth.js';
 
 export type ProviderAuthMethod = 'native' | 'broker';
 
@@ -44,6 +52,8 @@ const PROVIDER_DISPLAY: Record<NativeOAuthProviderId, string> = {
   openai: OPENAI_DISPLAY,
   'openai-oauth': OPENAI_DISPLAY,
   'github-copilot': 'GitHub Copilot (Individual / Business)',
+  'claude-code': 'Claude Code (Anthropic subscription)',
+  antigravity: 'Antigravity (Google Cloud Code Assist)',
 };
 
 function openBrowser(url: string): void {
@@ -97,12 +107,104 @@ async function runNativeDeviceCode(providerId: NativeOAuthProviderId): Promise<O
   }
 }
 
+async function runNativeBrowserOAuth(providerId: NativeOAuthProviderId): Promise<OpencodeOAuthCredential> {
+  if (providerId !== 'claude-code' && providerId !== 'antigravity') {
+    throw new Error(`Browser OAuth for "${providerId}" is not yet implemented.`);
+  }
+
+  const confirmed = await confirmSubscriptionOAuthRisk(providerId);
+  if (!confirmed) throw new Error('Cancelled');
+
+  if (providerId === 'claude-code') {
+    const spinner = p.spinner();
+    spinner.start('Opening browser for Anthropic sign-in…');
+    try {
+      const { tokens, bootstrap } = await runClaudeCodeOAuthFlow((url) => {
+        spinner.stop('');
+        p.log.info(`Opening: ${pc.cyan(url)}`);
+      }, async () => {
+        const code = await p.text({
+          message: 'Paste the authorization code or callback URL from Anthropic',
+          placeholder: 'code from browser',
+          validate: (value) => value.trim() ? undefined : 'Authorization code is required',
+        });
+        if (p.isCancel(code)) throw new Error('Cancelled');
+        spinner.start('Exchanging authorization code…');
+        return code;
+      });
+      spinner.stop(pc.green('Signed in to Claude Code'));
+
+      const providerData: Record<string, unknown> = { cliUserID: generateCliUserID() };
+      if (bootstrap.accountId) providerData.accountUUID = bootstrap.accountId;
+      if (bootstrap.organizationId) providerData.organizationUUID = bootstrap.organizationId;
+      if (bootstrap.organizationName) providerData.organizationName = bootstrap.organizationName;
+      if (bootstrap.plan) providerData.plan = bootstrap.plan;
+
+      return tokensToStoredCredential(tokens, undefined, bootstrap.accountId, providerData);
+    } catch (err) {
+      spinner.stop('');
+      throw err;
+    }
+  }
+
+  // Antigravity OAuth
+  const spinner = p.spinner();
+  spinner.start('Opening browser for Google sign-in…');
+  try {
+    const { tokens, userInfo, projectId, tierId } = await runAntigravityOAuthFlow((url) => {
+      spinner.stop('');
+      p.log.info(`Opening: ${pc.cyan(url)}`);
+      spinner.start('Waiting for authorization…');
+    });
+    spinner.stop(pc.green('Signed in to Antigravity'));
+
+    const providerData: Record<string, unknown> = {};
+    if (projectId) providerData.projectId = projectId;
+    if (tierId) providerData.tier = tierId;
+
+    return tokensToStoredCredential(tokens, undefined, userInfo.email, providerData);
+  } catch (err) {
+    spinner.stop('');
+    throw err;
+  }
+}
+
+export async function saveNativeOAuthCredential(
+  providerId: string,
+  tokens: import('../oauth/types.js').OAuthTokenResponse,
+  accountId?: string,
+  providerData?: Record<string, unknown>,
+): Promise<void> {
+  const cred = tokensToStoredCredential(tokens, undefined, accountId, providerData);
+  const registryId = toOAuthRegistryId(providerId);
+  let diagMsg = '';
+  const saved = await saveProviderCredential(
+    oauthAuthRef(registryId),
+    oauthCredentialToKeychainJson(cred),
+    (msg) => { diagMsg = msg; },
+  );
+  if (!saved) throw new Error(`Could not save OAuth tokens to Keychain${diagMsg ? ` — ${diagMsg}` : ' — grant access and try again'}`);
+  await upsertOAuthProvider(providerId, cred);
+}
+
+/**
+ * OAuth providers that share a templateId with an API-key provider (xai, openai)
+ * need a distinguishing display name so the two don't show identically in
+ * pickers. Applied regardless of which path builds the registry entry below.
+ */
+function oauthDisplayName(registryId: string, fallbackName: string): string {
+  if (registryId === 'openai-oauth') return 'OpenAI (ChatGPT)';
+  if (registryId === 'xai-oauth') return 'xAI (SuperGrok)';
+  return fallbackName;
+}
+
 async function upsertOAuthProvider(providerId: string, cred: OpencodeOAuthCredential): Promise<RegistryProvider> {
   const registryId = toOAuthRegistryId(providerId);
   const templateId = providerId.replace(/-oauth$/, '') || providerId;
 
   const registry = loadRegistry();
   const authRef = oauthAuthRef(registryId);
+  const template = getTemplateById(templateId);
   let entry: RegistryProvider | undefined = registry.providers.find(pr => pr.id === registryId);
 
   if (!entry) {
@@ -112,19 +214,27 @@ async function upsertOAuthProvider(providerId: string, cred: OpencodeOAuthCreden
       const lp = providers.find(pr => pr.id === registryId || pr.id === providerId);
       if (lp) {
         const converted = localProviderToRegistry(lp, { authType: 'oauth', authRef });
-        if (converted) entry = { ...converted, id: registryId, templateId };
+        if (converted) {
+          entry = {
+            ...converted,
+            id: registryId,
+            templateId,
+            name: oauthDisplayName(registryId, converted.name),
+            api: {
+              ...converted.api,
+              ...(template?.headers ? { headers: { ...template.headers, ...converted.api.headers } } : {}),
+            },
+          };
+        }
       }
     }
   }
 
   if (!entry) {
-    const template = getTemplateById(templateId);
     if (!template) {
       throw new Error(`Provider "${providerId}" is not in your registry and has no template`);
     }
-    const displayName = registryId === 'openai-oauth' ? 'OpenAI (ChatGPT)' 
-      : registryId === 'xai-oauth' ? 'xAI (SuperGrok)' 
-      : template.name;
+    const displayName = oauthDisplayName(registryId, template.name);
     entry = {
       id: registryId,
       templateId,
@@ -132,7 +242,11 @@ async function upsertOAuthProvider(providerId: string, cred: OpencodeOAuthCreden
       enabled: true,
       authRef,
       authType: 'oauth',
-      api: { npm: template.npm, url: template.defaultBaseUrl ?? '' },
+      api: {
+        npm: template.npm,
+        url: template.defaultBaseUrl ?? '',
+        ...(template.headers ? { headers: template.headers } : {}),
+      },
       addedAt: new Date().toISOString(),
     };
   } else {
@@ -155,9 +269,14 @@ export async function authenticateProvider(
   if (!supportsNativeOAuth(providerId)) {
     if (findOpencodeBinary()) {
       const cred = await runOpencodeAuthBroker(providerId, { method: options.brokerMethod });
-      const saved = await saveProviderCredential(oauthAuthRef(registryId), oauthCredentialToKeychainJson(cred));
+      let brokerDiagMsg = '';
+      const saved = await saveProviderCredential(
+        oauthAuthRef(registryId),
+        oauthCredentialToKeychainJson(cred),
+        (msg) => { brokerDiagMsg = msg; },
+      );
       if (!saved) {
-        p.log.warn('Could not save OAuth tokens to Keychain — session may not persist.');
+        p.log.warn(`Could not save OAuth tokens to Keychain — ${brokerDiagMsg || 'session may not persist.'}`);
       }
       const registryProvider = await upsertOAuthProvider(providerId, cred);
       return { providerId: registryId, credential: cred, registryProvider };
@@ -168,6 +287,12 @@ export async function authenticateProvider(
   }
 
   let method = options.method;
+  if (isBrowserRedirectOAuth(providerId)) {
+    if (method === 'broker') {
+      throw new Error(`Via OpenCode is not supported for "${providerId}". Use the built-in OAuth flow.`);
+    }
+    method = 'native';
+  }
   if (!method) {
     const hasOpencode = findOpencodeBinary() !== null;
     if (hasOpencode) {
@@ -187,11 +312,18 @@ export async function authenticateProvider(
 
   const cred = method === 'broker'
     ? await runOpencodeAuthBroker(providerId, { method: options.brokerMethod })
-    : await runNativeDeviceCode(providerId);
+    : isBrowserRedirectOAuth(providerId)
+      ? await runNativeBrowserOAuth(providerId)
+      : await runNativeDeviceCode(providerId);
 
-  const saved = await saveProviderCredential(oauthAuthRef(registryId), oauthCredentialToKeychainJson(cred));
+  let nativeDiagMsg = '';
+  const saved = await saveProviderCredential(
+    oauthAuthRef(registryId),
+    oauthCredentialToKeychainJson(cred),
+    (msg) => { nativeDiagMsg = msg; },
+  );
   if (!saved) {
-    p.log.warn('Could not save OAuth tokens to Keychain — session may not persist.');
+    p.log.warn(`Could not save OAuth tokens to Keychain — ${nativeDiagMsg || 'session may not persist.'}`);
   }
 
   const registryProvider = await upsertOAuthProvider(providerId, cred);
@@ -218,10 +350,10 @@ ${pc.bold('Usage:')}
   relay-ai providers auth github-copilot
 
 ${pc.bold('Options:')}
-  --native    Use built-in device-code flow (xai, openai, github-copilot)
+  --native    Use built-in OAuth flow
   --broker    Delegate to OpenCode auth login
 
-${pc.bold('Supported native OAuth:')}
+${pc.bold('Device code (works on SSH/VPS):')}
   xai              SuperGrok / X Premium (device code at x.ai/device)
   openai           ChatGPT Plus/Pro (device code at auth.openai.com/codex/device)
   github-copilot   GitHub Copilot Individual/Business (device code at github.com/login/device)`;

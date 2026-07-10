@@ -9,7 +9,7 @@ import {
   restoreConfigFromState,
   previewAppConfigToml,
 } from '../src/codex/app-config.js';
-import { CODEX_APP_PROVIDER_ID, CODEX_APP_DISPLAY_MODEL } from '../src/codex/app-profile.js';
+import { CODEX_APP_PROVIDER_ID } from '../src/codex/app-profile.js';
 import type { CodexAppConfigSpec } from '../src/codex/app-profile.js';
 
 describe('app-config', () => {
@@ -54,9 +54,22 @@ describe('app-config', () => {
     expect(text).toContain('model_provider = "openai"');
     expect(text).toContain('openai_base_url = "http://127.0.0.1:54321/v1"');
     expect(text).toContain('127.0.0.1:54321');
-    expect(text).toContain(`model = "${CODEX_APP_DISPLAY_MODEL}"`);
+    expect(text).toContain('model = "claude-sonnet-4-6"');
     expect(text).not.toContain(`[model_providers.${CODEX_APP_PROVIDER_ID}]`);
     expect(text).toContain('model_reasoning_effort = "high"');
+  });
+
+  it('uses an early auto-compact threshold for relay models', () => {
+    const configPath = join(home, '.codex', 'config.toml');
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    const spec = proxySpec(join(home, '.relay-ai', 'codex', 'app-models-anthropic.json'));
+    spec.route.contextWindow = 200_000;
+
+    applyAppConfigPatch(spec, configPath);
+
+    const text = readFileSync(configPath, 'utf8');
+    expect(text).toContain('model_context_window = 200000');
+    expect(text).toContain('model_auto_compact_token_limit = 110000');
   });
 
   it('restore state round-trips model_reasoning_effort', () => {
@@ -125,6 +138,26 @@ describe('app-config', () => {
     }, configPath);
     const after = readFileSync(configPath, 'utf8');
     expect(after).toContain('openai_base_url = "https://example.test/v1"');
+  });
+
+  it('writes favorites slug as model field', () => {
+    const configPath = join(home, '.codex', 'config.toml');
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    const spec: CodexAppConfigSpec = {
+      route: {
+        tier: 'proxy',
+        npm: '@ai-sdk/openai-compatible',
+        apiKey: 'sk-test',
+        upstreamModelId: 'big-pickle',
+        modelId: 'zen__big-pickle',
+        providerId: 'zen',
+      },
+      proxyPort: 54321,
+      catalogPath: '/tmp/favorites-catalog.json',
+    };
+    applyAppConfigPatch(spec, configPath);
+    const text = readFileSync(configPath, 'utf8');
+    expect(text).toContain('model = "zen__big-pickle"');
   });
 
   it('preview validates without writing', () => {

@@ -358,7 +358,7 @@ API GATEWAY (for tools that speak Anthropic/OpenAI HTTP)
   relay-ai server --vertex        Vertex AI gateway (gcloud ADC)
 
 DESKTOP APPS
-  relay-ai codex-app              Codex desktop (macOS/Windows)
+  relay-ai codex-app              ChatGPT desktop, Codex mode (macOS/Windows); alias: chatgpt
   relay-ai claude-app             Claude desktop (macOS/Windows)
 
 ================================================================================

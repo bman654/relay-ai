@@ -34,6 +34,22 @@ describe('resolveReasoningCapabilities', () => {
     expect(caps.levels).toEqual([]);
     expect(caps.defaultLevel).toBe('');
   });
+
+  it('exposes GLM-5.2 high/xhigh controls for OpenCode Go style routes', () => {
+    const caps = resolveReasoningCapabilities({
+      providerId: 'go',
+      npm: '@ai-sdk/openai-compatible',
+      modelId: 'glm-5.2',
+      reasoning: true,
+      interleavedReasoningField: 'reasoning_content',
+    });
+
+    expect(caps.mode).toBe('controllable');
+    expect(caps.source).toBe('provider-rule');
+    expect(caps.confidence).toBe('documented');
+    expect(caps.levels).toEqual(['high', 'xhigh']);
+    expect(caps.defaultLevel).toBe('high');
+  });
 });
 
 describe('effortProviderOptions', () => {
@@ -49,6 +65,30 @@ describe('effortProviderOptions', () => {
           effort: 'high',
           exclude: false,
         },
+      },
+    });
+  });
+
+  it('maps GLM-5.2 effort to providerOptions with correct camel-cased key and wire value', () => {
+    expect(
+      effortProviderOptions('@ai-sdk/openai-compatible', 'xhigh', 'glm-5.2', {
+        providerId: 'opencode-go',
+      }),
+    ).toEqual({
+      opencodeGo: {
+        reasoningEffort: 'max',
+      },
+    });
+  });
+
+  it('maps Kimi effort to providerOptions with correct camel-cased key', () => {
+    expect(
+      effortProviderOptions('@ai-sdk/openai-compatible', 'high', 'kimi-k2.7-code', {
+        providerId: 'kimi-code',
+      }),
+    ).toEqual({
+      kimiCode: {
+        reasoningEffort: 'high',
       },
     });
   });

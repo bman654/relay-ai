@@ -1,5 +1,7 @@
 // src/registry/types.ts — native provider registry schema (no secrets)
 
+import type { FreeStatus } from '../free-models.js';
+
 export const REGISTRY_SCHEMA_VERSION = 1;
 
 export type RegistrySubscriptionFilter = 'free' | 'zen' | 'go';
@@ -11,8 +13,10 @@ export interface CachedModel {
   family?: string;
   brand?: string;
   contextWindow?: number;
-  cost?: { input: number; output: number };
-  modelFormat: 'anthropic' | 'openai';
+  cost?: { input: number; output: number; cache_read?: number; cache_write?: number };
+  isFree?: boolean;
+  freeStatus?: FreeStatus;
+  modelFormat: 'anthropic' | 'openai' | 'cloud-code';
   /** Per-model override — wins over provider-level api.npm */
   npm?: string;
   /** Per-model override — wins over provider-level api.url */
@@ -38,6 +42,8 @@ export interface RegistryProvider {
     npm?: string;
     url?: string;
     id?: string;
+    /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
+    headers?: Record<string, string>;
   };
   modelsCache?: {
     fetchedAt: string;

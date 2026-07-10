@@ -1,5 +1,5 @@
 // Spawn Codex CLI with relay-ai-launch profile.
-import { execSync, spawn } from 'node:child_process';
+import { execFileSync, execSync, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +7,7 @@ import { CODEX_LAUNCH_SANDBOX, profileName } from './profile.js';
 import { codexProviderEnvKey } from './routing.js';
 import type { CodexRoute } from './routing.js';
 import { PROXY_PLACEHOLDER_KEY } from '../codex-proxy.js';
+import { getAppPathOverride } from '../config.js';
 
 const isWindows = process.platform === 'win32';
 
@@ -44,21 +45,53 @@ const CODEX_FALLBACK_PATHS = isWindows
     ];
 
 export function findCodexBinary(): string | null {
+  const override = getAppPathOverride('codex');
+  if (override) return selectCodexBinary([override], existsSync, canRunCodexBinary);
+
+  const candidates: string[] = [];
   try {
     const result = execSync(isWindows ? 'where.exe codex' : 'which codex', {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const lines = result.trim().split('\n').map(l => l.trim()).filter(Boolean);
-    const path = (isWindows ? lines.find(l => l.toLowerCase().endsWith('.cmd')) : null) ?? lines[0];
-    if (path) return path;
+    if (isWindows) {
+      candidates.push(...lines.filter(l => l.toLowerCase().endsWith('.cmd')));
+    }
+    candidates.push(...lines);
   } catch {
     // try fallbacks
   }
-  for (const path of CODEX_FALLBACK_PATHS) {
-    if (existsSync(path)) return path;
+  candidates.push(...CODEX_FALLBACK_PATHS);
+  return selectCodexBinary(candidates, existsSync, canRunCodexBinary);
+}
+
+export function selectCodexBinary(
+  candidates: string[],
+  exists: (path: string) => boolean,
+  canRun: (path: string) => boolean,
+): string | null {
+  const seen = new Set<string>();
+  for (const path of candidates) {
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    if (exists(path) && canRun(path)) return path;
   }
   return null;
+}
+
+function canRunCodexBinary(path: string): boolean {
+  try {
+    execFileSync(path, ['--version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+      shell: isWindows,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function codexArgsIncludeSandboxFlag(args: string[]): boolean {

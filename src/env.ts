@@ -67,6 +67,26 @@ export function buildChildEnv(
   return env;
 }
 
+/** Child env for Antigravity — only CLOUD_CODE_URL, no Anthropic proxy vars. */
+export function buildAntigravityChildEnv(gatewayUrl: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of CONFLICTING_ENV_VARS) {
+    delete env[name];
+  }
+  env['CLOUD_CODE_URL'] = gatewayUrl;
+
+  // Inject dummy API keys to bypass agy's slow keychain lookup (~500ms).
+  // This prevents the race condition where loadCodeAssist fails and falls back
+  // to the hardcoded, unsupported FLASH_LITE model.
+  // The local Cloud Code Gateway ignores these keys, so any dummy value works.
+  env['ANTIGRAVITY_API_KEY'] = 'relay-dummy-key';
+  env['GEMINI_API_KEY'] = 'relay-dummy-key';
+  env['GOOGLE_API_KEY'] = 'relay-dummy-key';
+  env['GOOGLE_GEMINI_API_KEY'] = 'relay-dummy-key';
+
+  return env;
+}
+
 /** Classify a keyring error into a human-readable reason (never throws). */
 export function classifyKeyringError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
@@ -86,6 +106,13 @@ export function classifyKeyringError(err: unknown): string {
 const KEYRING_SERVICE = 'relay-ai';
 /** @deprecated Use GLOBAL_OPENCODE_KEYRING_ACCOUNT — kept for migration reads */
 const KEYRING_ACCOUNT = 'relay-ai';
+// Windows Credential Manager caps a single credential blob at 2560 bytes (CredWriteW).
+// keyring-rs encodes the password as UTF-16 (2 bytes/char) before that check, so the
+// usable limit is 2560 / 2 = 1280 chars — long OAuth tokens (e.g. OpenAI's JWTs) exceed
+// this, so secrets above the threshold are split across multiple keyring entries.
+// Harmless on macOS/Linux, which have no such limit.
+const KEYRING_CHUNK_PREFIX = '__relay_chunked__:';
+const KEYRING_CHUNK_SIZE = 1200;
 const LEGACY_KEYRING_SERVICE = 'opencode-starter';
 const LEGACY_KEYRING_ACCOUNT = 'opencode-starter';
 
@@ -137,7 +164,14 @@ function readEnvCredential(varName: string): string | null {
 async function readKeyringAccount(account: string, diag?: (msg: string) => void): Promise<string | null> {
   try {
     const { Entry } = await import('@napi-rs/keyring');
-    return new Entry(KEYRING_SERVICE, account).getPassword() ?? null;
+    const value = new Entry(KEYRING_SERVICE, account).getPassword() ?? null;
+    if (!value?.startsWith(KEYRING_CHUNK_PREFIX)) return value;
+    const chunkCount = Number(value.slice(KEYRING_CHUNK_PREFIX.length));
+    let combined = '';
+    for (let i = 0; i < chunkCount; i++) {
+      combined += new Entry(KEYRING_SERVICE, `${account}::chunk::${i}`).getPassword() ?? '';
+    }
+    return combined;
   } catch (err) {
     diag?.(classifyKeyringError(err));
     return null;
@@ -151,7 +185,16 @@ async function writeKeyringAccount(
 ): Promise<boolean> {
   try {
     const { Entry } = await import('@napi-rs/keyring');
-    new Entry(KEYRING_SERVICE, account).setPassword(key);
+    if (key.length <= KEYRING_CHUNK_SIZE) {
+      new Entry(KEYRING_SERVICE, account).setPassword(key);
+      return true;
+    }
+    const chunkCount = Math.ceil(key.length / KEYRING_CHUNK_SIZE);
+    for (let i = 0; i < chunkCount; i++) {
+      const chunk = key.slice(i * KEYRING_CHUNK_SIZE, (i + 1) * KEYRING_CHUNK_SIZE);
+      new Entry(KEYRING_SERVICE, `${account}::chunk::${i}`).setPassword(chunk);
+    }
+    new Entry(KEYRING_SERVICE, account).setPassword(`${KEYRING_CHUNK_PREFIX}${chunkCount}`);
     return true;
   } catch (err) {
     diag?.(classifyKeyringError(err));
@@ -162,6 +205,13 @@ async function writeKeyringAccount(
 async function deleteKeyringAccount(account: string, diag?: (msg: string) => void): Promise<boolean> {
   try {
     const { Entry } = await import('@napi-rs/keyring');
+    const value = new Entry(KEYRING_SERVICE, account).getPassword();
+    if (value?.startsWith(KEYRING_CHUNK_PREFIX)) {
+      const chunkCount = Number(value.slice(KEYRING_CHUNK_PREFIX.length));
+      for (let i = 0; i < chunkCount; i++) {
+        new Entry(KEYRING_SERVICE, `${account}::chunk::${i}`).deletePassword();
+      }
+    }
     new Entry(KEYRING_SERVICE, account).deletePassword();
     return true;
   } catch (err) {
@@ -267,6 +317,16 @@ export async function resolveProviderOAuthAccountId(
   if (!parsed || parsed.kind !== 'keyring' || !oauthProviderIdFromAccount(parsed.account)) return undefined;
   const raw = await readKeyringAccount(parsed.account, diag);
   return parseStoredOAuthCredential(raw)?.accountId;
+}
+
+export async function resolveProviderOAuthProviderData(
+  authRef: string,
+  diag?: (msg: string) => void,
+): Promise<Record<string, unknown> | undefined> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== 'keyring' || !oauthProviderIdFromAccount(parsed.account)) return undefined;
+  const raw = await readKeyringAccount(parsed.account, diag);
+  return parseStoredOAuthCredential(raw)?.providerData;
 }
 
 function decodeProviderSecret(raw: string | null): string | null {

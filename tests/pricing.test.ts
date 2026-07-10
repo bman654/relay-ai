@@ -50,4 +50,31 @@ describe('pricing enrich', () => {
     const enriched = enrichModelsWithPricing(models, index, 'groq');
     expect(enriched[0]?.cost?.input).toBe(0.59);
   });
+
+  it('marks enriched zero-cost models as verified free', () => {
+    const index = buildPricingIndex({
+      models: [{
+        model_id: 'vendor/free-model',
+        pricing: [{
+          platform: 'openrouter',
+          tier: 'standard',
+          modality: 'text',
+          input_per_1m_tokens: 0,
+          output_per_1m_tokens: 0,
+        }],
+      }],
+    });
+    const enriched = enrichModelsWithPricing([{
+      id: 'vendor/free-model',
+      name: 'Free Model',
+      upstreamModelId: 'vendor/free-model',
+      modelFormat: 'openai',
+    }], index, 'openrouter');
+
+    expect(enriched[0]).toMatchObject({
+      cost: { input: 0, output: 0 },
+      isFree: true,
+      freeStatus: 'verified_free',
+    });
+  });
 });

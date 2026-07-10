@@ -3,6 +3,7 @@
 import { saveProviderCredential } from '../env.js';
 import { isSdkMigratedNpm } from '../provider-factory.js';
 import type { ProviderTemplate } from '../provider-templates.js';
+import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 import { fetchTemplateModels } from './fetch-template-models.js';
 import { loadRegistry, saveRegistry } from './io.js';
 import {
@@ -36,6 +37,18 @@ async function probeTemplatePackage(template: ProviderTemplate): Promise<string 
   }
 }
 
+function filterAnonymousFreeModels<T extends { cost?: { input: number; output: number }; isFree?: boolean; freeStatus?: ReturnType<typeof classifyFreeStatus> }>(
+  models: T[],
+  template: ProviderTemplate,
+): T[] {
+  if (!template.anonymousFreeModels) return models;
+  return models.filter(model => isFreeStatus(classifyFreeStatus({
+    model,
+    providerId: template.id,
+    templateId: template.id,
+  })));
+}
+
 /** Test API key, persist credential + registry entry. */
 export async function addProviderFromTemplate(
   template: ProviderTemplate,
@@ -48,7 +61,7 @@ export async function addProviderFromTemplate(
   }
 
   const trimmedKey = apiKey.trim();
-  if (!trimmedKey) {
+  if (!trimmedKey && !template.apiKeyOptional) {
     return { added: false, error: 'API key cannot be empty.' };
   }
 
@@ -70,8 +83,19 @@ export async function addProviderFromTemplate(
       hint: fetched.hint,
     };
   }
+  const usableModels = !trimmedKey && template.anonymousFreeModels
+    ? filterAnonymousFreeModels(fetched.models, template)
+    : fetched.models;
+  if (usableModels.length === 0) {
+    return {
+      added: false,
+      error: 'No free models were returned for anonymous access.',
+      hint: template.signupUrl ? `Add a ${template.name} API key from ${template.signupUrl} to use paid models.` : undefined,
+    };
+  }
 
-  const saved = await saveProviderCredential(`keyring:provider:${template.id}`, trimmedKey);
+  const authRef = `keyring:provider:${template.id}`;
+  const saved = trimmedKey ? await saveProviderCredential(authRef, trimmedKey) : true;
   if (!saved) {
     return {
       added: false,
@@ -84,7 +108,7 @@ export async function addProviderFromTemplate(
   const pricingCache = loadPricingCache();
   const platform = pricingPlatformForProvider(template.id, template.id);
   const pricedModels = enrichModelsWithPricing(
-    fetched.models.map(m => ({ ...m, apiUrl: fetched.baseUrl })),
+    usableModels.map(m => ({ ...m, apiUrl: fetched.baseUrl })),
     buildPricingIndex(pricingCache),
     platform,
   );
@@ -93,7 +117,8 @@ export async function addProviderFromTemplate(
     templateId: template.id,
     name: template.name,
     enabled: true,
-    authRef: `keyring:provider:${template.id}`,
+    authRef,
+    authType: template.authType,
     api: {
       npm: template.npm,
       url: fetched.baseUrl,
@@ -115,5 +140,5 @@ export async function addProviderFromTemplate(
   saveRegistry(registry);
   enrichPricingAsync();
 
-  return { added: true, provider: entry, modelCount: fetched.models.length };
+  return { added: true, provider: entry, modelCount: pricedModels.length };
 }

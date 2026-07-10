@@ -147,6 +147,57 @@ describe('parseArgs', () => {
     });
   });
 
+  it('parses server quick-start aliases', () => {
+    expect(parseArgs(['server', '--quick'])).toMatchObject({
+      command: 'server',
+      serverQuick: true,
+    });
+    expect(parseArgs(['server', '--saved'])).toMatchObject({
+      command: 'server',
+      serverQuick: true,
+    });
+  });
+
+  it('parses one-run server options', () => {
+    expect(parseArgs([
+      'server',
+      '--quick',
+      '--listen',
+      'network',
+      '--providers',
+      'openai,anthropic',
+      '--free-only',
+      '--no-mask-gateway-ids',
+      '--password',
+      'secret',
+    ])).toMatchObject({
+      command: 'server',
+      serverQuick: true,
+      serverListenMode: 'network',
+      serverProvidersMode: 'specific',
+      serverProviderIds: ['openai', 'anthropic'],
+      serverFreeOnly: true,
+      serverMaskGatewayIds: false,
+      serverPassword: 'secret',
+    });
+  });
+
+  it('parses server provider presets and mask flag', () => {
+    expect(parseArgs(['server', '--providers', 'all', '--mask-gateway-ids'])).toMatchObject({
+      command: 'server',
+      serverProvidersMode: 'all',
+      serverMaskGatewayIds: true,
+    });
+    expect(parseArgs(['server', '--providers=favorites'])).toMatchObject({
+      command: 'server',
+      serverProvidersMode: 'favorites',
+    });
+    expect(parseArgs(['server', '--no-free-only'])).toMatchObject({
+      command: 'server',
+      serverFreeOnly: false,
+    });
+  });
+
   it('parses server help', () => {
     expect(parseArgs(['server', '--help'])).toMatchObject({
       command: 'server',
@@ -184,6 +235,15 @@ describe('parseArgs', () => {
     });
   });
 
+  it('parses favorites --agy command', () => {
+    expect(parseArgs(['favorites', '--agy'])).toMatchObject({
+      command: 'models',
+      favoritesAgy: true,
+      showHelp: false,
+      claudeArgs: [],
+    });
+  });
+
   it('parses models help', () => {
     expect(parseArgs(['models', '--help'])).toMatchObject({
       command: 'models',
@@ -202,6 +262,14 @@ describe('parseArgs', () => {
     expect(parseArgs(['providers'])).toMatchObject({
       command: 'providers',
       showHelp: false,
+      claudeArgs: [],
+    });
+  });
+
+  it('consumes ui --trace', () => {
+    expect(parseArgs(['ui', '--trace'])).toMatchObject({
+      command: 'ui',
+      trace: true,
       claudeArgs: [],
     });
   });
@@ -229,6 +297,7 @@ describe('help text', () => {
       'claude-app',
       'codex',
       'codex-app',
+      'antigravity',
       'server',
       'models',
       'favorites',
@@ -249,6 +318,8 @@ describe('help text', () => {
     expect(help).toContain('local providers');
     expect(help).toContain('Commands:');
     expect(help).toContain('Launch OpenAI Codex CLI');
+    expect(help).toContain('relay-ai antigravity');
+    expect(help).toContain('six Antigravity favorites');
   });
 
   it('claude help includes starter options, providers, and switch menu', () => {
@@ -275,7 +346,11 @@ describe('help text', () => {
 
     expect(help).toContain(`v${VERSION}`);
     expect(help).toContain('relay-ai server');
+    expect(help).toContain('relay-ai server --quick');
     expect(help).toContain('relay-ai server --vertex');
+    for (const option of ['--quick', '--saved', '--listen', '--providers', '--free-only', '--no-free-only', '--mask-gateway-ids', '--no-mask-gateway-ids', '--password']) {
+      expect(help).toContain(option);
+    }
     expect(help).toContain('registry providers');
     expect(help).toContain('Vertex AI');
     expect(help).toContain('17645');
@@ -290,11 +365,14 @@ describe('help text', () => {
     const help = modelsHelpText();
 
     expect(help).toContain(`v${VERSION}`);
-    expect(help).toContain('relay-ai models');
+    expect(help).toContain('relay-ai favorites');
+    expect(help).toContain('relay-ai favorites --agy');
     expect(help).toContain('favorites');
     expect(help).toContain('registry');
     expect(help).toContain('/model');
     expect(help).toContain('20');
+    expect(help).toContain('6');
+    expect(help).toContain('Antigravity CLI favorites');
     expect(help).toContain('~/.relay-ai/config.json');
   });
 
@@ -338,5 +416,115 @@ describe('main routing', () => {
 
     await expect(main(['server', '--help'])).resolves.toBe(0);
     expect(log.mock.calls.flat().join('\n')).toContain('relay-ai server');
+  });
+});
+
+describe('parseArgs — antigravity commands', () => {
+  it('parses antigravity app command with no passthrough args', () => {
+    expect(parseArgs(['antigravity'])).toMatchObject({
+      command: 'antigravity',
+      showHelp: false,
+      dryRun: false,
+      trace: false,
+      claudeArgs: [],
+    });
+  });
+
+  it('parses antigravity app --help', () => {
+    expect(parseArgs(['antigravity', '--help'])).toMatchObject({
+      command: 'antigravity',
+      showHelp: true,
+      claudeArgs: [],
+    });
+  });
+
+  it('consumes relay launch flags for antigravity app', () => {
+    expect(parseArgs(['antigravity', '--provider=zen', '--model=deepseek-v4-flash-free', '--wait'])).toMatchObject({
+      command: 'antigravity',
+      launchProvider: 'zen',
+      launchModel: 'deepseek-v4-flash-free',
+      claudeArgs: ['--wait'],
+    });
+  });
+
+  it('parses agy command with no passthrough args', () => {
+    expect(parseArgs(['agy'])).toMatchObject({
+      command: 'agy',
+      showHelp: false,
+      dryRun: false,
+      trace: false,
+      claudeArgs: [],
+    });
+  });
+
+  it('parses agy --help', () => {
+    expect(parseArgs(['agy', '--help'])).toMatchObject({
+      command: 'agy',
+      showHelp: true,
+      claudeArgs: [],
+    });
+  });
+
+  it('parses agy --version', () => {
+    expect(parseArgs(['agy', '--version'])).toMatchObject({
+      command: 'agy',
+      showVersion: true,
+      claudeArgs: [],
+    });
+  });
+
+  it('passes agy passthrough args unchanged', () => {
+    expect(parseArgs(['agy', '-p', 'say hello']).claudeArgs).toEqual(['-p', 'say hello']);
+  });
+
+  it('consumes agy --trace without passing it to agy', () => {
+    expect(parseArgs(['agy', '--trace'])).toMatchObject({
+      command: 'agy',
+      trace: true,
+    });
+    expect(parseArgs(['agy', '--trace']).claudeArgs).toEqual([]);
+  });
+
+  it('consumes relay launch flags for agy', () => {
+    expect(parseArgs(['agy', '--provider=zen', '--model=deepseek-v4-flash-free', '-p', 'fix'])).toMatchObject({
+      command: 'agy',
+      launchProvider: 'zen',
+      launchModel: 'deepseek-v4-flash-free',
+      claudeArgs: ['-p', 'fix'],
+    });
+  });
+
+  it('passes everything after separator to agy unchanged', () => {
+    expect(parseArgs(['agy', '--', '-p', 'hello']).claudeArgs).toEqual(['-p', 'hello']);
+  });
+
+  it('parses antigravity-ide command with no passthrough args', () => {
+    expect(parseArgs(['antigravity-ide'])).toMatchObject({
+      command: 'antigravity-ide',
+      showHelp: false,
+      dryRun: false,
+      trace: false,
+      claudeArgs: [],
+    });
+  });
+
+  it('parses antigravity-ide --help', () => {
+    expect(parseArgs(['antigravity-ide', '--help'])).toMatchObject({
+      command: 'antigravity-ide',
+      showHelp: true,
+      claudeArgs: [],
+    });
+  });
+
+  it('consumes antigravity-ide --trace', () => {
+    expect(parseArgs(['antigravity-ide', '--trace'])).toMatchObject({
+      command: 'antigravity-ide',
+      trace: true,
+    });
+    expect(parseArgs(['antigravity-ide', '--trace']).claudeArgs).toEqual([]);
+  });
+
+  it('passes antigravity-ide passthrough args unchanged', () => {
+    expect(parseArgs(['antigravity-ide', '--user-data-dir', '/tmp/test']).claudeArgs).toEqual(['--user-data-dir', '/tmp/test']);
   });
 });

@@ -18,6 +18,8 @@ export interface AddCustomEndpointInput {
   apiKey: string;
   kind: CustomEndpointKind;
   allowInsecureLocal?: boolean;
+  /** Static headers this endpoint requires on every request (e.g. a plan/auth-tracking header). */
+  headers?: Record<string, string>;
 }
 
 export interface AddCustomEndpointResult {
@@ -36,7 +38,11 @@ function modelFormatForKind(kind: CustomEndpointKind): 'anthropic' | 'openai' {
   return kind === 'anthropic' ? 'anthropic' : 'openai';
 }
 
-export async function fetchAnthropicModels(baseUrl: string, apiKey: string): Promise<{ models: CachedModel[]; baseUrl: string; error?: string; hint?: string }> {
+export async function fetchAnthropicModels(
+  baseUrl: string,
+  apiKey: string,
+  extraHeaders?: Record<string, string>,
+): Promise<{ models: CachedModel[]; baseUrl: string; error?: string; hint?: string }> {
   const root = baseUrl.replace(/\/v1\/?$/, '').replace(/\/$/, '');
   const modelsUrl = `${root}/v1/models`;
   const controller = new AbortController();
@@ -49,6 +55,7 @@ export async function fetchAnthropicModels(baseUrl: string, apiKey: string): Pro
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
         Accept: 'application/json',
+        ...extraHeaders,
       },
       redirect: 'manual',
       signal: controller.signal,
@@ -144,9 +151,11 @@ export async function addCustomEndpointProvider(input: AddCustomEndpointInput): 
   const npm = npmForKind(input.kind);
   const apiKey = input.apiKey.trim() || 'local';
 
+  const headers = input.headers && Object.keys(input.headers).length > 0 ? input.headers : undefined;
+
   let fetched: { models: CachedModel[]; baseUrl: string; error?: string; hint?: string };
   if (input.kind === 'anthropic') {
-    fetched = await fetchAnthropicModels(urlCheck.normalizedUrl, apiKey);
+    fetched = await fetchAnthropicModels(urlCheck.normalizedUrl, apiKey, headers);
   } else {
     fetched = await fetchTemplateModels(
       {
@@ -160,6 +169,7 @@ export async function addCustomEndpointProvider(input: AddCustomEndpointInput): 
       },
       apiKey,
       urlCheck.normalizedUrl,
+      headers,
     );
   }
 
@@ -181,7 +191,7 @@ export async function addCustomEndpointProvider(input: AddCustomEndpointInput): 
     name: input.displayName.trim(),
     enabled: true,
     authRef: apiKey === 'local' ? `keyring:provider:${providerId}` : `keyring:provider:${providerId}`,
-    api: { npm, url: fetched.baseUrl },
+    api: { npm, url: fetched.baseUrl, ...(headers ? { headers } : {}) },
     addedAt: now,
     refreshedAt: now,
     modelsCache: {

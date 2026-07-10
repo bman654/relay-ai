@@ -8,31 +8,35 @@ import {
   getSavedServerPassword,
   getServerExposedProviders,
   getServerFavoritesOnly,
+  getServerFreeModelsOnly,
+  getServerListenMode,
   getServerMaskGatewayIds,
   loadPreferences,
   setSavedServerPassword,
   setServerExposedProviders,
   setServerFavoritesOnly,
+  setServerFreeModelsOnly,
+  setServerListenMode,
   setServerMaskGatewayIds,
 } from '../config.js';
 import { BACKENDS, MAX_MODEL_CATALOG } from '../constants.js';
 import {
   fetchProviderCatalog,
   localProvidersToServerModels,
-  zenGoModelsToServerModels,
-  type ProviderCatalog,
 } from '../provider-catalog.js';
+import { providersForTarget } from '../target-compatibility.js';
 import { loadRegistry } from '../registry/io.js';
 import type { ModelInfo } from '../types.js';
 import type { ServerModelInfo, GatewayModelOptions } from './models.js';
 import {
   upstreamModelId,
-  exposedGatewayAliasId,
   gatewayProviderLabel,
+  buildDedupedModelRows,
 } from './models.js';
 import { getReasoningCapabilities } from '../provider-factory.js';
 import {
   askFavoritesOnly,
+  askFreeModelsOnly,
   askListenMode,
   askMaskGatewayIds,
   askSaveServerPassword,
@@ -44,6 +48,7 @@ import { createGatewayModelCatalog } from './models.js';
 import { startServer } from './router.js';
 import {
   filterServerModelsByFavorites,
+  filterServerModelsByFreeStatus,
   filterServerModelsByProviders,
   summarizeServerProviders,
 } from './catalog-filter.js';
@@ -59,13 +64,22 @@ export interface ServerRunConfig {
   exposedProviders: string[] | null;
   maskGatewayIds: boolean;
   favoritesOnly: boolean;
+  freeModelsOnly: boolean;
+  listenMode: 'local' | 'network';
 }
 
 export interface ServerCommandOptions {
   vertex?: boolean;
+  quick?: boolean;
+  listenMode?: 'local' | 'network';
+  providersMode?: 'all' | 'favorites' | 'specific';
+  providerIds?: string[];
+  freeOnly?: boolean;
+  maskGatewayIds?: boolean;
+  password?: string;
 }
 
-function getLocalIps(): Array<{ name: string; address: string }> {
+export function getLocalIps(): Array<{ name: string; address: string }> {
   const ifaces = networkInterfaces();
   const result: Array<{ name: string; address: string }> = [];
   for (const [name, iface] of Object.entries(ifaces)) {
@@ -78,10 +92,13 @@ function getLocalIps(): Array<{ name: string; address: string }> {
   return result;
 }
 
-function printModelCatalog(models: ServerModelInfo[], gateway?: GatewayModelOptions): void {
-  if (models.length === 0) return;
+function cappedWidth(values: string[], label: string, cap: number): number {
+  return Math.max(label.length, ...values.map(value => Math.min(value.length, cap)));
+}
 
-  // Group by provider label, sorted alphabetically
+export function formatModelCatalogLines(models: ServerModelInfo[], gateway?: GatewayModelOptions): string[] {
+  if (models.length === 0) return [];
+
   const groups = new Map<string, ServerModelInfo[]>();
   for (const model of models) {
     const label = gatewayProviderLabel(model);
@@ -92,55 +109,47 @@ function printModelCatalog(models: ServerModelInfo[], gateway?: GatewayModelOpti
     }
     list.push(model);
   }
+
+  const lines: string[] = ['Model catalog:', ''];
   const sortedGroups = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-
-  console.log(pc.bold('Model catalog:'));
-  console.log('');
   for (const [label, groupModels] of sortedGroups) {
-    console.log(`  ${pc.bold(label)}`);
-    // Sort models within each group alphabetically by name
-    const sorted = [...groupModels].sort((a, b) => a.name.localeCompare(b.name));
-    for (const model of sorted) {
-      const anthropicId = exposedGatewayAliasId(model, gateway);
-      console.log(`    ${model.name}`);
-      console.log(`      ${pc.dim('anthropic:')} ${pc.cyan(anthropicId)}`);
-      console.log(`      ${pc.dim('openai:   ')} ${pc.cyan(model.id)}`);
+    const rows = buildDedupedModelRows(groupModels, gateway);
+    const hiddenDuplicates = groupModels.length - rows.length;
+    const duplicateNote = hiddenDuplicates > 0 ? `, ${hiddenDuplicates} duplicate${hiddenDuplicates !== 1 ? 's' : ''} hidden` : '';
+    const nameWidth = cappedWidth(rows.map(row => row.name), 'Model', 28);
+    const anthropicWidth = cappedWidth(rows.map(row => row.anthropicId), 'Anthropic ID', 46);
+    const indexWidth = Math.max(String(rows.length).length, 1);
+
+    lines.push(`  ${label} (${rows.length}${duplicateNote})`);
+    lines.push(`  ${'#'.padStart(indexWidth)}  ${'Model'.padEnd(nameWidth)}  ${'Anthropic ID'.padEnd(anthropicWidth)}  OpenAI ID`);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      lines.push(`  ${String(i + 1).padStart(indexWidth)}  ${row.name.padEnd(nameWidth)}  ${row.anthropicId.padEnd(anthropicWidth)}  ${row.openaiId}`);
     }
-    console.log('');
+    lines.push('');
+  }
+  return lines;
+}
+
+function printModelCatalog(models: ServerModelInfo[], gateway?: GatewayModelOptions): void {
+  if (models.length === 0) return;
+
+  for (const line of formatModelCatalogLines(models, gateway)) {
+    if (line === 'Model catalog:') {
+      console.log(pc.bold(line));
+    } else if (/^  [^#\d\s].+\(\d+/.test(line)) {
+      console.log(pc.bold(line));
+    } else if (/^  \s*#\s+Model\s+Anthropic ID\s+OpenAI ID/.test(line)) {
+      console.log(pc.dim(line));
+    } else {
+      console.log(line);
+    }
   }
 }
 
-function filterZenModelsForServer(models: ModelInfo[]): ModelInfo[] {
-  const zenProvider = loadRegistry().providers.find(entry => entry.id === 'zen' && entry.enabled);
-  if (zenProvider?.subscriptionFilter === 'free') {
-    return models.filter(model => model.isFree);
-  }
-  return models;
-}
-
-function usableGoModels(models: ModelInfo[]): ModelInfo[] {
-  return models.filter(model => model.modelFormat !== 'unsupported');
-}
-
-function providerOptionsFromCatalog(catalog: ProviderCatalog): ServerProviderOption[] {
+export function providerOptionsFromCatalog(catalog: import('../types.js').LocalProvider[]): ServerProviderOption[] {
   const options: ServerProviderOption[] = [];
-  const zenModels = filterZenModelsForServer(catalog.zenModels);
-  if (zenModels.length > 0) {
-    options.push({
-      id: 'zen',
-      name: 'OpenCode Zen',
-      modelCount: zenModels.length,
-    });
-  }
-  const goModels = usableGoModels(catalog.goModels);
-  if (goModels.length > 0) {
-    options.push({
-      id: 'go',
-      name: 'OpenCode Go',
-      modelCount: goModels.length,
-    });
-  }
-  for (const provider of catalog.localProviders) {
+  for (const provider of providersForTarget(catalog, 'server')) {
     options.push({
       id: provider.id,
       name: provider.name,
@@ -154,18 +163,9 @@ export async function loadServerModels(): Promise<ServerModelInfo[]> {
   const catalog = await fetchProviderCatalog({ agent: 'server' });
   const models: ServerModelInfo[] = [];
 
-  const zenModels = filterZenModelsForServer(catalog.zenModels);
-  if (zenModels.length > 0) {
-    models.push(...zenGoModelsToServerModels(zenModels));
-  }
-
-  const goModels = usableGoModels(catalog.goModels);
-  if (goModels.length > 0) {
-    models.push(...zenGoModelsToServerModels(goModels));
-  }
-
-  if (catalog.localProviders.length > 0) {
-    models.push(...localProvidersToServerModels(catalog.localProviders));
+  const serverProviders = providersForTarget(catalog, 'server');
+  if (serverProviders.length > 0) {
+    models.push(...localProvidersToServerModels(serverProviders));
   }
 
   return models.map(enrichServerModelReasoning);
@@ -236,6 +236,66 @@ async function getServerPasswordForMode(
   return { password: serverPassword, wasSaved };
 }
 
+async function getServerPasswordForQuickMode(
+  mode: 'local' | 'network',
+  passwordOverride?: string,
+): Promise<{ password: string | null; wasSaved: boolean } | undefined> {
+  if (mode === 'local') return { password: null, wasSaved: false };
+
+  const trimmedOverride = passwordOverride?.trim();
+  if (trimmedOverride) return { password: trimmedOverride, wasSaved: false };
+
+  const savedPassword = await getSavedServerPassword();
+  if (savedPassword) return { password: savedPassword, wasSaved: true };
+
+  p.log.error('Network server quick-start needs a saved server password or `--password <value>`.');
+  p.log.info('Run `relay-ai server` and choose Configure & start to save one, or pass a one-run password.');
+  return undefined;
+}
+
+function savedServerRunConfig(): ServerRunConfig {
+  return {
+    exposedProviders: getServerExposedProviders(),
+    maskGatewayIds: getServerMaskGatewayIds(),
+    favoritesOnly: getServerFavoritesOnly(),
+    freeModelsOnly: getServerFreeModelsOnly(),
+    listenMode: getServerListenMode(),
+  };
+}
+
+function hasServerRunOverrides(options: ServerCommandOptions): boolean {
+  return options.listenMode !== undefined
+    || options.providersMode !== undefined
+    || options.freeOnly !== undefined
+    || options.maskGatewayIds !== undefined
+    || options.password !== undefined;
+}
+
+function applyServerRunOverrides(config: ServerRunConfig, options: ServerCommandOptions): ServerRunConfig {
+  const next: ServerRunConfig = { ...config };
+
+  if (options.listenMode) next.listenMode = options.listenMode;
+  if (options.freeOnly !== undefined) next.freeModelsOnly = options.freeOnly;
+  if (options.maskGatewayIds !== undefined) next.maskGatewayIds = options.maskGatewayIds;
+
+  if (options.providersMode === 'all') {
+    next.favoritesOnly = false;
+    next.exposedProviders = null;
+  } else if (options.providersMode === 'favorites') {
+    next.favoritesOnly = true;
+    next.exposedProviders = null;
+  } else if (options.providersMode === 'specific') {
+    next.favoritesOnly = false;
+    next.exposedProviders = options.providerIds ?? [];
+  }
+
+  return next;
+}
+
+function shouldUseQuickServerMode(options: ServerCommandOptions): boolean {
+  return Boolean(options.quick || hasServerRunOverrides(options) || !process.stdin.isTTY);
+}
+
 async function configureExposedProviders(): Promise<string[] | null | undefined> {
   p.log.info('Add providers to expose. Listed providers are removed when selected — like favorites.');
   const spinner = p.spinner();
@@ -251,18 +311,14 @@ async function configureExposedProviders(): Promise<string[] | null | undefined>
   return picked;
 }
 
-async function runServerWizard(): Promise<ServerRunConfig | undefined> {
+async function runServerWizard(): Promise<{ runConfig: ServerRunConfig; promptForPassword: boolean } | undefined> {
   relayIntro('Server');
 
   const startMode = await askServerStartMode();
   if (!startMode) return undefined;
 
   if (startMode === 'quick') {
-    return {
-      exposedProviders: getServerExposedProviders(),
-      maskGatewayIds: getServerMaskGatewayIds(),
-      favoritesOnly: getServerFavoritesOnly(),
-    };
+    return { runConfig: savedServerRunConfig(), promptForPassword: false };
   }
 
   const favoritesOnly = await askFavoritesOnly(getServerFavoritesOnly());
@@ -271,6 +327,10 @@ async function runServerWizard(): Promise<ServerRunConfig | undefined> {
   if (favoritesOnly) {
     p.log.info('Manage favorites with `relay-ai models`.');
   }
+
+  const freeModelsOnly = await askFreeModelsOnly(getServerFreeModelsOnly());
+  if (freeModelsOnly === null) return undefined;
+  setServerFreeModelsOnly(freeModelsOnly);
 
   let exposedProviders: string[] | null | undefined = null;
   if (!favoritesOnly) {
@@ -282,7 +342,14 @@ async function runServerWizard(): Promise<ServerRunConfig | undefined> {
   if (maskGatewayIds === null) return undefined;
   setServerMaskGatewayIds(maskGatewayIds);
 
-  return { exposedProviders, maskGatewayIds, favoritesOnly };
+  const listenMode = await askListenMode();
+  if (!listenMode) return undefined;
+  setServerListenMode(listenMode);
+
+  return {
+    runConfig: { exposedProviders, maskGatewayIds, favoritesOnly, freeModelsOnly, listenMode },
+    promptForPassword: true,
+  };
 }
 
 async function runVertexServerCommand(): Promise<number> {
@@ -349,7 +416,7 @@ async function runVertexServerCommand(): Promise<number> {
   return 0;
 }
 
-async function resolveServerUpstreamApiKey(): Promise<string | null> {
+export async function resolveServerUpstreamApiKey(): Promise<string | null> {
   let apiKey = sanitizeCredential(resolveApiKey());
   if (apiKey) return apiKey;
 
@@ -365,7 +432,7 @@ async function resolveServerUpstreamApiKey(): Promise<string | null> {
   }
 
   const catalog = await fetchProviderCatalog({ agent: 'server' });
-  if (catalog.localProviders.some(provider => provider.apiKey.trim())) {
+  if (catalog.some(provider => provider.apiKey.trim() || provider.models.length > 0)) {
     return 'registry-local';
   }
 
@@ -383,16 +450,23 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
     return 1;
   }
 
-  const runConfig = await runServerWizard();
-  if (!runConfig) return 0;
+  const quickMode = shouldUseQuickServerMode(options);
+  const resolved = quickMode
+    ? {
+        runConfig: applyServerRunOverrides(savedServerRunConfig(), options),
+        promptForPassword: false,
+      }
+    : await runServerWizard();
+  if (!resolved) return 0;
 
-  const mode = await askListenMode();
-  if (!mode) return 0;
-
-  const pwResult = await getServerPasswordForMode(mode);
-  if (pwResult === undefined) return 0;
+  const { runConfig, promptForPassword } = resolved;
+  const pwResult = promptForPassword
+    ? await getServerPasswordForMode(runConfig.listenMode)
+    : await getServerPasswordForQuickMode(runConfig.listenMode, options.password);
+  if (pwResult === undefined) return promptForPassword ? 0 : 1;
   const { password: serverPassword, wasSaved: passwordWasSaved } = pwResult;
 
+  const mode = runConfig.listenMode;
   const host = mode === 'network' ? '0.0.0.0' : '127.0.0.1';
   const spinner = p.spinner();
   spinner.start('Fetching available models...');
@@ -417,6 +491,14 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
         return 1;
       }
     }
+    if (runConfig.freeModelsOnly) {
+      models = filterServerModelsByFreeStatus(models);
+      if (models.length === 0) {
+        spinner.stop(pc.red('No free models matched the current server filters'));
+        p.log.error('Turn off free-models-only mode or add a provider with free models.');
+        return 1;
+      }
+    }
     if (runConfig.favoritesOnly) {
       p.log.info(
         `Favorites-only mode active — GET /anthropic/v1/models returns ${models.length} favorites.`,
@@ -435,8 +517,9 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
       ? ` — ${runConfig.exposedProviders.length} provider${runConfig.exposedProviders.length !== 1 ? 's' : ''}`
       : '';
     const favoritesNote = runConfig.favoritesOnly ? ' — favorites only' : '';
+    const freeNote = runConfig.freeModelsOnly ? ' — free models only' : '';
     const maskNote = runConfig.maskGatewayIds ? ' — discovery ids masked' : '';
-    spinner.stop(`Loaded ${models.length} models (${localCount} from registry providers)${filterNote}${favoritesNote}${maskNote}`);
+    spinner.stop(`Loaded ${models.length} models (${localCount} from registry providers)${filterNote}${favoritesNote}${freeNote}${maskNote}`);
     if (summary) p.log.info(summary);
   } catch (err) {
     spinner.stop(pc.red('Failed to load models'));
@@ -478,6 +561,9 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
   }
   if (runConfig.favoritesOnly) {
     console.log(pc.dim('  Catalog:    favorite models only'));
+  }
+  if (runConfig.freeModelsOnly) {
+    console.log(pc.dim('  Pricing:    free/free-access models only'));
   }
   if (runConfig.maskGatewayIds) {
     console.log(pc.dim('  Discovery:  gateway ids masked for Claude Desktop / Cowork'));

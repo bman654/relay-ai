@@ -18,10 +18,17 @@ import {
   type OpenAiRequest,
 } from '../openai-adapter.js';
 import { sendJson, readBody } from '../http-utils.js';
-import { postJsonUpstream, relayAnthropicMessages } from '../upstream-forward.js';
+import { relayAnthropicMessages } from '../upstream-forward.js';
+import { resolveProviderCredential } from '../env.js';
+import { oauthAuthRef } from '../registry/import-build.js';
+import {
+  injectClaudeCodeBillingSystemLine,
+  injectClaudeIdentity,
+  selectBetaFlags,
+} from '../oauth/claude-identity.js';
 import { writeSecureLogLine, resetTraceLog } from '../trace-log.js';
 import type { LanguageModel } from 'ai';
-import { createLanguageModel, isSdkMigratedNpm } from '../provider-factory.js';
+import { createLanguageModel, isSdkMigratedNpm, maxToolsForNpm } from '../provider-factory.js';
 import {
   translateRequest as sdkTranslateRequest,
   streamAnthropicResponse,
@@ -120,7 +127,7 @@ async function routeRequest(req: IncomingMessage, res: ServerResponse, options: 
     }
 
     if (req.method === 'GET' && pathname === '/models') {
-      sendJson(res, 200, { models: options.catalog.list().map(({ apiKey: _apiKey, ...rest }) => rest) });
+      sendJson(res, 200, { models: options.catalog.list().map(({ apiKey: _apiKey, headers: _headers, ...rest }) => rest) });
       return;
     }
 
@@ -182,8 +189,34 @@ async function handleAnthropicMessages(
     const apiKey = model.apiKey ?? options.apiKey;
     const betaHeaderRaw = req.headers['anthropic-beta'];
     const inboundBeta = Array.isArray(betaHeaderRaw) ? betaHeaderRaw.join(',') : betaHeaderRaw;
-    plog(() => `anthropic-passthrough → ${messagesUrl}`);
-    await forwardJson(res, messagesUrl, { ...body, model: upstreamModelId(model) }, apiKey, inboundBeta);
+    const clientWantsStream = Boolean(body.stream);
+    const forwardBody: Record<string, unknown> = { ...body, model: upstreamModelId(model) };
+    const isOAuth = model.authType === 'oauth';
+
+    let effectiveBeta = inboundBeta;
+    let claudeCodeSessionId: string | undefined;
+    if (isOAuth) {
+      const seed = model.providerId ?? upstreamModelId(model);
+      const identity = injectClaudeIdentity(forwardBody, model.providerData, seed);
+      if (model.providerId === 'claude-code') injectClaudeCodeBillingSystemLine(forwardBody);
+      claudeCodeSessionId = identity.sessionId;
+      effectiveBeta = selectBetaFlags(forwardBody, upstreamModelId(model), inboundBeta);
+    }
+
+    const refreshToken = isOAuth && model.providerId
+      ? () => resolveProviderCredential(model.providerId!, oauthAuthRef(model.providerId!))
+      : undefined;
+
+    plog(() => `anthropic-passthrough → ${messagesUrl} oauth=${isOAuth} stream=${clientWantsStream}`);
+    await relayAnthropicMessages(
+      res, messagesUrl, forwardBody, apiKey, clientWantsStream, effectiveBeta,
+      isOAuth ? 'oauth' : 'api',
+      message => plog(message),
+      claudeCodeSessionId,
+      model.headers,
+      refreshToken,
+      refreshed => { model.apiKey = refreshed; },
+    );
     return;
   }
 
@@ -194,6 +227,11 @@ async function handleAnthropicMessages(
     }
     const apiKey = model.apiKey ?? options.apiKey;
     const languageModel = await getOrInitLanguageModel(modelCache, model, model.npm!, model.apiBaseUrl, apiKey, options.vertex);
+    const npmMaxTools = maxToolsForNpm(model.npm);
+    const toolCount = Array.isArray((body as Record<string, unknown>).tools) ? ((body as Record<string, unknown>).tools as unknown[]).length : 0;
+    if (npmMaxTools !== undefined && toolCount > npmMaxTools) {
+      plog(`tools truncated: ${toolCount} → ${npmMaxTools} (provider limit)`);
+    }
     const params = sdkTranslateRequest(body as unknown as AnthropicRequest, model.npm!, {
       defaultEffort: anthropicEffortFromRequest(body as AnthropicRequest) ? undefined : model.defaultEffort,
       openAiOAuth: model.npm === '@ai-sdk/openai' && model.authType === 'oauth',
@@ -203,7 +241,9 @@ async function handleAnthropicMessages(
         supportedParameters: model.supportedParameters,
         reasoning: model.reasoning,
         interleavedReasoningField: model.interleavedReasoningField,
+        upstreamModelId: upstreamModelId(model),
       },
+      maxTools: npmMaxTools,
     });
     const clientWantsStream = Boolean(body.stream);
     // Use the display name in the response model field when masking is on — Claude
@@ -228,6 +268,7 @@ async function handleAnthropicMessages(
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
       if (!res.headersSent) sendJson(res, 502, { error: { message } });
       else res.end();
     }
@@ -297,6 +338,7 @@ async function handleOpenAIChatCompletions(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
     if (!res.headersSent) sendJson(res, 502, { error: { message } });
     else res.end();
   }
@@ -352,6 +394,7 @@ async function getOrInitLanguageModel(
       authType: model.authType,
       oauthAccountId: model.oauthAccountId,
       vertex,
+      headers: model.headers,
     });
     modelCache.set(cacheKey, languageModel);
   }
@@ -362,11 +405,6 @@ function getResponseModelId(bodyModel: unknown, model: ServerModelInfo, options:
   return options.gateway?.maskGatewayIds
     ? gatewayDisplayName(model, options.gateway)
     : (typeof bodyModel === 'string' ? bodyModel : model.id);
-}
-
-async function forwardJson(res: ServerResponse, url: string, body: JsonBody, apiKey: string, inboundBeta?: string): Promise<void> {
-  const upstream = await postJsonUpstream(url, body, apiKey, inboundBeta);
-  sendJson(res, upstream.status, upstream.body);
 }
 
 async function readJson(req: IncomingMessage): Promise<JsonBody | null> {

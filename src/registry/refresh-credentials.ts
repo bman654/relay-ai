@@ -55,7 +55,16 @@ export async function resolveRefreshCredential(
   provider: RegistryProvider,
   resolveKey: (provider: RegistryProvider) => Promise<string | null>,
 ): Promise<string | null> {
-  let key = await resolveKey(provider);
+  // OAuth token refresh (e.g. an expired/revoked refresh token returning 401) throws
+  // rather than resolving to null. Treat that the same as "no key" so callers fall
+  // through to refreshProviderModels' existing friendly "sign in again" messaging
+  // instead of crashing the whole refresh with an unhandled exception.
+  let key: string | null;
+  try {
+    key = await resolveKey(provider);
+  } catch {
+    key = null;
+  }
   if (!isLikelyPlaceholderKey(key)) return key;
 
   for (const envVar of ENV_FALLBACK_BY_PROVIDER[provider.id] ?? []) {

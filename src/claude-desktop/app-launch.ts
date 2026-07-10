@@ -129,14 +129,18 @@ function sleep(ms: number): Promise<void> {
 async function waitForQuit(timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    // Check actual process existence, not window visibility — apps that
+    // minimize to the tray on close clear their window handle immediately
+    // while staying alive, which would make this return early with the
+    // old process (and its old config) still running.
     if (process.platform === 'win32') {
-      if (!winHasWindow()) return true;
+      if (winMatchingPids().length === 0) return true;
     } else if (!darwinIsRunning()) {
       return true;
     }
     await sleep(200);
   }
-  return process.platform === 'win32' ? !winHasWindow() : !darwinIsRunning();
+  return process.platform === 'win32' ? winMatchingPids().length === 0 : !darwinIsRunning();
 }
 
 function openClaudeAppAt(path: string): void {

@@ -20,6 +20,7 @@ export const PROXY_DEBUG_LOG = 'proxy-debug.log';
 export const CODEX_PROXY_DEBUG_LOG = 'codex-proxy-debug.log';
 export const GEMINI_PROXY_DEBUG_LOG = 'gemini-proxy-debug.log';
 export const PROVIDER_DEBUG_LOG = 'provider-debug.log';
+export const UI_DEBUG_LOG = 'ui-debug.log';
 
 export function ensureLogsDir(): string {
   const dir = getLogsPath();
@@ -56,6 +57,10 @@ export function getGeminiProxyDebugLogPath(): string {
 
 export function getProviderDebugLogPath(): string {
   return join(ensureLogsDir(), PROVIDER_DEBUG_LOG);
+}
+
+export function getUiDebugLogPath(): string {
+  return join(ensureLogsDir(), UI_DEBUG_LOG);
 }
 
 export function prepareProviderTraceLog(): string {

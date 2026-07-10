@@ -3,6 +3,8 @@ import { execSync, spawn } from 'node:child_process';
 import { existsSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { getAppPathOverride } from './config.js';
+import { findBinaryOnPath } from './binary-lookup.js';
 
 const isWindows = process.platform === 'win32';
 
@@ -20,22 +22,10 @@ const FALLBACK_PATHS = isWindows
     ];
 
 export function findClaudeBinary(): string | null {
-  try {
-    const result = execSync(isWindows ? 'where.exe claude' : 'which claude', {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const lines = result.trim().split('\n').map(l => l.trim()).filter(Boolean);
-    // On Windows, prefer .cmd wrappers — spawn() can't execute bare scripts without shell:true
-    const path = (isWindows ? lines.find(l => l.toLowerCase().endsWith('.cmd')) : null) ?? lines[0];
-    if (path) return path;
-  } catch {
-    // command failed — try fallback paths
-  }
-  for (const path of FALLBACK_PATHS) {
-    if (existsSync(path)) return path;
-  }
-  return null;
+  const override = getAppPathOverride('claude');
+  if (override) return existsSync(override) ? override : null;
+
+  return findBinaryOnPath('claude', FALLBACK_PATHS);
 }
 
 export function getInstalledClaudeVersion(): string {

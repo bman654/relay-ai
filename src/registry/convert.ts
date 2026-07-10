@@ -13,6 +13,8 @@ function modelToCached(model: LocalProviderModel): CachedModel {
     brand: model.brand,
     contextWindow: model.contextWindow,
     cost: model.cost,
+    isFree: model.isFree,
+    freeStatus: model.freeStatus,
     modelFormat: model.modelFormat,
     npm: model.npm,
     apiUrl: model.apiBaseUrl,

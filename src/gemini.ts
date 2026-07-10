@@ -5,7 +5,7 @@ import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } 
 import { loadPreferences, recordLaunchSelection } from './config.js';
 import { findProviderAndModel, planLaunchWizard, wantsCleanAgentStdout } from './launch-target.js';
 import { setAgentStdoutMode, isAgentStdoutMode } from './agent-io.js';
-import { findGeminiBinary, buildGeminiChildEnv, launchGemini } from './gemini/launch.js';
+import { findGeminiBinary, prepareGeminiChildEnv, launchGemini } from './gemini/launch.js';
 import {
   pickGeminiProvider,
   pickGeminiModel,
@@ -16,7 +16,10 @@ import {
 import { startGeminiProxy } from './gemini-proxy.js';
 import { getGeminiProxyDebugLogPath, printTraceLog } from './trace-log.js';
 import type { ProxyRoute, ProxyHandle } from './proxy.js';
+import type { CloudCodeBackend } from './cloud-code-backend.js';
+import { rewriteGeminiBackendRoutes } from './gemini/backend-routes.js';
 import { VERSION } from './constants.js';
+import { providersForTarget } from './target-compatibility.js';
 
 export function geminiHelpText(): string {
   return `${pc.bold('relay-ai gemini')} v${VERSION}
@@ -109,7 +112,7 @@ export async function runGeminiCommand(
     catalogSpinner.stop('');
   }
 
-  const compatible = providersForPicker(catalog);
+  const compatible = providersForTarget(providersForPicker(catalog), 'gemini');
   if (compatible.length === 0) {
     p.log.warn('No Gemini-compatible providers in your registry.');
     p.log.info('Add a provider with relay-ai providers add, or sign in with relay-ai providers auth openai.');
@@ -197,6 +200,8 @@ export async function runGeminiCommand(
     providerId: activeProvider.id,
     authType: activeProvider.authType,
     oauthAccountId: activeProvider.oauthAccountId,
+    providerData: activeProvider.providerData,
+    headers: activeProvider.headers,
     supportedParameters: m.supportedParameters,
     reasoning: m.reasoning,
     interleavedReasoningField: m.interleavedReasoningField,
@@ -224,6 +229,8 @@ export async function runGeminiCommand(
           providerId: provider.id,
           authType: provider.authType,
           oauthAccountId: provider.oauthAccountId,
+          providerData: provider.providerData,
+          headers: provider.headers,
           supportedParameters: model.supportedParameters,
           reasoning: model.reasoning,
           interleavedReasoningField: model.interleavedReasoningField,
@@ -258,32 +265,49 @@ export async function runGeminiCommand(
       providerId: activeProvider.id,
       authType: activeProvider.authType,
       oauthAccountId: activeProvider.oauthAccountId,
+      providerData: activeProvider.providerData,
+      headers: activeProvider.headers,
       supportedParameters: selectedModel.supportedParameters,
       reasoning: selectedModel.reasoning,
       interleavedReasoningField: selectedModel.interleavedReasoningField,
     });
   }
 
-  const finalRoutes = [...routesMap.values()];
+  let finalRoutes = [...routesMap.values()];
+  // Backend-routed models get rewritten to a new local alias below — this tracks
+  // what selectedModel.id becomes so Gemini CLI is launched with the id its
+  // requests will actually be resolved by, not the pre-rewrite one.
+  let launchModelId = selectedModel.id;
+  let oauthBackend: CloudCodeBackend | null = null;
 
   let proxyHandle: ProxyHandle | null = null;
   try {
+    const backendRoutes = await rewriteGeminiBackendRoutes(finalRoutes, launchModelId, trace);
+    finalRoutes = backendRoutes.routes;
+    launchModelId = backendRoutes.launchModelId;
+    oauthBackend = backendRoutes.backend;
     proxyHandle = await startGeminiProxy(finalRoutes, trace);
   } catch (err) {
     p.log.error(`Failed to start Gemini proxy: ${err instanceof Error ? err.message : String(err)}`);
+    oauthBackend?.handle.close();
     return 1;
   }
 
-  const childEnv = buildGeminiChildEnv(proxyHandle.port, proxyHandle.token);
-  
+  const childEnv = prepareGeminiChildEnv(proxyHandle.port, proxyHandle.token);
+
   if (!agentStdout) {
     p.log.info(`Gemini proxy started on port ${proxyHandle.port}`);
     p.log.info(`💡 Type ${pc.bold('.model <id>')} in the chat to switch models mid-session.`);
   }
 
-  const exitCode = await launchGemini(geminiPath, selectedModel.id, childEnv, passthroughArgs);
-  
-  proxyHandle.close();
+  let exitCode = 1;
+  try {
+    exitCode = await launchGemini(geminiPath, launchModelId, childEnv.env, passthroughArgs);
+  } finally {
+    childEnv.cleanup();
+    proxyHandle.close();
+    oauthBackend?.handle.close();
+  }
 
   if (!agentStdout) {
     p.log.info('Gemini proxy stopped.');

@@ -1,8 +1,10 @@
 // src/types.ts
 
+import type { FreeStatus } from './free-models.js';
+
 export type ModelFormat = 'anthropic' | 'openai' | 'unsupported';
 
-export type StarterCommand = 'root' | 'claude' | 'claude-app' | 'codex' | 'codex-app' | 'server' | 'models' | 'providers' | 'gemini';
+export type StarterCommand = 'root' | 'claude' | 'claude-app' | 'codex' | 'codex-app' | 'server' | 'models' | 'providers' | 'gemini' | 'agy' | 'antigravity' | 'antigravity-ide' | 'ui';
 
 export interface BackendConfig {
   id: 'zen' | 'go';
@@ -21,11 +23,16 @@ export interface ModelInfo {
   id: string;
   name: string;
   isFree: boolean;
+  freeStatus?: FreeStatus;
   brand: string;
   sourceBackend: 'zen' | 'go';
   modelFormat: ModelFormat;
   cost?: ModelCost;
   contextWindow?: number;
+  /** Broad model metadata: model can produce reasoning/thinking output. */
+  reasoning?: boolean;
+  /** Streaming/interleaved reasoning field name from metadata, e.g. reasoning_content. */
+  interleavedReasoningField?: string;
 }
 
 export interface LocalProviderModel {
@@ -33,7 +40,7 @@ export interface LocalProviderModel {
   name: string;
   family: string;
   brand: string;
-  modelFormat: 'anthropic' | 'openai';
+  modelFormat: 'anthropic' | 'openai' | 'cloud-code';
   /** Wire id sent to the upstream API (OpenCode api.id); may differ from catalog id, e.g. gpt-5.5-fast → gpt-5.5. */
   upstreamModelId: string;
   baseUrl?: string;        // set for anthropic-format models
@@ -50,6 +57,7 @@ export interface LocalProviderModel {
   interleavedReasoningField?: string;
   /** OpenCode Zen free-tier models only. */
   isFree?: boolean;
+  freeStatus?: FreeStatus;
   modalities?: ('text' | 'image')[];
 }
 
@@ -59,6 +67,9 @@ export interface LocalProvider {
   apiKey: string;
   authType?: 'api' | 'oauth' | 'none';
   oauthAccountId?: string;
+  providerData?: Record<string, unknown>;
+  /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
+  headers?: Record<string, string>;
   models: LocalProviderModel[];
 }
 
@@ -75,8 +86,14 @@ export interface UserPreferences {
   lastCodexModel?: string;
   lastGeminiProvider?: string;
   lastGeminiModel?: string;
+  lastAntigravityProvider?: string;
+  lastAntigravityModel?: string;
   recentModelsByProvider?: Record<string, string[]>;
   favoriteModels?: FavoriteModel[];
+  antigravityCliFavoriteModels?: FavoriteModel[];
+  antigravityCliFavoritesHintShown?: boolean;
+  appPathOverrides?: Record<string, string>;
+  recentLaunchFolders?: string[];
   server?: {
     savedPassword?: string;
     /** Provider ids exposed by `relay-ai server` (zen, go, or local OpenCode provider ids). */
@@ -85,6 +102,10 @@ export interface UserPreferences {
     maskGatewayIds?: boolean;
     /** Expose only models saved via `relay-ai models`. */
     favoritesOnly?: boolean;
+    /** Expose only verified-free or free-provider-access models. */
+    freeModelsOnly?: boolean;
+    /** Saved listen mode for one-step `relay-ai server --quick` launches. */
+    listenMode?: 'local' | 'network';
   };
 }
 
@@ -107,6 +128,22 @@ export interface ParsedArgs {
   aiInstall?: boolean;
   /** Reinstall skill even when version already matches */
   aiInstallForce?: boolean;
+  /** Manage the AGY-specific favorites list instead of global favorites. */
+  favoritesAgy?: boolean;
+  /** Start `relay-ai server` from saved/default settings without prompts. */
+  serverQuick?: boolean;
+  /** One-run listen override for `relay-ai server`. */
+  serverListenMode?: 'local' | 'network';
+  /** One-run provider exposure mode for `relay-ai server`. */
+  serverProvidersMode?: 'all' | 'favorites' | 'specific';
+  /** One-run provider ids when serverProvidersMode is `specific`. */
+  serverProviderIds?: string[];
+  /** One-run free/free-access model filter override. */
+  serverFreeOnly?: boolean;
+  /** One-run discovery id masking override. */
+  serverMaskGatewayIds?: boolean;
+  /** One-run network password for `relay-ai server`. */
+  serverPassword?: string;
   error?: string;
 }
 

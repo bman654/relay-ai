@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { parseProvidersArgs, providerHubChoiceValue, providersHelpText } from '../src/providers-command.js';
+import { parseProvidersArgs, providerHubChoiceValue, providersHelpText, runProvidersAdd } from '../src/providers-command.js';
 import {
   addZenRegistryStub,
   removeProviderFromRegistry,
@@ -10,7 +10,19 @@ import {
 } from '../src/registry/crud.js';
 import { emptyRegistry, loadRegistry, saveRegistry } from '../src/registry/io.js';
 import { zenRegistryStub } from '../src/registry/builtins.js';
+import { providerAuthHelpText } from '../src/registry/provider-auth.js';
+import { PROVIDER_TEMPLATES } from '../src/provider-templates.js';
 import * as env from '../src/env.js';
+
+const selectMock = vi.hoisted(() => vi.fn());
+
+vi.mock('@clack/prompts', async importOriginal => {
+  const actual = await importOriginal<typeof import('@clack/prompts')>();
+  return {
+    ...actual,
+    select: selectMock,
+  };
+});
 
 describe('parseProvidersArgs', () => {
   it('defaults to hub', () => {
@@ -50,18 +62,32 @@ describe('parseProvidersArgs', () => {
     expect(help).toContain('providers remove');
     expect(help).toContain('refresh-models');
     expect(help).toContain('Phase 1.1');
+    for (const template of PROVIDER_TEMPLATES.filter(t => t.hidden)) {
+      expect(help).not.toContain(template.id);
+      expect(help).not.toContain(template.name);
+    }
   });
 
-  it('routes cloud builtins to the cloud detail branch', () => {
+  it('keeps hidden provider ids out of auth help', () => {
+    const help = providerAuthHelpText();
+    expect(help).toContain('github-copilot');
+    expect(help).toContain('openai');
+    expect(help).toContain('xai');
+    for (const template of PROVIDER_TEMPLATES.filter(t => t.hidden)) {
+      expect(help).not.toContain(template.id);
+      expect(help).not.toContain(template.name);
+    }
+  });
+
+  it('returns provider:id for all entries', () => {
     expect(providerHubChoiceValue({
-      id: 'opencode-cloud',
-      name: 'OpenCode Zen / Go',
+      id: 'zen',
+      name: 'OpenCode Zen',
       modelCount: 6,
       enabled: true,
       authLabel: 'keychain',
-      inRegistry: false,
-      cloudBuiltin: 'opencode',
-    })).toBe('cloud:opencode');
+      inRegistry: true,
+    })).toBe('provider:zen');
     expect(providerHubChoiceValue({
       id: 'groq',
       name: 'Groq',
@@ -142,5 +168,32 @@ describe('registry crud', () => {
     expect(result.credentialDeleted).toBe(false);
     expect(deleteSpy).not.toHaveBeenCalled();
     expect(loadRegistry().providers).toHaveLength(1);
+  });
+});
+
+describe('providers add menu', () => {
+  let home: string;
+  const prevHome = process.env.RELAY_AI_HOME;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'relay-ai-providers-add-'));
+    process.env.RELAY_AI_HOME = home;
+    selectMock.mockReset();
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.RELAY_AI_HOME;
+    else process.env.RELAY_AI_HOME = prevHome;
+    rmSync(home, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('shows native templates first, custom server second, and OpenCode import last', async () => {
+    selectMock.mockResolvedValue('noop');
+
+    await runProvidersAdd();
+
+    const options = selectMock.mock.calls[0]?.[0].options.map(option => option.value);
+    expect(options).toEqual(['templates', 'custom', 'import']);
   });
 });

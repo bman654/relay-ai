@@ -36,6 +36,10 @@ export const CHATGPT_CODEX_UNSUPPORTED_MODELS = new Set<string>([
 // Models available via ChatGPT Plus/Pro OAuth (chatgpt.com/backend-api/codex).
 // Ordered from newest to oldest within each tier.
 const OPENAI_OAUTH_MODEL_SEEDS: OAuthModelSeed[] = [
+  // GPT-5.6 family (Sol / Terra / Luna)
+  { id: 'gpt-5.6-sol',          name: 'GPT-5.6 Sol',       reasoning: true },
+  { id: 'gpt-5.6-terra',        name: 'GPT-5.6 Terra',     reasoning: true },
+  { id: 'gpt-5.6-luna',         name: 'GPT-5.6 Luna',      reasoning: true },
   // GPT-5.5 family (Pro)
   { id: 'gpt-5.5',              name: 'GPT-5.5',           reasoning: true },
   // GPT-5.4 family

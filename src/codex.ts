@@ -1,12 +1,10 @@
 // codex.ts — relay-ai codex: launch OpenAI Codex CLI with registry providers
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
-import { fetchProviderCatalog, providersForPicker } from './provider-catalog.js';
+import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
 import { loadPreferences, recordLaunchSelection } from './config.js';
-import { resolveProviderCredential, resolveApiKey, readFromCredentialStore } from './env.js';
+import { resolveApiKey, readFromCredentialStore } from './env.js';
 import { resolveOrCollectApiKey } from './key-setup.js';
-import { oauthAuthRef } from './registry/import-build.js';
-import { loadRegistry } from './registry/io.js';
 import { startCodexProxy } from './codex-proxy.js';
 import type { CodexProxyHandle } from './codex-proxy.js';
 import { buildCatalogFile, formatCodexModelLabel, serializeCatalog } from './codex/catalog.js';
@@ -42,15 +40,25 @@ import {
 } from './server/vertex-config.js';
 import { VERTEX_ANTHROPIC_NPM } from './constants.js';
 import { resolveContextWindow } from './context-window.js';
-import { resolveFirstAvailableFavorite, type ResolvedFavorite } from './favorites-resolver.js';
+import type { ResolvedFavorite } from './favorites-resolver.js';
 import {
   buildFavoritesCodexCatalog,
   codexCliFavoritesSlug,
   defaultReasoningEffortForFavorite,
 } from './codex/favorites-catalog.js';
-import { buildCodexProxyRoutesFromResolved, resolveCodexFavorites } from './codex/favorites-launch.js';
+import {
+  buildCodexProxyRoutesFromResolved,
+  pickFavoriteStartingModel,
+  resolveCodexFavorites,
+} from './codex/favorites-launch.js';
 import { getFavoritesCatalogPath } from './codex/profile.js';
-import type { LocalProvider } from './types.js';
+import type { LocalProvider, LocalProviderModel } from './types.js';
+import {
+  buildSingleModelCloudCodeRoute,
+  needsCloudCodeBackend,
+  partitionAndStartCloudCodeBackend,
+  type CloudCodeBackend,
+} from './cloud-code-backend.js';
 import { getCodexProxyDebugLogPath, printTraceLog } from './trace-log.js';
 import { setAgentStdoutMode, isAgentStdoutMode } from './agent-io.js';
 import {
@@ -456,18 +464,16 @@ export async function runCodexCommand(
       if (!pickedProvider) return 0;
       
       if (pickedProvider === '__favorites__') {
-        const favoriteProviders = compatible.map(provider => ({
-          ...provider,
-          models: routableModelsForProvider(provider, 'codex'),
-        }));
-        const favoriteStart = resolveFirstAvailableFavorite(favorites, favoriteProviders);
-        if (!favoriteStart) {
-          p.log.warn('No saved Codex favorites are currently available.');
-          return 0;
-        }
-        activeProvider = favoriteStart.provider;
-        selectedModel = favoriteStart.model;
-        p.log.step(`Loaded Favorites Catalog. Starting model: ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
+        const favoritePick = await pickFavoriteStartingModel(
+          compatible,
+          favorites,
+          'codex',
+          'Codex',
+          provider => ({ ...provider, models: routableModelsForProvider(provider, 'codex') }),
+        );
+        if (favoritePick === 'cancelled' || favoritePick === 'unavailable') return 0;
+        activeProvider = favoritePick.provider;
+        selectedModel = favoritePick.model;
         break;
       } else {
         activeProvider = pickedProvider as LocalProvider;
@@ -487,40 +493,18 @@ export async function runCodexCommand(
   let providersById: Map<string, LocalProvider> = new Map();
 
   if (favoritesActive) {
-    let zenGoApiKey: string | null = null;
-    const hasZenGo = favorites.some(f => f.providerId === 'zen' || f.providerId === 'go')
-      || activeProvider.id === 'zen'
-      || activeProvider.id === 'go';
-    if (hasZenGo) {
-      if (!configOnly) {
-        zenGoApiKey = await resolveOrCollectApiKey(false, trace);
-      } else {
-        const existing = resolveApiKey();
-        if (existing) {
-          zenGoApiKey = existing;
-        } else {
-          const stored = await readFromCredentialStore(() => {});
-          if (stored) zenGoApiKey = stored;
-        }
-      }
-    }
-    const res = resolveCodexFavorites(
+    const res = await resolveCodexFavorites(
       activeProvider,
       selectedModel,
       compatible,
       favorites,
       'codex',
-      zenGoApiKey,
     );
     resolvedFavorites = res.resolvedFavorites;
     providersById = res.providersById;
   }
 
-  const regEntry = loadRegistry().providers.find(p => p.id === activeProvider.id);
-  const authRef = regEntry?.authRef
-    ?? (activeProvider.apiKey ? `keyring:provider:${activeProvider.id}` : oauthAuthRef(activeProvider.id));
-  const apiKey = activeProvider.apiKey?.trim()
-    || await resolveProviderCredential(activeProvider.id, authRef);
+  const apiKey = await resolveLocalProviderApiKey(activeProvider);
   if (!apiKey) {
     if (!configOnly) {
       p.log.error(`No credential for ${activeProvider.name}. Run relay-ai providers auth ${activeProvider.id} or add an API key.`);
@@ -542,11 +526,107 @@ export async function runCodexCommand(
   }
 
   let proxyHandle: CodexProxyHandle | null = null;
+  let cloudCodeBackend: CloudCodeBackend | null = null;
+  let cloudCodeBackendFav: CloudCodeBackend | null = null;
   try {
     let proxyPort: number | undefined;
     if (favoritesActive && resolvedFavorites.length > 0) {
-      const routes = buildCodexProxyRoutesFromResolved(resolvedFavorites, providersById);
-      proxyHandle = await startCodexProxy(routes, { requireAuth: true, debug: trace });
+      const needsBackend = (r: typeof resolvedFavorites[0]) => {
+        const m = r.model as LocalProviderModel;
+        const prov = providersById.get(r.providerId);
+        return needsCloudCodeBackend(m, prov?.authType);
+      };
+      const backendResolved = resolvedFavorites.filter(needsBackend);
+      const regularResolved = resolvedFavorites.filter(r => !needsBackend(r));
+
+      let backendCodexRoutes: import('./codex-proxy.js').CodexProxyRoute[] = [];
+
+      if (backendResolved.length > 0) {
+        const partitioned = await partitionAndStartCloudCodeBackend(
+          backendResolved.map(r => {
+            const provider = providersById.get(r.providerId);
+            return {
+              providerId: r.providerId,
+              model: r.model as LocalProviderModel,
+              apiKey: r.apiKey,
+              oauthAccountId: provider?.oauthAccountId,
+              providerData: (provider?.providerData ?? {}) as Record<string, unknown>,
+            };
+          }),
+          (cr, backend, original) => ({
+            modelId: cr.aliasId,
+            npm: '@ai-sdk/anthropic',
+            apiKey: backend.token,
+            baseURL: `http://127.0.0.1:${backend.port}`,
+            upstreamModelId: cr.aliasId,
+            providerId: cr.providerId ?? 'antigravity',
+            authType: 'oauth' as const,
+            oauthAccountId: original.oauthAccountId,
+            providerData: original.providerData,
+            contextWindow: cr.contextWindow,
+          }),
+          trace,
+        );
+        cloudCodeBackendFav = partitioned.backend;
+        backendCodexRoutes = partitioned.backendItems;
+      }
+
+      const regularRoutes = buildCodexProxyRoutesFromResolved(regularResolved, providersById);
+      const allRoutes = [...backendCodexRoutes, ...regularRoutes];
+
+      proxyHandle = await startCodexProxy(allRoutes, { requireAuth: true, debug: trace });
+      proxyPort = proxyHandle.port;
+    } else if (route.tier === 'cloud-code') {
+      const providerData = (activeProvider.providerData ?? {}) as Record<string, unknown>;
+      const { proxyRoute: cloudRoute, backend } = await buildSingleModelCloudCodeRoute(
+        selectedModel,
+        apiKey,
+        route.providerId,
+        providerData,
+        trace,
+      );
+      cloudCodeBackend = backend;
+      proxyHandle = await startCodexProxy([{
+        modelId: cloudRoute.aliasId,
+        npm: '@ai-sdk/anthropic',
+        apiKey: cloudCodeBackend.token,
+        baseURL: `http://127.0.0.1:${cloudCodeBackend.port}`,
+        upstreamModelId: cloudRoute.aliasId,
+        providerId: route.providerId,
+        authType: route.authType,
+        oauthAccountId: route.oauthAccountId,
+        providerData,
+        contextWindow: route.contextWindow,
+        supportedParameters: route.supportedParameters,
+        reasoning: route.reasoning,
+        interleavedReasoningField: route.interleavedReasoningField,
+      }], { debug: trace });
+      proxyPort = proxyHandle.port;
+    } else if (route.authType === 'oauth' && selectedModel.modelFormat === 'anthropic') {
+      const providerData = (activeProvider.providerData ?? {}) as Record<string, unknown>;
+      const { proxyRoute: oauthRoute, backend } = await buildSingleModelCloudCodeRoute(
+        selectedModel,
+        apiKey,
+        route.providerId,
+        providerData,
+        trace,
+      );
+      cloudCodeBackend = backend;
+      proxyHandle = await startCodexProxy([{
+        modelId: oauthRoute.aliasId,
+        npm: '@ai-sdk/anthropic',
+        apiKey: cloudCodeBackend.token,
+        baseURL: `http://127.0.0.1:${cloudCodeBackend.port}`,
+        upstreamModelId: oauthRoute.aliasId,
+        providerId: route.providerId,
+        authType: route.authType,
+        oauthAccountId: route.oauthAccountId,
+        providerData,
+        contextWindow: route.contextWindow,
+        supportedParameters: route.supportedParameters,
+        reasoning: route.reasoning,
+        interleavedReasoningField: route.interleavedReasoningField,
+      }], { debug: trace });
       proxyPort = proxyHandle.port;
     } else if (route.tier === 'proxy') {
       proxyHandle = await startCodexProxy([{
@@ -556,9 +636,13 @@ export async function runCodexCommand(
         baseURL: route.baseURL,
         upstreamModelId: route.upstreamModelId,
         providerId: route.providerId,
+        authType: route.authType,
+        oauthAccountId: route.oauthAccountId,
+        providerData: route.providerData,
         supportedParameters: route.supportedParameters,
         reasoning: route.reasoning,
         interleavedReasoningField: route.interleavedReasoningField,
+        headers: route.headers,
       }], { debug: trace });
       proxyPort = proxyHandle.port;
     }
@@ -617,7 +701,7 @@ export async function runCodexCommand(
     const modelLabel = formatCodexModelLabel(selectedModel);
 
     if (!agentStdout) {
-      if (route.tier === 'proxy' && proxyPort) {
+      if ((route.tier === 'proxy' || route.tier === 'cloud-code') && proxyPort) {
         logCodexProxy(proxyPort);
       }
     }
@@ -640,16 +724,22 @@ export async function runCodexCommand(
       apiKey: '',
     };
     const childEnv = buildCodexChildEnv(
-      favoritesLaunch ? dummyRoute : route,
+      (favoritesLaunch || route.tier === 'cloud-code') ? dummyRoute : route,
       proxyPort,
     );
-    const hadProxy = (route.tier === 'proxy' || favoritesLaunch) && !!proxyPort;
+    const hadProxy = (route.tier === 'proxy' || route.tier === 'cloud-code' || favoritesLaunch) && !!proxyPort;
     const exitCode = await launchCodex(launchModelId, childEnv, passthroughArgs);
     if (trace) printTraceLog(debugLogPath);
     printCodexCleanupReminder(hadProxy);
     return exitCode;
   } finally {
     proxyHandle?.close();
+    if (cloudCodeBackend) {
+      cloudCodeBackend.handle.close();
+    }
+    if (cloudCodeBackendFav) {
+      cloudCodeBackendFav.handle.close();
+    }
     restoreCodexOverlay();
   }
 }

@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse } from 'smol-toml';
-import { startCodexProxy } from '../src/codex-proxy.js';
+import {
+  estimateCodexRequestChars,
+  isLikelyCodexCompactionRequest,
+  protectCodexCompactionParams,
+  startCodexProxy,
+} from '../src/codex-proxy.js';
+import type { CodexSdkCallParams } from '../src/codex-responses-adapter.js';
 
 describe('startCodexProxy', () => {
   let handle: Awaited<ReturnType<typeof startCodexProxy>> | null = null;
@@ -165,6 +171,209 @@ describe('startCodexProxy', () => {
     const resModelInvalid = await fetch(`http://127.0.0.1:${handle.port}/v1/models/non-existent`);
     expect(resModelInvalid.status).toBe(404);
   });
+
+});
+
+describe('Codex compaction protection', () => {
+  it('detects and shrinks oversized relay-started compaction requests before upstream', () => {
+    const body = {
+      model: 'relay-model',
+      stream: true,
+      previous_response_id: 'resp_previous',
+      input: [
+        ...Array.from({ length: 240 }, (_, i) => ({
+          type: 'message',
+          role: 'user',
+          content: `turn ${i}\n${'x'.repeat(20_000)}`,
+        })),
+        { type: 'compaction_trigger' },
+      ],
+    };
+    const params: CodexSdkCallParams = {
+      messages: Array.from({ length: 240 }, (_, i) => ({
+        role: 'user',
+        content: [{ type: 'text', text: `turn ${i}\n${'x'.repeat(20_000)}` }],
+      })),
+    };
+
+    expect(isLikelyCodexCompactionRequest(body)).toBe(true);
+
+    const protectedParams = protectCodexCompactionParams(body, params, 100_000);
+
+    expect(estimateCodexRequestChars(protectedParams)).toBeLessThanOrEqual(Math.floor(100_000 * 0.55) * 3);
+    expect(protectedParams.messages.length).toBeGreaterThanOrEqual(3);
+    for (const message of protectedParams.messages) {
+      const content = message.content;
+      if (!Array.isArray(content)) continue;
+      for (const part of content) {
+        if (part && typeof part === 'object' && 'text' in part && typeof part.text === 'string') {
+          expect(part.text.length).toBeLessThanOrEqual(12_000);
+        }
+      }
+    }
+  });
+
+  it('strips tools from a detected compaction request so the model must return a text summary', () => {
+    const body = {
+      model: 'relay-model',
+      stream: true,
+      previous_response_id: 'resp_previous',
+      tools: [{ type: 'function', name: 'read_file', parameters: {} }],
+      input: [
+        ...Array.from({ length: 240 }, (_, i) => ({
+          type: 'message',
+          role: 'user',
+          content: `turn ${i}\n${'x'.repeat(20_000)}`,
+        })),
+        { type: 'compaction_trigger' },
+      ],
+    };
+    const params: CodexSdkCallParams = {
+      messages: Array.from({ length: 240 }, (_, i) => ({
+        role: 'user',
+        content: [{ type: 'text', text: `turn ${i}\n${'x'.repeat(20_000)}` }],
+      })),
+      tools: { read_file: {} } as CodexSdkCallParams['tools'],
+    };
+
+    expect(isLikelyCodexCompactionRequest(body)).toBe(true);
+
+    const protectedParams = protectCodexCompactionParams(body, params, 100_000);
+
+    expect(protectedParams.tools).toBeUndefined();
+  });
+
+  it('caps output tokens on a detected compaction request to bound a runaway generation', () => {
+    const body = {
+      model: 'relay-model',
+      stream: true,
+      previous_response_id: 'resp_previous',
+      input: [
+        ...Array.from({ length: 240 }, (_, i) => ({
+          type: 'message',
+          role: 'user',
+          content: `turn ${i}\n${'x'.repeat(20_000)}`,
+        })),
+        { type: 'compaction_trigger' },
+      ],
+    };
+    const params: CodexSdkCallParams = {
+      messages: Array.from({ length: 240 }, (_, i) => ({
+        role: 'user',
+        content: [{ type: 'text', text: `turn ${i}\n${'x'.repeat(20_000)}` }],
+      })),
+    };
+
+    const protectedParams = protectCodexCompactionParams(body, params, 100_000);
+
+    expect(protectedParams.maxOutputTokens).toBe(4_000);
+  });
+
+  it('does not raise an already-tighter client-supplied output cap on compaction', () => {
+    const body = {
+      model: 'relay-model',
+      stream: true,
+      input: [
+        ...Array.from({ length: 240 }, (_, i) => ({
+          type: 'message',
+          role: 'user',
+          content: `turn ${i}\n${'x'.repeat(20_000)}`,
+        })),
+        { type: 'compaction_trigger' },
+      ],
+    };
+    const params: CodexSdkCallParams = {
+      messages: Array.from({ length: 240 }, (_, i) => ({
+        role: 'user',
+        content: [{ type: 'text', text: `turn ${i}\n${'x'.repeat(20_000)}` }],
+      })),
+      maxOutputTokens: 500,
+    };
+
+    const protectedParams = protectCodexCompactionParams(body, params, 100_000);
+
+    expect(protectedParams.maxOutputTokens).toBe(500);
+  });
+
+  it('keeps tools on a normal (non-compaction) request', () => {
+    const body = { model: 'relay-model', stream: true, input: 'hello' };
+    const params: CodexSdkCallParams = {
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      tools: { read_file: {} } as CodexSdkCallParams['tools'],
+    };
+
+    expect(isLikelyCodexCompactionRequest(body)).toBe(false);
+
+    const protectedParams = protectCodexCompactionParams(body, params, 100_000);
+
+    expect(protectedParams.tools).toEqual({ read_file: {} });
+  });
+
+  it('does NOT classify a huge normal agentic turn as compaction (no marker)', () => {
+    // Regression: observed live — a normal 29-message review turn with 131 tools and a
+    // 427KB body (> 2x the 200K window) was misclassified as compaction by the old size
+    // heuristic, stripping its tools mid-task.
+    const body = {
+      model: 'relay-model',
+      stream: true,
+      input: Array.from({ length: 89 }, (_, i) => ({
+        type: 'message',
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: `turn ${i}\n${'x'.repeat(5_000)}`,
+      })),
+      tools: [{ type: 'function', name: 'exec_command', parameters: {} }],
+    };
+    const params: CodexSdkCallParams = {
+      messages: Array.from({ length: 29 }, (_, i) => ({
+        role: 'user',
+        content: [{ type: 'text', text: `turn ${i}\n${'x'.repeat(10_000)}` }],
+      })),
+      tools: { exec_command: {} } as CodexSdkCallParams['tools'],
+    };
+
+    expect(isLikelyCodexCompactionRequest(body)).toBe(false);
+    const protectedParams = protectCodexCompactionParams(body, params, 100_000);
+    expect(protectedParams.tools).toEqual({ exec_command: {} });
+    expect(protectedParams.maxOutputTokens).toBeUndefined();
+  });
+
+  it('classifies a small request with a compaction_trigger item as compaction', () => {
+    const body = {
+      model: 'relay-model',
+      stream: true,
+      input: [
+        { type: 'message', role: 'user', content: 'short conversation' },
+        { type: 'compaction_trigger' },
+      ],
+    };
+    expect(isLikelyCodexCompactionRequest(body)).toBe(true);
+  });
+
+  it('classifies a prompt-based compaction request by its checkpoint marker', () => {
+    // Older Codex versions send the summarization prompt as the final user message
+    // (codex-rs templates/compact/prompt.md) instead of a compaction_trigger item.
+    const body = {
+      model: 'relay-model',
+      stream: true,
+      input: [
+        { type: 'message', role: 'user', content: 'earlier conversation' },
+        { type: 'message', role: 'user', content: 'You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.' },
+      ],
+    };
+    expect(isLikelyCodexCompactionRequest(body)).toBe(true);
+  });
+
+  it('ignores the checkpoint marker when it appears mid-history (e.g. quoted in a diff)', () => {
+    const body = {
+      model: 'relay-model',
+      stream: true,
+      input: [
+        { type: 'message', role: 'user', content: 'You are performing a CONTEXT CHECKPOINT COMPACTION — this string appears in a file we are reviewing.' },
+        { type: 'message', role: 'user', content: 'now continue the code review' },
+      ],
+    };
+    expect(isLikelyCodexCompactionRequest(body)).toBe(false);
+  });
 });
 
 describe('resolveCodexRoute', () => {
@@ -207,6 +416,17 @@ describe('resolveCodexRoute', () => {
       'k',
     );
     expect(route.tier).toBe('proxy');
+  });
+
+  it('carries custom endpoint headers through to the route', async () => {
+    const { resolveCodexRoute } = await import('../src/codex/routing.js');
+    const route = resolveCodexRoute(
+      { id: 'custom-zai', name: 'Z.AI Coding Plan', apiKey: 'k', headers: { 'X-Plan': 'coding' }, models: [] },
+      { id: 'glm-5.2', name: 'GLM', family: '', brand: '', modelFormat: 'openai', upstreamModelId: 'glm-5.2', npm: '@ai-sdk/openai-compatible', apiBaseUrl: 'https://api.z.ai/api/coding/paas/v4' },
+      'k',
+    );
+    expect(route.tier).toBe('proxy');
+    expect(route.headers).toEqual({ 'X-Plan': 'coding' });
   });
 });
 

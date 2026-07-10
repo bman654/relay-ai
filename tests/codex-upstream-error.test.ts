@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatUpstreamError } from '../src/codex/upstream-error.js';
+import { formatUpstreamError, upstreamHttpStatus, anthropicErrorType } from '../src/codex/upstream-error.js';
 
 describe('formatUpstreamError', () => {
   it('uses lastError message and status without stack', () => {
@@ -30,5 +30,37 @@ describe('formatUpstreamError', () => {
     });
     expect(msg).toContain('API usage limits');
     expect(msg).toContain('HTTP 400');
+  });
+});
+
+describe('upstreamHttpStatus', () => {
+  it('reads a known status code off the error object', () => {
+    expect(upstreamHttpStatus({ statusCode: 401 }, '')).toBe(401);
+    expect(upstreamHttpStatus({ statusCode: 403 }, '')).toBe(403);
+  });
+
+  it('falls back to sniffing the formatted message', () => {
+    expect(upstreamHttpStatus({}, 'Provider returned HTTP 429.')).toBe(429);
+    expect(upstreamHttpStatus(undefined, 'Provider returned HTTP 400.')).toBe(400);
+  });
+
+  it('defaults to 500 for unrecognized errors', () => {
+    expect(upstreamHttpStatus({ statusCode: 418 }, 'teapot')).toBe(500);
+    expect(upstreamHttpStatus(null, 'boom')).toBe(500);
+  });
+});
+
+describe('anthropicErrorType', () => {
+  it('maps terminal client errors to non-retryable Anthropic error types', () => {
+    expect(anthropicErrorType(401)).toBe('authentication_error');
+    expect(anthropicErrorType(403)).toBe('permission_error');
+    expect(anthropicErrorType(400)).toBe('invalid_request_error');
+    expect(anthropicErrorType(404)).toBe('not_found_error');
+  });
+
+  it('maps 429 to rate_limit_error and everything else to api_error', () => {
+    expect(anthropicErrorType(429)).toBe('rate_limit_error');
+    expect(anthropicErrorType(500)).toBe('api_error');
+    expect(anthropicErrorType(502)).toBe('api_error');
   });
 });

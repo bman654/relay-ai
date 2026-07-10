@@ -11,13 +11,17 @@
 [![License](https://img.shields.io/npm/l/@jacobbd/relay-ai)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=flat-square&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/jacobbd)
 
-📺 **Watch the Demos**
+<p align="center">
+  <a href="https://youtu.be/IvsUPHLhX0o">
+    <img src="assets/demo-part1-thumbnail.png" alt="relay-ai demo — installation, configuration, Claude Code, Claude Cowork & Claude Code Desktop (Part 1)" width="100%">
+  </a>
+</p>
 
-| **Claude Code / Cowork / Desktop** | **Codex CLI & Desktop App** | **Gemini CLI** |
-|:---:|:---:|:---:|
-| [![Claude Demo](https://img.youtube.com/vi/IvsUPHLhX0o/mqdefault.jpg)](https://youtu.be/IvsUPHLhX0o) | [![Codex Demo](https://img.youtube.com/vi/42oiOB8IAu4/mqdefault.jpg)](https://youtu.be/42oiOB8IAu4) | [![Gemini Demo](https://img.youtube.com/vi/g7JKvqOHJl4/mqdefault.jpg)](https://www.youtube.com/watch?v=g7JKvqOHJl4) |
+> 🎥 **Watch the Demos:**
+> - **Demo (Part 1):** Installation · Configuration · Claude Code · Claude Cowork & Claude Code Desktop — [watch on YouTube](https://youtu.be/IvsUPHLhX0o)
+> - **Demo (Part 2):** OpenAI Codex CLI & Codex Desktop App — [watch on YouTube](https://youtu.be/42oiOB8IAu4)
 
-**relay-ai** is an interactive CLI that launches AI coding tools and runs local API gateways on your machine. Currently, it supports **Claude Code**, **Claude Desktop (Cowork + Code)**, the **OpenAI Codex CLI**, the **Codex desktop app (macOS + Windows)**, and the **Google Gemini CLI**.
+**relay-ai** is an interactive CLI — and now a **visual launcher** — that connects AI coding tools to any provider and runs local API gateways on your machine. It supports **Claude Code**, **Claude Desktop (Cowork + Code)**, the **OpenAI Codex CLI**, the **ChatGPT desktop app in Codex mode (macOS + Windows)**, **Google Gemini CLI**, and experimental **Antigravity CLI / IDE** support.
 
 Pick your backend:
 
@@ -31,6 +35,7 @@ Pick your backend:
 | Command | Description |
 |---------|-------------|
 | `relay-ai` | Print help (does not launch Claude Code) |
+| `relay-ai ui` | **Open the visual launcher** — manage providers and launch any tool from a browser UI |
 | `relay-ai claude` | Pick a provider → launch Claude Code |
 | `relay-ai providers` | Add, import, list, remove, and refresh your AI providers |
 | `relay-ai models` | Manage favorite models for mid-session `/model` switching |
@@ -38,12 +43,18 @@ Pick your backend:
 | `relay-ai server --vertex` | Foreground Anthropic-compatible gateway to Claude on Vertex AI |
 | `relay-ai claude-app` | Launch Claude Desktop app with registry providers ([guide](docs/CLAUDE_DESKTOP_SETUP.md)) |
 | `relay-ai codex` | Launch OpenAI Codex CLI with registry providers ([guide](docs/CODEX.md)) |
-| `relay-ai codex-app` | Launch Codex desktop app with registry providers ([guide](docs/CODEX.md)) |
+| `relay-ai codex-app` (alias `chatgpt`) | Launch ChatGPT desktop app in Codex mode with registry providers ([guide](docs/CODEX.md)) |
 | `relay-ai gemini` | Launch Google Gemini CLI with registry providers |
+| `relay-ai agy` | Launch Antigravity CLI with Relay models ([warning + guide](docs/ANTIGRAVITY.md)) |
+| `relay-ai antigravity` | Launch Antigravity app with Relay models, macOS ([warning + guide](docs/ANTIGRAVITY.md)) |
+| `relay-ai antigravity-ide` | Launch Antigravity IDE with Relay models, macOS ([warning + guide](docs/ANTIGRAVITY.md)) |
+| `relay-ai providers auth <id>` | Authenticate an OAuth provider (GitHub Copilot, xAI, OpenAI) |
 | `relay-ai --ai` | Full agent reference for scripts and alef-agent ([guide](docs/AI-AGENTS.md)) |
 
 ## Features
 
+- **Visual launcher UI:** `relay-ai ui` opens a browser dashboard — launch any supported tool with a point-and-click model picker. Pick provider and model in the UI; the terminal opens straight to the running session with no second selection step. Manage providers and favorites without leaving the browser.
+- **Server tab in the UI:** Run the same API gateway as `relay-ai server` — favorites-only or specific providers, discovery id masking for Claude Desktop / Cowork, local or network listen mode — from a browser form instead of a terminal wizard. Shows live URLs, the API key, and the full model catalog once started, with a one-click Stop.
 - **Native provider registry:** `relay-ai providers` stores config in `~/.relay-ai/providers.json` and secrets in the OS keychain — no OpenCode binary required at launch. See **[docs/PROVIDERS.md](docs/PROVIDERS.md)** for a full list of providers and known issues.
 - **Provider templates:** Add Groq, Mistral, Together, OpenRouter, and 15+ SDK-backed providers, plus custom OpenAI/Anthropic-compatible endpoints
 - **OpenCode import:** One-time migration from OpenCode (`providers import`); validates API keys and skips placeholders like `anything`
@@ -53,8 +64,9 @@ Pick your backend:
 - **Smart model pickers:** Recent models per provider, search for large lists (>25), paginated browse (15 per page)
 - **Refresh model lists:** `relay-ai providers refresh-models` updates cached catalogs per provider
 - **API server:** Run a local gateway on port **17645** for Claude Code, Claude Desktop, or any Anthropic-compatible client
-- **Server wizard:** Filter exposed providers, mask discovery ids for Claude Desktop, optional favorites-only catalog, local vs network listen mode
+- **Server wizard:** Filter exposed providers, mask discovery ids for Claude Desktop, optional favorites-only catalog, local vs network listen mode — available in the terminal (`relay-ai server`) or the `relay-ai ui` Server tab
 - **Vertex gateway:** Anthropic-compatible Claude on Google Vertex AI using gcloud Application Default Credentials
+- **Antigravity CLI / app / IDE support:** Experimental local Cloud Code gateway for Antigravity's native model picker. Read the account warning before using it
 - **Clean environment isolation:** We strip 17 conflicting env vars (Vertex AI, Bedrock, AWS, Foundry, stale Anthropic config) from the child process only. We never touch `~/.claude/settings.json` (see caveat below)
 - **Secure key storage:** Per-provider keys and the OpenCode API key go in the OS credential store (macOS Keychain, Windows Credential Manager, Linux Secret Service) or your shell profile
 - **Cross-platform:** macOS, Windows, Linux (Ubuntu, Fedora, distros with GNOME Keyring or KWallet)
@@ -66,6 +78,7 @@ Pick your backend:
 
 | Tool | Command | Status |
 |------|---------|--------|
+| **Visual launcher UI** | `relay-ai ui` | ✅ Supported — browser dashboard for all tools |
 | Provider registry | `relay-ai providers` | ✅ Supported ([guide](docs/PROVIDERS.md)) |
 | Claude Code | `relay-ai claude` | ✅ Supported |
 | Favorite models | `relay-ai models` | ✅ Supported |
@@ -73,8 +86,14 @@ Pick your backend:
 | Vertex API gateway | `relay-ai server --vertex` | ✅ Supported |
 | Claude Desktop (Cowork + Code) | `relay-ai claude-app` | ✅ Supported macOS + Windows ([guide](docs/CLAUDE_DESKTOP_SETUP.md)) |
 | Codex CLI | `relay-ai codex` | ✅ Supported ([guide](docs/CODEX.md)) |
-| Codex desktop app | `relay-ai codex-app` | ✅ Supported macOS + Windows ([guide](docs/CODEX.md)) |
+| ChatGPT desktop app (Codex mode) | `relay-ai codex-app` (alias `chatgpt`) | ✅ Supported macOS + Windows ([guide](docs/CODEX.md)) |
 | Google Gemini CLI | `relay-ai gemini` | ⚠️ Experimental, model switching is done via .model prompt |
+| Antigravity CLI | `relay-ai agy` | ⚠️ Experimental, use a throwaway Google account ([guide](docs/ANTIGRAVITY.md)) |
+| Antigravity app | `relay-ai antigravity` | ⚠️ Experimental macOS + Windows support, use a throwaway Google account ([guide](docs/ANTIGRAVITY.md)) |
+| Antigravity IDE | `relay-ai antigravity-ide` | ⚠️ Experimental macOS + Windows support, use a throwaway Google account ([guide](docs/ANTIGRAVITY.md)) |
+| GitHub Copilot OAuth | `relay-ai providers auth github-copilot` | ✅ Device code flow ([guide](docs/SUBSCRIPTION-OAUTH.md)) |
+| xAI SuperGrok OAuth | `relay-ai providers auth xai-oauth` | ✅ Device code flow ([guide](docs/SUBSCRIPTION-OAUTH.md)) |
+| OpenAI ChatGPT OAuth | `relay-ai providers auth openai-oauth` | ✅ Device code flow ([guide](docs/SUBSCRIPTION-OAUTH.md)) |
 
 ## Prerequisites
 
@@ -83,6 +102,7 @@ Pick your backend:
 - At least one provider configured via `relay-ai providers add` or `import` — **or** an [OpenCode API key](https://opencode.ai/auth) for Zen/Go cloud backends
 - [OpenCode CLI](https://opencode.ai) only if you want **one-time import** from an existing OpenCode setup (optional)
 - For **Vertex gateway:** [Google Cloud SDK](https://cloud.google.com/sdk) with `gcloud auth application-default login`, a GCP project with Vertex AI enabled, and Claude partner models enabled in that project
+- For **Antigravity CLI / IDE:** a Google account is still needed for Antigravity authentication. Do **not** use your main Google account. Use a throwaway or secondary account you can afford to lose.
 
 **A note on providers:** relay-ai keeps your provider list in `~/.relay-ai/providers.json`. You can add providers directly (API key + template), import from OpenCode once, or use Zen/Go cloud backends. OpenCode is not required after setup.
 
@@ -156,6 +176,22 @@ Grab your key at [opencode.ai/auth](https://opencode.ai/auth) if you use OpenCod
 The key is active in your current session right away, no matter which option you pick. No terminal restart needed.
 
 ## Usage
+
+### Visual launcher (`relay-ai ui`)
+
+```bash
+relay-ai ui
+```
+
+Opens a browser-based dashboard on a random local port. From the UI you can:
+
+- **Launch any supported tool** — app cards for Claude Code CLI, Codex CLI, Gemini CLI, Antigravity CLI, Antigravity App, Antigravity IDE, Claude Code Desktop, and the ChatGPT Desktop app (Codex mode). Select a provider and model in the card, then click **Launch** — a native terminal opens with the selection pre-wired. No second picker in the terminal.
+- **Manage General Favorites** — the sidebar shows your saved favorite models with a slot indicator (Slots used X/20). Favorites launch through all supported agents.
+- **Manage Antigravity Favorites** — separate favorites panel for Antigravity sessions.
+- **Manage providers** — add providers from templates, delete providers, and refresh model lists inline, all without leaving the browser.
+- **Run the Server tab** — configure and start the same gateway as `relay-ai server` (favorites-only or specific providers, discovery id masking, local/network listen mode) and see the resulting URLs, API key, and model catalog right in the browser. Runs in the same process as the UI, so it stops when you close the dashboard. See [Registry gateway (`relay-ai server`)](#registry-gateway-relay-ai-server) below for what each option does.
+
+Press `Ctrl+C` in the terminal where `relay-ai ui` is running to shut down the dashboard server (this also stops the gateway if you started it from the Server tab).
 
 ### Launch Claude Code
 
@@ -242,11 +278,33 @@ The wizard asks:
 
 | Prompt | What it does |
 |--------|--------------|
-| **Configure & start** vs **Start with saved settings** | Full wizard or reuse saved server preferences |
+| **Configure & start** vs **Start with saved settings** | Full wizard or one-step launch from saved server preferences |
 | **Exposed providers** | Limit which providers appear in the catalog (Zen, Go, Groq, OpenAI, etc.) |
 | **Mask gateway model ids for discovery?** | Recommended **Yes** for Claude Desktop — hides competitor vendor strings in model ids so discovery works |
 | **Expose only favorite models?** | Optional cap at your favorites (manage with `relay-ai models`) |
 | **Listen mode** | **Local only** (`127.0.0.1`) or **Network** (`0.0.0.0` + server password) |
+
+The same options are available without a terminal in the [Server tab of `relay-ai ui`](#visual-launcher-relay-ai-ui), which also shows the resulting URLs, API key, and model catalog live.
+
+After you configure the server once, start it without prompts:
+
+```bash
+relay-ai server --quick
+# same as:
+relay-ai server --saved
+```
+
+Any one-run server option also skips the wizard:
+
+| Option | Meaning |
+|--------|---------|
+| `--listen local\|network` | Override the saved listen mode for this run |
+| `--providers all\|favorites\|id1,id2` | Expose all providers, favorites only, or a comma-separated provider id list |
+| `--free-only` / `--no-free-only` | Enable or disable the free/free-access model filter for this run |
+| `--mask-gateway-ids` / `--no-mask-gateway-ids` | Enable or disable discovery id masking for this run |
+| `--password <value>` | One-run password for network mode when you do not want to use a saved password |
+
+Non-interactive shells (scripts, services, CI, pipes) use quick mode automatically. If quick mode resolves to network mode, relay-ai uses `--password` first, then a saved server password; without either it exits with a clear error instead of prompting.
 
 **Local mode** — point any Anthropic-compatible client at your machine:
 
@@ -262,7 +320,7 @@ export ANTHROPIC_BASE_URL="http://<server-ip>:17645/anthropic"
 export ANTHROPIC_API_KEY="<server-password>"
 ```
 
-By default the server password stays in memory only. If you choose to save it, relay-ai stores it in `~/.relay-ai/config.json`.
+By default the server password stays in memory only. If you choose to save it, relay-ai stores it in the OS credential store when available, with `~/.relay-ai/config.json` as a fallback.
 
 OpenAI-format models also get an OpenAI-compatible endpoint:
 
@@ -312,6 +370,36 @@ export ANTHROPIC_API_KEY="anything"
 unset CLAUDE_CODE_USE_VERTEX ANTHROPIC_VERTEX_PROJECT_ID CLOUD_ML_REGION
 ```
 
+## Antigravity CLI, app, and IDE support
+
+Relay AI can launch the Antigravity CLI, standalone Antigravity app, and Antigravity IDE through a local Cloud Code gateway. This lets Antigravity's native model picker show Relay models from your configured providers.
+
+```bash
+relay-ai agy
+relay-ai antigravity
+relay-ai antigravity-ide
+```
+
+> ⚠️ **Do not use your main Google account with Antigravity support.**
+>
+> Antigravity still requires Google authentication before it will run. Relay AI routes Cloud Code generation through your local gateway, but the Antigravity CLI, app, and IDE are still Google software and may contact Google for auth, telemetry, updates, or account checks.
+>
+> This kind of use is probably not what Google intended, may violate Google's terms of service, and could lead to account restrictions or bans. Use a throwaway Google account, a secondary account, or another account you can afford to lose. A free Google account should be enough for authentication. Seriously, don't risk your real Gmail, Workspace, YouTube, Drive, or business account for this.
+
+Read the full setup and risk notes in **[docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md)** before launching any Antigravity surface.
+
+## OAuth Providers
+
+relay-ai supports OAuth providers that use device-code sign-in, so you can connect an existing subscription without pasting an API key. See **[docs/SUBSCRIPTION-OAUTH.md](docs/SUBSCRIPTION-OAUTH.md)** for setup details.
+
+Device code flows for existing subscriptions:
+
+```bash
+relay-ai providers auth github-copilot   # GitHub Copilot
+relay-ai providers auth openai-oauth     # ChatGPT Plus / Pro
+relay-ai providers auth xai-oauth        # xAI SuperGrok
+```
+
 ### Codex CLI (`relay-ai codex`)
 
 Launch [OpenAI Codex CLI](https://developers.openai.com/codex/cli) with registry providers. Requires `npm install -g @openai/codex`.
@@ -351,17 +439,21 @@ Full details: **[docs/CODEX.md](docs/CODEX.md)** — CLI + desktop app, configs,
 
 For agent / alef-agent integration (boot flags, NDJSON, JSONL): **[docs/AI-AGENTS.md](docs/AI-AGENTS.md)** and `relay-ai --ai`.
 
-### Codex desktop app (`relay-ai codex-app`)
+### ChatGPT desktop app / Codex mode (`relay-ai codex-app`, alias `relay-ai chatgpt`)
 
-Launch the **Codex app** (macOS or Windows) with registry providers:
+> OpenAI merged the standalone Codex app into the ChatGPT desktop app on 2026-07-09 — it's now named "ChatGPT" on disk (bundle id and config format unchanged) and opens in Codex mode for existing Codex users. `relay-ai codex-app` and `relay-ai chatgpt` are the same command.
+
+Launch the **ChatGPT app in Codex mode** (macOS or Windows) with registry providers:
 
 ```bash
 relay-ai codex-app
 ```
 
-Patches `~/.codex/config.toml` with backup; **Ctrl+C** in the relay-ai terminal restores your config. The app keeps Codex's built-in `openai` provider active so existing conversation history remains visible, and routes the selected model through a foreground local proxy. Preview config without writing: `relay-ai codex-app --config`. Recovery: `relay-ai codex-app --restore`.
+Patches `~/.codex/config.toml` with backup; **Ctrl+C** in the relay-ai terminal asks whether to close ChatGPT Desktop and restore your config (choose "No, keep session running" to decline and keep going). The app keeps Codex's built-in `openai` provider active so existing conversation history remains visible, and routes the selected model through a foreground local proxy. Preview config without writing: `relay-ai codex-app --config`. Recovery: `relay-ai codex-app --restore`.
 
 See **[docs/CODEX.md](docs/CODEX.md)** for CLI vs app differences, file ownership, and troubleshooting.
+
+> **Known limitation — MCP tools (Context7, chrome-devtools, etc.) don't work with non-native models.** Codex wraps local `[mcp_servers.*]` tools in a proprietary, undocumented format that only Codex's own ChatGPT backend can dispatch. When routed through relay-ai (or *any* non-native model provider — this also affects Ollama, OpenRouter, LiteLLM, LM Studio identically), the model can see and call the tools, but Codex's own dispatcher rejects every call with `unsupported call: ...`. This is a confirmed, currently open upstream bug ([openai/codex#20652](https://github.com/openai/codex/issues/20652)) — there is no workaround on relay-ai's side. MCP tools work normally with Codex's native OpenAI/ChatGPT models. See the [MCP troubleshooting row in docs/CODEX.md](docs/CODEX.md#troubleshooting) for details.
 
 **Reasoning effort:** Capable models show Codex's native reasoning picker (low/medium/high, etc.). relay-ai maps your choice to each provider's SDK options and preserves existing `model_reasoning_effort` in Codex config. Claude Code `/effort` and the `relay-ai server` gateway use the same mapping — see the [reasoning section in docs/CODEX.md](docs/CODEX.md#reasoning-effort).
 
@@ -480,7 +572,7 @@ Private beta right now. Issues and PRs welcome on GitHub.
 
 ## Disclaimer
 
-This project and its creator have **no affiliation** with OpenCode, Anthropic, Claude, Google, or any other vendor named or integrated here. Trademarks belong to their respective owners.
+This project and its creator have **no affiliation** with OpenCode, Anthropic, Claude, Google, GitHub, OpenAI, xAI, or any other vendor named or integrated here. Trademarks belong to their respective owners.
 
 relay-ai was built for **education and research**, and mostly for fun. It routes inference through services you configure yourself (OpenCode Zen/Go, OpenCode-configured providers, Vertex AI, and gateways you run locally). Use at your own risk.
 

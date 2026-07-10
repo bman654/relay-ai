@@ -74,13 +74,19 @@ export function loadPreferences(): UserPreferences {
     lastCodexModel: config.lastCodexModel,
     lastGeminiProvider: config.lastGeminiProvider,
     lastGeminiModel: config.lastGeminiModel,
+    lastAntigravityProvider: config.lastAntigravityProvider,
+    lastAntigravityModel: config.lastAntigravityModel,
     recentModelsByProvider: config.recentModelsByProvider,
     favoriteModels: config.favoriteModels,
+    antigravityCliFavoriteModels: config.antigravityCliFavoriteModels,
+    antigravityCliFavoritesHintShown: config.antigravityCliFavoritesHintShown,
+    appPathOverrides: config.appPathOverrides,
+    recentLaunchFolders: config.recentLaunchFolders,
     server: config.server,
   };
 }
 
-export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastBackend' | 'lastModel' | 'lastProvider' | 'lastCodexProvider' | 'lastCodexModel' | 'lastGeminiProvider' | 'lastGeminiModel' | 'recentModelsByProvider' | 'favoriteModels'>>): void {
+export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastBackend' | 'lastModel' | 'lastProvider' | 'lastCodexProvider' | 'lastCodexModel' | 'lastGeminiProvider' | 'lastGeminiModel' | 'lastAntigravityProvider' | 'lastAntigravityModel' | 'recentModelsByProvider' | 'favoriteModels' | 'antigravityCliFavoriteModels' | 'antigravityCliFavoritesHintShown' | 'appPathOverrides' | 'recentLaunchFolders'>>): void {
   const config = readConfig();
   if (prefs.lastBackend !== undefined) config.lastBackend = prefs.lastBackend;
   if (prefs.lastModel !== undefined) config.lastModel = prefs.lastModel;
@@ -89,12 +95,47 @@ export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastBacken
   if (prefs.lastCodexModel !== undefined) config.lastCodexModel = prefs.lastCodexModel;
   if (prefs.lastGeminiProvider !== undefined) config.lastGeminiProvider = prefs.lastGeminiProvider;
   if (prefs.lastGeminiModel !== undefined) config.lastGeminiModel = prefs.lastGeminiModel;
+  if (prefs.lastAntigravityProvider !== undefined) config.lastAntigravityProvider = prefs.lastAntigravityProvider;
+  if (prefs.lastAntigravityModel !== undefined) config.lastAntigravityModel = prefs.lastAntigravityModel;
   if (prefs.recentModelsByProvider !== undefined) config.recentModelsByProvider = prefs.recentModelsByProvider;
   if (prefs.favoriteModels !== undefined) config.favoriteModels = prefs.favoriteModels;
+  if (prefs.antigravityCliFavoriteModels !== undefined) config.antigravityCliFavoriteModels = prefs.antigravityCliFavoriteModels;
+  if (prefs.antigravityCliFavoritesHintShown !== undefined) config.antigravityCliFavoritesHintShown = prefs.antigravityCliFavoritesHintShown;
+  if (prefs.appPathOverrides !== undefined) config.appPathOverrides = prefs.appPathOverrides;
+  if (prefs.recentLaunchFolders !== undefined) config.recentLaunchFolders = prefs.recentLaunchFolders;
   writeConfig(config);
 }
 
+export function getAppPathOverride(appId: string): string | undefined {
+  const value = loadPreferences().appPathOverrides?.[appId];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+export function setAppPathOverride(appId: string, path: string | null): Record<string, string> {
+  const config = readConfig();
+  const next = { ...(config.appPathOverrides ?? {}) };
+  const trimmed = path?.trim() ?? '';
+  if (trimmed) next[appId] = trimmed;
+  else delete next[appId];
+  config.appPathOverrides = next;
+  if (Object.keys(next).length === 0) delete config.appPathOverrides;
+  writeConfig(config);
+  return next;
+}
+
 const MAX_RECENT_MODELS = 3;
+const MAX_RECENT_LAUNCH_FOLDERS = 6;
+
+export function recordLaunchFolder(folder: string): string[] {
+  const trimmed = folder.trim();
+  if (!trimmed) return loadPreferences().recentLaunchFolders ?? [];
+  const config = readConfig();
+  const prev = config.recentLaunchFolders ?? [];
+  const next = [trimmed, ...prev.filter(path => path !== trimmed)].slice(0, MAX_RECENT_LAUNCH_FOLDERS);
+  config.recentLaunchFolders = next;
+  writeConfig(config);
+  return next;
+}
 
 export function recordLaunchSelection(
   agent: 'claude' | 'codex' | 'gemini',
@@ -225,6 +266,32 @@ export function setServerFavoritesOnly(favoritesOnly: boolean): void {
   config.server = {
     ...(config.server ?? {}),
     favoritesOnly,
+  };
+  writeConfig(config);
+}
+
+export function getServerFreeModelsOnly(): boolean {
+  return readConfig().server?.freeModelsOnly ?? false;
+}
+
+export function setServerFreeModelsOnly(freeModelsOnly: boolean): void {
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    freeModelsOnly,
+  };
+  writeConfig(config);
+}
+
+export function getServerListenMode(): 'local' | 'network' {
+  return readConfig().server?.listenMode === 'network' ? 'network' : 'local';
+}
+
+export function setServerListenMode(listenMode: 'local' | 'network'): void {
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    listenMode,
   };
   writeConfig(config);
 }

@@ -13,6 +13,7 @@ import {
   filterTemplates,
   listAddableTemplates,
   listSupportedTemplates,
+  listVisibleOAuthTemplates,
   type ProviderTemplate,
 } from './provider-templates.js';
 import { addProviderFromTemplate } from './registry/add-template.js';
@@ -31,6 +32,10 @@ import { resolveRefreshCredential } from './registry/refresh-credentials.js';
 import { resolveOrCollectApiKey } from './key-setup.js';
 import { authenticateProvider, providerAuthHelpText, type ProviderAuthMethod } from './registry/provider-auth.js';
 import { supportsNativeOAuth } from './oauth/types.js';
+import { browseAllModels } from './prompts.js';
+import { cachedModelToLocal } from './registry/materialize.js';
+import { loadPreferences } from './config.js';
+import type { LocalProvider } from './types.js';
 import {
   fmtCount,
   fmtEnabledStar,
@@ -115,7 +120,7 @@ ${pc.bold('Subcommands:')}
   (none)      Provider hub wizard ${pc.dim('[Phase 1.1]')}
   add         Add a provider (Groq, Mistral, Together AI, …) ${pc.dim('[Phase 1.1]')}
   import      Import providers from OpenCode CLI (one-time) ${pc.dim('[Phase 1.0]')}
-  auth        Sign in with OAuth (xAI, OpenAI ChatGPT) ${pc.dim('[Phase 2]')}
+  auth        Sign in with OAuth (GitHub Copilot, xAI, OpenAI)
   list        Show configured providers ${pc.dim('[Phase 1.0]')}
   remove      Remove a provider by id ${pc.dim('[Phase 1.1]')}
   refresh-models  Update cached model lists ${pc.dim('[Phase 1.2]')}`;
@@ -265,6 +270,9 @@ export async function runProvidersRefreshModels(providerId?: string): Promise<nu
       ? ''
       : diff > 0 ? ` (+${diff})` : diff < 0 ? ` (${diff})` : '';
     p.log.success(`${result.name}: ${result.modelCount} model${result.modelCount === 1 ? '' : 's'} updated${diffStr}.`);
+    if (result.reason) {
+      p.log.warn(result.reason);
+    }
     return 0;
   }
 
@@ -287,6 +295,9 @@ export async function runProvidersRefreshModels(providerId?: string): Promise<nu
         ? ''
         : diff > 0 ? ` (+${diff})` : diff < 0 ? ` (${diff})` : '';
       p.log.info(`  ${r.name}: ${r.modelCount} model${r.modelCount === 1 ? '' : 's'}${diffStr}`);
+      if (r.reason) {
+        p.log.warn(`  ${r.reason}`);
+      }
     }
   }
   for (const r of skipped) {
@@ -452,9 +463,11 @@ async function runTemplateAddFlow(): Promise<number> {
     if (p.isCancel(urlInput)) return 0;
     baseUrlOverride = String(urlInput).trim();
     
-    // Security check for overridden URLs
-    const isLocal = baseUrlOverride.includes('127.0.0.1') || baseUrlOverride.includes('localhost');
-    const valid = await validateCustomEndpointUrl(baseUrlOverride, { allowInsecureLocal: isLocal });
+    const usesHttp = /^http:\/\//i.test(baseUrlOverride);
+    if (usesHttp) {
+      p.log.warn('HTTP is not encrypted. Use it only for trusted local or LAN servers, like Ollama on your own network.');
+    }
+    const valid = await validateCustomEndpointUrl(baseUrlOverride, { allowInsecureLocal: usesHttp });
     if (!valid.ok) {
       p.log.error(valid.error ?? 'Invalid URL');
       if (valid.hint) p.log.info(valid.hint);
@@ -462,7 +475,9 @@ async function runTemplateAddFlow(): Promise<number> {
     }
   }
 
-  const apiKeyMsg = template.apiKeyOptional
+  const apiKeyMsg = template.anonymousFreeModels
+    ? `API key (leave empty to use free models only):`
+    : template.apiKeyOptional
     ? `API key (leave empty for local servers without auth):`
     : `Paste your ${template.name} API key:`;
 
@@ -476,7 +491,7 @@ async function runTemplateAddFlow(): Promise<number> {
   }
   
   const rawKey = String(apiKeyInput).trim();
-  const apiKey = template.apiKeyOptional && !rawKey ? template.id : rawKey;
+  const apiKey = template.apiKeyOptional && !rawKey && !template.anonymousFreeModels ? template.id : rawKey;
 
   const spinner = p.spinner();
   spinner.start(`Testing connection to ${template.name}...`);
@@ -527,16 +542,49 @@ async function runCustomEndpointAddFlow(): Promise<number> {
   });
   if (p.isCancel(baseUrl)) return 0;
 
-  const allowLocal = await p.confirm({
-    message: 'Allow local HTTP (Ollama / LM Studio on localhost)?',
-    initialValue: String(baseUrl).includes('127.0.0.1') || String(baseUrl).includes('localhost'),
-  });
-  if (p.isCancel(allowLocal)) return 0;
+  const usesHttp = /^http:\/\//i.test(String(baseUrl).trim());
+  let allowInsecureHttp = false;
+  if (usesHttp) {
+    p.log.warn('HTTP is not encrypted. Only use it for a trusted local or LAN server, like Ollama on your own network.');
+    const allowLocal = await p.confirm({
+      message: 'Allow insecure HTTP for this local/LAN server?',
+      initialValue: true,
+    });
+    if (p.isCancel(allowLocal)) return 0;
+    allowInsecureHttp = allowLocal === true;
+  }
 
   const apiKey = await p.password({
     message: 'API key (leave empty for local servers without auth):',
   });
   if (p.isCancel(apiKey)) return 0;
+
+  const wantsHeaders = await p.confirm({
+    message: 'Does this endpoint need extra custom headers? (e.g. a plan/auth-tracking header)',
+    initialValue: false,
+  });
+  if (p.isCancel(wantsHeaders)) return 0;
+
+  const headers: Record<string, string> = {};
+  if (wantsHeaders) {
+    for (;;) {
+      const headerLine = await p.text({
+        message: 'Header (leave empty when done):',
+        placeholder: 'X-Plan: coding',
+      });
+      if (p.isCancel(headerLine)) return 0;
+      const trimmed = String(headerLine).trim();
+      if (!trimmed) break;
+      const idx = trimmed.indexOf(':');
+      if (idx < 1) {
+        p.log.warn('Use the format "Name: Value" — skipped.');
+        continue;
+      }
+      const name = trimmed.slice(0, idx).trim();
+      const value = trimmed.slice(idx + 1).trim();
+      if (name) headers[name] = value;
+    }
+  }
 
   const spinner = p.spinner();
   spinner.start('Testing connection...');
@@ -545,7 +593,8 @@ async function runCustomEndpointAddFlow(): Promise<number> {
     baseUrl: String(baseUrl).trim(),
     apiKey: String(apiKey ?? '').trim(),
     kind: kindChoice as 'openai' | 'anthropic',
-    allowInsecureLocal: allowLocal === true,
+    allowInsecureLocal: allowInsecureHttp,
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
   });
   spinner.stop('');
 
@@ -563,13 +612,7 @@ export async function runProvidersAdd(): Promise<number> {
   const registry = loadRegistry();
   const hasOpencode = findOpencodeBinary() !== null;
 
-  const options: Array<{ value: string; label: string; hint: string }> = [
-    {
-      value: 'import',
-      label: 'Import providers from OpenCode CLI',
-      hint: hasOpencode ? 'Import Groq, OpenAI, etc. from your OpenCode config' : 'Requires OpenCode CLI',
-    },
-  ];
+  const options: Array<{ value: string; label: string; hint: string }> = [];
   const addableTemplates = listAddableTemplates(registry.providers.map(p => p.id));
   if (addableTemplates.length > 0) {
     options.push({
@@ -582,6 +625,11 @@ export async function runProvidersAdd(): Promise<number> {
     value: 'custom',
     label: 'Custom server (Advanced)',
     hint: 'OpenAI-compatible or Claude-style API URL',
+  });
+  options.push({
+    value: 'import',
+    label: 'Import providers from OpenCode CLI',
+    hint: hasOpencode ? 'Import Groq, OpenAI, etc. from your OpenCode config' : 'Requires OpenCode CLI',
   });
 
   const choice = await p.select({ message: 'Add a provider', options });
@@ -658,7 +706,7 @@ async function runOpenCodeCloudDetail(): Promise<'back'> {
 }
 
 export function providerHubChoiceValue(entry: ProviderDisplayEntry): string {
-  return entry.cloudBuiltin ? `cloud:${entry.cloudBuiltin}` : `provider:${entry.id}`;
+  return `provider:${entry.id}`;
 }
 
 async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
@@ -670,13 +718,19 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
   const authLabel = formatRegistryAuthLabel(provider);
   printProviderDetailPanel(provider.name, modelCount, authLabel);
 
-  const detailOptions: Array<{ value: string; label: string; hint?: string }> = [
-    {
-      value: 'refresh',
-      label: 'Refresh model list',
-      hint: 'Fetch latest models from the provider API',
-    },
-  ];
+  const detailOptions: Array<{ value: string; label: string; hint?: string }> = [];
+  if (modelCount > 0) {
+    detailOptions.push({
+      value: 'browse',
+      label: 'Browse models',
+      hint: `Search or browse ${modelCount} model${modelCount === 1 ? '' : 's'}`,
+    });
+  }
+  detailOptions.push({
+    value: 'refresh',
+    label: 'Refresh model list',
+    hint: 'Fetch latest models from the provider API',
+  });
   if (supportsNativeOAuth(id) || provider.authType === 'oauth') {
     detailOptions.push({
       value: 'auth',
@@ -699,6 +753,21 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
     options: detailOptions,
   });
   if (p.isCancel(action) || action === 'back') return 'back';
+
+  if (action === 'browse') {
+    const cachedModels = provider.modelsCache?.models ?? [];
+    const localModels = cachedModels
+      .map(m => cachedModelToLocal(m, provider))
+      .filter((m): m is NonNullable<typeof m> => m !== null);
+    const localProvider: LocalProvider = {
+      id: provider.id,
+      name: provider.name,
+      apiKey: '',
+      models: localModels,
+    };
+    await browseAllModels(localProvider, loadPreferences());
+    return 'back';
+  }
 
   if (action === 'refresh') {
     await runProvidersRefreshModels(id);
@@ -741,7 +810,7 @@ export async function runProvidersHub(): Promise<number> {
       });
     }
 
-    options.push({ value: 'auth-menu', label: '→ Sign in with OAuth (xAI / OpenAI)', hint: 'Device code or OpenCode broker' });
+    options.push({ value: 'auth-menu', label: '→ Sign in with OAuth', hint: 'GitHub Copilot · xAI · OpenAI' });
     if (entries.length > 0) {
       options.push({ value: 'refresh-all', label: '↺ Refresh all models', hint: 'Update model lists for all providers' });
     }
@@ -770,12 +839,19 @@ export async function runProvidersHub(): Promise<number> {
       continue;
     }
     if (choice === 'auth-menu') {
+      const configuredIds = loadRegistry().providers.map(provider => provider.id);
+      const oauthTemplates = listVisibleOAuthTemplates(configuredIds);
+      if (oauthTemplates.length === 0) {
+        p.log.info('All visible OAuth providers are already configured.');
+        continue;
+      }
       const providerId = await p.select({
         message: 'Which provider?',
-        options: [
-          { value: 'xai', label: 'xAI Grok (SuperGrok)' },
-          { value: 'openai', label: 'OpenAI ChatGPT Plus/Pro' },
-        ],
+        options: oauthTemplates.map(template => ({
+          value: template.id,
+          label: template.name,
+          hint: 'device code',
+        })),
       });
       if (!p.isCancel(providerId)) await runProvidersAuth(providerId as string);
       continue;

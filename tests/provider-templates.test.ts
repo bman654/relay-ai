@@ -4,6 +4,8 @@ import {
   getTemplateById,
   listAddableTemplates,
   listSupportedTemplates,
+  listVisibleOAuthTemplates,
+  PROVIDER_TEMPLATES,
 } from '../src/provider-templates.js';
 import { fetchTemplateModels } from '../src/registry/fetch-template-models.js';
 
@@ -12,6 +14,7 @@ describe('provider templates', () => {
     const ids = listSupportedTemplates().map(t => t.id);
     expect(ids).toContain('groq');
     expect(ids).toContain('mistral');
+    expect(ids).toContain('kilo');
   });
 
   it('sorts supported templates alphabetically by display name', () => {
@@ -28,6 +31,38 @@ describe('provider templates', () => {
 
   it('looks up template by id', () => {
     expect(getTemplateById('groq')?.npm).toBe('@ai-sdk/groq');
+  });
+
+  it('defines Kilo Code as anonymous-free OpenAI-compatible provider', () => {
+    expect(getTemplateById('kilo')).toMatchObject({
+      name: 'Kilo Code',
+      npm: '@ai-sdk/openai-compatible',
+      defaultBaseUrl: 'https://api.kilo.ai/api/gateway',
+      modelsPath: '/models',
+      apiKeyOptional: true,
+      anonymousFreeModels: true,
+      modelSource: 'api-list',
+      supported: true,
+    });
+  });
+
+  it('omits hidden templates from OAuth discovery surfaces', () => {
+    const hiddenIds = PROVIDER_TEMPLATES.filter(t => t.hidden).map(t => t.id);
+    const visibleIds = listVisibleOAuthTemplates().map(t => t.id);
+
+    expect(hiddenIds.length).toBeGreaterThan(0);
+    for (const id of hiddenIds) {
+      expect(visibleIds).not.toContain(id);
+    }
+  });
+
+  it('lists only visible OAuth templates for discovery surfaces', () => {
+    expect(listVisibleOAuthTemplates().map(t => t.id).sort()).toEqual([
+      'github-copilot',
+      'openai-oauth',
+      'xai-oauth',
+    ]);
+    expect(listVisibleOAuthTemplates(['openai-oauth']).map(t => t.id)).not.toContain('openai-oauth');
   });
 
   it('excludes already-configured providers from addable list', () => {

@@ -1,4 +1,4 @@
-// Find, open, quit, and restart Codex desktop app (macOS + Windows).
+// Find, open, quit, and restart the ChatGPT desktop app / Codex mode (macOS + Windows).
 import { execSync, spawn } from 'node:child_process';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -6,6 +6,16 @@ import { join } from 'node:path';
 import * as p from '@clack/prompts';
 
 const CODEX_BUNDLE_ID = 'com.openai.codex';
+// OpenAI merged the Codex desktop app into the ChatGPT desktop app (2026-07-09).
+// The bundle id is unchanged, but the app is now named "ChatGPT" on disk and
+// as a running process. Check both names — some users may still be on the
+// pre-merge "Codex" build until they update.
+const DARWIN_APP_NAMES = ['ChatGPT', 'Codex'];
+// Confirmed on macOS only (see DARWIN_APP_NAMES above); the Windows renamed
+// exe/process name is not yet verified against a real install. Mirrors the
+// confirmed macOS rename (Codex -> ChatGPT, same install-folder convention)
+// as a best-effort guess until confirmed on a real Windows install.
+const WIN_APP_NAMES = ['ChatGPT', 'Codex'];
 
 export function codexAppSupported(): void {
   if (process.platform !== 'darwin' && process.platform !== 'win32') {
@@ -22,10 +32,10 @@ function runPowerShell(script: string): string {
 }
 
 function darwinAppCandidates(): string[] {
-  return [
-    '/Applications/Codex.app',
-    join(homedir(), 'Applications', 'Codex.app'),
-  ];
+  return DARWIN_APP_NAMES.flatMap(name => [
+    `/Applications/${name}.app`,
+    join(homedir(), 'Applications', `${name}.app`),
+  ]);
 }
 
 function winLocalAppData(): string {
@@ -34,22 +44,26 @@ function winLocalAppData(): string {
 
 function winCodexExeCandidates(): string[] {
   const local = winLocalAppData();
-  const bases = [
-    join(local, 'Programs', 'Codex'),
-    join(local, 'Programs', 'OpenAI Codex'),
-    join(local, 'Codex'),
-    join(local, 'OpenAI Codex'),
-    join(local, 'OpenAI', 'Codex'),
-    join(local, 'openai-codex-electron'),
-  ];
+  const bases = WIN_APP_NAMES.flatMap(name => [
+    join(local, 'Programs', name),
+    join(local, 'Programs', `OpenAI ${name}`),
+    join(local, name),
+    join(local, `OpenAI ${name}`),
+    join(local, 'OpenAI', name),
+  ]);
+  bases.push(join(local, 'openai-codex-electron'), join(local, 'openai-chatgpt-electron'));
   const out: string[] = [];
   for (const base of bases) {
-    out.push(join(base, 'Codex.exe'));
+    for (const name of WIN_APP_NAMES) {
+      out.push(join(base, `${name}.exe`));
+    }
     try {
       if (existsSync(base)) {
-        for (const name of readdirSync(base)) {
-          if (name.startsWith('app-')) {
-            out.push(join(base, name, 'Codex.exe'));
+        for (const dir of readdirSync(base)) {
+          if (dir.startsWith('app-')) {
+            for (const name of WIN_APP_NAMES) {
+              out.push(join(base, dir, `${name}.exe`));
+            }
           }
         }
       }
@@ -82,8 +96,11 @@ export function findCodexApp(): string | null {
       } catch { /* ignore */ }
     }
     try {
+      const nameFilter = WIN_APP_NAMES
+        .map(name => `$_.Name -eq '${name}' -or $_.Name -like '${name}*'`)
+        .join(' -or ');
       const appId = runPowerShell(
-        "(Get-StartApps Codex | Where-Object { $_.Name -eq 'Codex' -or $_.Name -like 'Codex*' } | Select-Object -First 1 -ExpandProperty AppID)",
+        `(Get-StartApps | Where-Object { ${nameFilter} } | Select-Object -First 1 -ExpandProperty AppID)`,
       );
       if (appId) return `shell:AppsFolder\\${appId}`;
     } catch { /* ignore */ }
@@ -92,17 +109,26 @@ export function findCodexApp(): string | null {
 }
 
 function darwinIsRunning(): boolean {
-  try {
-    const out = run(`osascript -e 'tell application "System Events" to exists process "Codex"'`);
-    return out.toLowerCase() === 'true';
-  } catch {
-    return false;
-  }
+  return DARWIN_APP_NAMES.some(name => {
+    try {
+      const out = run(`osascript -e 'tell application "System Events" to exists process "${name}"'`);
+      return out.toLowerCase() === 'true';
+    } catch {
+      return false;
+    }
+  });
 }
 
 function winMatchingPids(): number[] {
   try {
-    const script = `$current = ${process.pid}; Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe'" | Where-Object { $_.ProcessId -ne $current -and ((($_.Name -ieq 'Codex.exe') -and (($null -eq $_.CommandLine) -or ($_.CommandLine -notlike '* --type=*'))) -or (($_.Name -ieq 'codex.exe') -and ($_.CommandLine -like '*app-server*'))) } | Select-Object -ExpandProperty ProcessId`;
+    const nameFilter = WIN_APP_NAMES.map(name => `Name = '${name}.exe'`).join(' OR ');
+    // Exclude Electron subprocess helpers (renderer/gpu, tagged with --type=)
+    // for each app's main process; 'codex.exe' (lowercase) is the embedded
+    // CLI engine, kept as its own case since it isn't part of the rename.
+    const mainProcessFilter = WIN_APP_NAMES
+      .map(name => `(($_.Name -ieq '${name}.exe') -and (($null -eq $_.CommandLine) -or ($_.CommandLine -notlike '* --type=*')))`)
+      .join(' -or ');
+    const script = `$current = ${process.pid}; Get-CimInstance Win32_Process -Filter "${nameFilter} OR Name = 'codex.exe'" | Where-Object { $_.ProcessId -ne $current -and (${mainProcessFilter} -or (($_.Name -ieq 'codex.exe') -and ($_.CommandLine -like '*app-server*'))) } | Select-Object -ExpandProperty ProcessId`;
     const out = runPowerShell(script);
     return out.split(/\s+/).map(s => Number.parseInt(s, 10)).filter(n => Number.isFinite(n) && n > 0);
   } catch {
@@ -112,8 +138,9 @@ function winMatchingPids(): number[] {
 
 function winHasWindow(): boolean {
   try {
+    const nameFilter = WIN_APP_NAMES.map(name => `'${name}'`).join(',');
     const out = runPowerShell(
-      "(Get-Process Codex -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1).Id",
+      `(Get-Process ${nameFilter} -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1).Id`,
     );
     return out.length > 0 && Number.isFinite(Number.parseInt(out, 10));
   } catch {
@@ -134,14 +161,18 @@ function sleep(ms: number): Promise<void> {
 async function waitForQuit(timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    // Check actual process existence, not window visibility — apps that
+    // minimize to the tray on close clear their window handle immediately
+    // while staying alive, which would make this return early with the
+    // old process (and its old config) still running.
     if (process.platform === 'win32') {
-      if (!winHasWindow()) return true;
+      if (winMatchingPids().length === 0) return true;
     } else if (!darwinIsRunning()) {
       return true;
     }
     await sleep(200);
   }
-  return process.platform === 'win32' ? !winHasWindow() : !darwinIsRunning();
+  return process.platform === 'win32' ? winMatchingPids().length === 0 : !darwinIsRunning();
 }
 
 function openCodexAppAt(path: string): void {
@@ -167,7 +198,7 @@ export function openCodexApp(): void {
   const path = findCodexApp();
   if (!path) {
     throw new Error(
-      'Codex App not found. Install from https://developers.openai.com/codex/cli then run relay-ai codex-app again.',
+      'ChatGPT Desktop app not found. Install from https://developers.openai.com/codex/app then run relay-ai codex-app again.',
     );
   }
   openCodexAppAt(path);
@@ -182,8 +213,9 @@ function darwinQuit(): void {
 }
 
 function winQuitGraceful(): void {
+  const nameFilter = WIN_APP_NAMES.map(name => `'${name}'`).join(',');
   runPowerShell(
-    'Get-Process Codex -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { [void]$_.CloseMainWindow() }',
+    `Get-Process ${nameFilter} -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { [void]$_.CloseMainWindow() }`,
   );
 }
 
@@ -199,13 +231,13 @@ function winForceQuit(): void {
 }
 
 export async function launchOrRestartCodexApp(
-  prompt = 'Restart Codex to apply relay-ai settings?',
+  prompt = 'Restart ChatGPT Desktop to apply relay-ai settings?',
 ): Promise<void> {
   const appPath = findCodexApp();
   if (!isCodexAppRunning()) {
     if (!appPath) {
       throw new Error(
-        'Codex App not found. Install from https://developers.openai.com/codex/cli then run relay-ai codex-app again.',
+        'ChatGPT Desktop app not found. Install from https://developers.openai.com/codex/app then run relay-ai codex-app again.',
       );
     }
     openCodexAppAt(appPath);
@@ -214,7 +246,7 @@ export async function launchOrRestartCodexApp(
 
   const restart = await p.confirm({ message: prompt, initialValue: true });
   if (p.isCancel(restart) || !restart) {
-    p.log.info('Quit and reopen Codex when you are ready for the new model to take effect.');
+    p.log.info('Quit and reopen ChatGPT Desktop when you are ready for the new model to take effect.');
     return;
   }
 
@@ -231,5 +263,5 @@ export async function launchOrRestartCodexApp(
 }
 
 export function codexAppInstallHint(): string {
-  return 'Install the Codex desktop app for macOS or Windows: https://developers.openai.com/codex/cli';
+  return 'Install the ChatGPT desktop app (Codex mode) for macOS or Windows: https://developers.openai.com/codex/app';
 }

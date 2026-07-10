@@ -9,15 +9,22 @@ export interface ProviderTemplate {
   authType: ProviderAuthType;
   npm: string;
   defaultBaseUrl?: string;
+  modelsPath?: string;
   signupUrl?: string;
   urlPlaceholder?: string;
   urlPrompt?: string;
   apiKeyOptional?: boolean;
+  anonymousFreeModels?: boolean;
+  /** Static headers this provider requires on every request (model listing and runtime). */
+  headers?: Record<string, string>;
   modelSource: ProviderModelSource;
   staticModels?: Array<{ id: string; name: string }>;
   supported: boolean;
   addable?: boolean;
+  hidden?: boolean;
   unsupportedReason?: string;
+  /** True for providers that extract subscription tokens — carries account risk. */
+  subscriptionRisk?: boolean;
 }
 
 /** Templates aligned with SDK packages shipped in package.json (API-key providers first). */
@@ -29,6 +36,16 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     npm: '@ai-sdk/groq',
     defaultBaseUrl: 'https://api.groq.com/openai/v1',
     signupUrl: 'https://console.groq.com/keys',
+    modelSource: 'api-list',
+    supported: true,
+  },
+  {
+    id: 'nvidia',
+    name: 'Nvidia',
+    authType: 'api',
+    npm: '@ai-sdk/openai-compatible',
+    defaultBaseUrl: 'https://integrate.api.nvidia.com/v1',
+    signupUrl: 'https://build.nvidia.com',
     modelSource: 'api-list',
     supported: true,
   },
@@ -195,6 +212,19 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     supported: true,
   },
   {
+    id: 'kilo',
+    name: 'Kilo Code',
+    authType: 'api',
+    npm: '@ai-sdk/openai-compatible',
+    defaultBaseUrl: 'https://api.kilo.ai/api/gateway',
+    modelsPath: '/models',
+    signupUrl: 'https://app.kilo.ai',
+    apiKeyOptional: true,
+    anonymousFreeModels: true,
+    modelSource: 'api-list',
+    supported: true,
+  },
+  {
     id: 'ollama',
     name: 'Ollama',
     authType: 'api',
@@ -292,22 +322,67 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     supported: true,
     addable: false,
   },
-  // OAuth-gated subscription providers — use relay-ai providers auth <id> to sign in
+  // Subscription OAuth providers — Authorization Code + PKCE (browser redirect)
+  // ⚠️  These extract tokens from paid subscriptions. Account risk — see plan docs.
+  {
+    id: 'claude-code',
+    name: 'Claude Code (Anthropic subscription)',
+    authType: 'oauth',
+    npm: '@ai-sdk/anthropic',
+    defaultBaseUrl: 'https://api.anthropic.com',
+    signupUrl: 'https://claude.ai',
+    modelSource: 'api-list',
+    supported: true,
+    hidden: true,
+    subscriptionRisk: true,
+  },
+  {
+    id: 'antigravity',
+    name: 'Antigravity (Google Cloud Code Assist)',
+    authType: 'oauth',
+    npm: '@ai-sdk/openai-compatible',
+    signupUrl: 'https://antigravity.google',
+    modelSource: 'api-list',
+    supported: true,
+    hidden: true,
+    subscriptionRisk: true,
+  },
+  // OAuth-gated subscription providers — device code or broker sign-in
+  {
+    id: 'xai-oauth',
+    name: 'xAI Grok (SuperGrok)',
+    authType: 'oauth',
+    npm: '@ai-sdk/xai',
+    signupUrl: 'https://x.ai',
+    modelSource: 'api-list',
+    supported: true,
+  },
+  {
+    id: 'openai-oauth',
+    name: 'OpenAI (ChatGPT)',
+    authType: 'oauth',
+    npm: '@ai-sdk/openai',
+    signupUrl: 'https://chatgpt.com',
+    modelSource: 'api-list',
+    supported: true,
+  },
   {
     id: 'github-copilot',
     name: 'GitHub Copilot',
     authType: 'oauth',
     npm: '@ai-sdk/openai-compatible',
     defaultBaseUrl: 'https://api.githubcopilot.com',
+    modelsPath: '/models',
     signupUrl: 'https://github.com/features/copilot',
     modelSource: 'api-list',
+    headers: { 'Editor-Version': 'vscode/1.85.1' },
     supported: true,
   },
 ];
 
 export function listSupportedTemplates(): ProviderTemplate[] {
   return PROVIDER_TEMPLATES
-    .filter(t => t.supported && t.authType === 'api' && t.addable !== false)
+    .filter(t => t.supported && t.authType === 'api' && t.addable !== false && !t.hidden)
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -320,6 +395,13 @@ export function listAddableTemplates(configuredIds: Iterable<string> = []): Prov
     }
     return !configured.has(t.id);
   });
+}
+
+export function listVisibleOAuthTemplates(configuredIds: Iterable<string> = []): ProviderTemplate[] {
+  const configured = new Set(configuredIds);
+  return PROVIDER_TEMPLATES
+    .filter(t => t.authType === 'oauth' && t.supported && t.addable !== false && !t.hidden && !configured.has(t.id))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function getTemplateById(id: string): ProviderTemplate | undefined {

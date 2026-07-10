@@ -202,6 +202,24 @@ describe('translateRequest', () => {
     });
   });
 
+  it('applies reasoning effort using reasoningMetadata.upstreamModelId, not the gateway-aliased body.model', () => {
+    const params = translateRequest({
+      model: 'anthropic-xai__grok-4.3',
+      output_config: { effort: 'high' },
+      messages: [{ role: 'user', content: 'hi' }],
+    }, '@ai-sdk/xai', { reasoningMetadata: { upstreamModelId: 'grok-4.3' } });
+    expect(params.providerOptions?.xai).toMatchObject({ reasoningEffort: 'high' });
+  });
+
+  it('does not apply reasoning effort when only the gateway-aliased model id is available (regression guard)', () => {
+    const params = translateRequest({
+      model: 'anthropic-xai__grok-4.3',
+      output_config: { effort: 'high' },
+      messages: [{ role: 'user', content: 'hi' }],
+    }, '@ai-sdk/xai');
+    expect(params.providerOptions?.xai).toBeUndefined();
+  });
+
   it('reads effort from output_config via anthropicEffortFromRequest', () => {
     expect(anthropicEffortFromRequest({ model: 'm', messages: [], output_config: { effort: 'high' } })).toBe('high');
     expect(anthropicEffortFromRequest({ model: 'm', messages: [] })).toBeUndefined();
@@ -289,6 +307,33 @@ describe('generateAnthropicResponse', () => {
     vi.doUnmock('ai');
     vi.resetModules();
   });
+
+  it('forceStream collects a real stream into one response instead of calling generateText', async () => {
+    vi.resetModules();
+    const generateText = vi.fn();
+    vi.doMock('ai', () => ({
+      generateText,
+      streamText: vi.fn(() => ({
+        text: Promise.resolve('hello'),
+        toolCalls: Promise.resolve([]),
+        toolResults: Promise.resolve([]),
+        finishReason: Promise.resolve('stop'),
+        usage: Promise.resolve({ inputTokens: 3, outputTokens: 4 }),
+      })),
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+    const body = await generateAnthropicResponse({} as never, { messages: [] }, 'gpt-5.6-sol', { forceStream: true });
+
+    expect(generateText).not.toHaveBeenCalled();
+    expect((body.content as any[])[0]).toEqual({ type: 'text', text: 'hello' });
+    expect(body.usage).toEqual({ input_tokens: 3, output_tokens: 4 });
+
+    vi.doUnmock('ai');
+    vi.resetModules();
+  });
 });
 
 // ── streaming translation ────────────────────────────────────────────────────
@@ -321,6 +366,24 @@ describe('writeAnthropicStream', () => {
     const delta = events.find(e => e.event === 'message_delta')!;
     expect(delta.data.delta.stop_reason).toBe('end_turn');
     expect(delta.data.usage).toEqual({ input_tokens: 5, output_tokens: 2 });
+  });
+
+  it('maps a mid-stream 401 to a non-retryable authentication_error instead of a generic api_error', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'error', error: { statusCode: 401, message: 'Unauthorized' } },
+    ]);
+    const errorEvent = events.find(e => e.event === 'error')!;
+    expect(errorEvent.data.error).toEqual({ type: 'authentication_error', message: 'Unauthorized' });
+  });
+
+  it('falls back to a generic api_error for an unrecognized upstream failure', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'error', error: { message: 'Something went wrong' } },
+    ]);
+    const errorEvent = events.find(e => e.event === 'error')!;
+    expect(errorEvent.data.error).toEqual({ type: 'api_error', message: 'Something went wrong' });
   });
 
   it('encodes thought_signature into the tool_use id and reports tool_use stop', async () => {

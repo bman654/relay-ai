@@ -14,6 +14,8 @@ const sampleProvider: LocalProvider = {
     modelFormat: 'openai',
     upstreamModelId: 'llama-3.3-70b',
     npm: '@ai-sdk/groq',
+    isFree: true,
+    freeStatus: 'verified_free',
   }],
 };
 
@@ -27,6 +29,8 @@ describe('localProviderToRegistry', () => {
       enabled: true,
     });
     expect(entry?.modelsCache?.models[0]?.upstreamModelId).toBe('llama-3.3-70b');
+    expect(entry?.modelsCache?.models[0]?.isFree).toBe(true);
+    expect(entry?.modelsCache?.models[0]?.freeStatus).toBe('verified_free');
   });
 
   it('rejects invalid provider ids', () => {

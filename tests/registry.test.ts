@@ -216,6 +216,85 @@ describe('materializeRegistry', () => {
     expect(materializeRegistry(registry, () => null)).toHaveLength(0);
   });
 
+  it('allows anonymous Kilo but exposes only verified free models', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'kilo',
+      templateId: 'kilo',
+      name: 'Kilo Code',
+      enabled: true,
+      authRef: 'keyring:provider:kilo',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://api.kilo.ai/api/gateway' },
+      addedAt: '2026-07-06T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-07-06T00:00:00.000Z',
+        models: [
+          {
+            id: 'tencent/hy3:free',
+            name: 'Tencent: Hy3 (free)',
+            upstreamModelId: 'tencent/hy3:free',
+            modelFormat: 'openai',
+            npm: '@ai-sdk/openai-compatible',
+            cost: { input: 0, output: 0 },
+            isFree: true,
+            freeStatus: 'verified_free',
+          },
+          {
+            id: 'anthropic/claude-sonnet-4.5',
+            name: 'Claude Sonnet 4.5',
+            upstreamModelId: 'anthropic/claude-sonnet-4.5',
+            modelFormat: 'openai',
+            npm: '@ai-sdk/openai-compatible',
+            cost: { input: 3, output: 15 },
+            isFree: false,
+            freeStatus: 'paid',
+          },
+        ],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => null);
+
+    expect(locals).toHaveLength(1);
+    expect(locals[0]?.apiKey).toBe('');
+    expect(locals[0]?.models.map(m => m.id)).toEqual(['tencent/hy3:free']);
+    expect(locals[0]?.models[0]).toMatchObject({
+      isFree: true,
+      freeStatus: 'verified_free',
+    });
+  });
+
+  it('marks NVIDIA imported models as free provider access', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'nvidia',
+      templateId: 'nvidia',
+      name: 'NVIDIA NIM',
+      enabled: true,
+      authRef: 'keyring:provider:nvidia',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://integrate.api.nvidia.com/v1' },
+      addedAt: '2026-07-06T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-07-06T00:00:00.000Z',
+        models: [{
+          id: 'nvidia/llama-3.1-nemotron',
+          name: 'NVIDIA Nemotron',
+          upstreamModelId: 'nvidia/llama-3.1-nemotron',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai-compatible',
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'nvapi-test');
+
+    expect(locals[0]?.models[0]).toMatchObject({
+      isFree: true,
+      freeStatus: 'free_provider',
+    });
+  });
+
   it('honors per-model npm and apiUrl overrides', () => {
     const registry = emptyRegistry();
     registry.providers.push({

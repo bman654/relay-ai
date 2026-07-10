@@ -4,10 +4,17 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   clearSavedServerPassword,
+  getAppPathOverride,
   getSavedServerPassword,
+  getServerFreeModelsOnly,
+  getServerListenMode,
   loadPreferences,
+  recordLaunchFolder,
   savePreferences,
+  setAppPathOverride,
   setSavedServerPassword,
+  setServerFreeModelsOnly,
+  setServerListenMode,
 } from '../src/config.js';
 import { getAppHome, getConfigPath, getLegacyAppHome, getLegacyConfPath } from '../src/paths.js';
 
@@ -67,6 +74,48 @@ describe('dotfolder config', () => {
     });
   });
 
+  it('saves Antigravity CLI favorites separately from global favorites', () => {
+    savePreferences({
+      favoriteModels: [{ providerId: 'global', modelId: 'claude' }],
+      antigravityCliFavoriteModels: [{ providerId: 'xai-oauth', modelId: 'grok-4.3' }],
+      antigravityCliFavoritesHintShown: true,
+    });
+
+    expect(loadPreferences()).toMatchObject({
+      favoriteModels: [{ providerId: 'global', modelId: 'claude' }],
+      antigravityCliFavoriteModels: [{ providerId: 'xai-oauth', modelId: 'grok-4.3' }],
+      antigravityCliFavoritesHintShown: true,
+    });
+    expect(JSON.parse(readFileSync(getConfigPath(), 'utf8'))).toMatchObject({
+      favoriteModels: [{ providerId: 'global', modelId: 'claude' }],
+      antigravityCliFavoriteModels: [{ providerId: 'xai-oauth', modelId: 'grok-4.3' }],
+      antigravityCliFavoritesHintShown: true,
+    });
+  });
+
+  it('saves and clears app path overrides', () => {
+    setAppPathOverride('codex', '/tmp/custom-codex');
+
+    expect(getAppPathOverride('codex')).toBe('/tmp/custom-codex');
+    expect(loadPreferences().appPathOverrides).toEqual({ codex: '/tmp/custom-codex' });
+
+    setAppPathOverride('codex', null);
+
+    expect(getAppPathOverride('codex')).toBeUndefined();
+    expect(loadPreferences().appPathOverrides).toBeUndefined();
+  });
+
+  it('records recent launch folders with most recent first', () => {
+    recordLaunchFolder('/Users/jbendavi/project-a');
+    recordLaunchFolder('/Users/jbendavi/project-b');
+    recordLaunchFolder('/Users/jbendavi/project-a');
+
+    expect(loadPreferences().recentLaunchFolders).toEqual([
+      '/Users/jbendavi/project-a',
+      '/Users/jbendavi/project-b',
+    ]);
+  });
+
   it('migrates legacy lastProvider opencode to zen on read', () => {
     const configPath = getConfigPath();
     mkdirSync(dirname(configPath), { recursive: true });
@@ -85,6 +134,26 @@ describe('dotfolder config', () => {
 
     await clearSavedServerPassword();
     expect(await getSavedServerPassword()).toBeNull();
+  });
+
+  it('saves server free-models-only preference', () => {
+    expect(getServerFreeModelsOnly()).toBe(false);
+
+    setServerFreeModelsOnly(true);
+    expect(getServerFreeModelsOnly()).toBe(true);
+
+    setServerFreeModelsOnly(false);
+    expect(getServerFreeModelsOnly()).toBe(false);
+  });
+
+  it('saves server listen-mode preference', () => {
+    expect(getServerListenMode()).toBe('local');
+
+    setServerListenMode('network');
+    expect(getServerListenMode()).toBe('network');
+
+    setServerListenMode('local');
+    expect(getServerListenMode()).toBe('local');
   });
 
   it('creates the app home lazily', () => {

@@ -9,6 +9,8 @@ import { normalizeGoogleDisplayName, normalizeGoogleModelId } from './google-mod
 import { findModelsDevModel } from './models-dev.js';
 import type { CachedModel, ProviderRegistry, RegistryProvider } from './types.js';
 import { isValidProviderId } from './validate.js';
+import { getTemplateById } from '../provider-templates.js';
+import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 
 export type CredentialResolver = (provider: RegistryProvider) => string | null;
 
@@ -16,10 +18,34 @@ export interface MaterializeOptions {
   agent?: CompatibilityAgent;
 }
 
-function cachedModelToLocal(
+export function cachedModelToLocal(
   cached: CachedModel,
   provider: RegistryProvider,
 ): LocalProviderModel | null {
+  const freeStatus = classifyFreeStatus({
+    model: cached,
+    providerId: provider.id,
+    templateId: provider.templateId,
+  });
+
+  // Cloud Code models route through the cloud-code proxy — no SDK endpoint needed.
+  if (cached.modelFormat === 'cloud-code') {
+    const { id } = normalizeGoogleModelId(cached.id, '');
+    return {
+      id,
+      name: cached.name,
+      family: cached.family ?? '',
+      brand: cached.brand ?? deriveBrand(cached.family ?? ''),
+      modelFormat: 'cloud-code',
+      upstreamModelId: cached.upstreamModelId ?? cached.id,
+      contextWindow: cached.contextWindow ?? resolveContextWindow(id),
+      isFree: isFreeStatus(freeStatus),
+      freeStatus,
+      reasoning: cached.reasoning,
+      interleavedReasoningField: cached.interleavedReasoningField,
+    };
+  }
+
   const npm = cached.npm ?? provider.api.npm ?? '';
   const apiUrl = cached.apiUrl ?? provider.api.url ?? '';
   const endpoint = resolveEndpoint(npm, apiUrl);
@@ -42,11 +68,18 @@ function cachedModelToLocal(
     npm: npm || undefined,
     apiBaseUrl: apiUrl || undefined,
     cost: cached.cost,
+    isFree: isFreeStatus(freeStatus),
+    freeStatus,
     contextWindow: cached.contextWindow ?? resolveContextWindow(id),
     supportedParameters: cached.supportedParameters,
     reasoning: cached.reasoning ?? modelsDev?.reasoning,
     interleavedReasoningField: cached.interleavedReasoningField ?? modelsDev?.interleaved?.field,
   };
+}
+
+function providerAllowsAnonymousFreeModels(provider: RegistryProvider): boolean {
+  const template = getTemplateById(provider.templateId) ?? getTemplateById(provider.id);
+  return template?.anonymousFreeModels === true;
 }
 
 function materializeOne(
@@ -57,8 +90,17 @@ function materializeOne(
   if (!provider.enabled) return null;
   if (!isValidProviderId(provider.id)) return null;
 
+  const freeOnly = provider.subscriptionFilter === 'free';
+  const apiKey = resolveCredential(provider) ?? '';
+  const anonymousFreeOnly = !apiKey.trim() && providerAllowsAnonymousFreeModels(provider);
   const models: LocalProviderModel[] = [];
   for (const cached of provider.modelsCache?.models ?? []) {
+    const freeStatus = classifyFreeStatus({
+      model: cached,
+      providerId: provider.id,
+      templateId: provider.templateId,
+    });
+    if ((freeOnly || anonymousFreeOnly) && !isFreeStatus(freeStatus)) continue;
     const model = cachedModelToLocal(cached, provider);
     if (!model) continue;
     if (shouldHideModel({ providerId: provider.id, modelId: model.id, agent })) continue;
@@ -66,14 +108,14 @@ function materializeOne(
   }
   if (models.length === 0) return null;
 
-  const apiKey = resolveCredential(provider) ?? '';
-  if (!apiKey) return null;
+  if (!apiKey.trim() && !anonymousFreeOnly) return null;
 
   return {
     id: provider.id,
     name: provider.name,
     apiKey,
     authType: provider.authType,
+    headers: provider.api.headers,
     models,
   };
 }

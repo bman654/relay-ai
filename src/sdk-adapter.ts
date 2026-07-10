@@ -18,6 +18,7 @@ import {
 } from './provider-factory.js';
 import { resolveUpstreamTools } from './tool-search.js';
 import type { AnthropicRequestMessage, AnthropicToolDefinition } from './proxy-types.js';
+import { anthropicErrorType, upstreamHttpStatus } from './codex/upstream-error.js';
 
 export { silenceSdkWarnings };
 
@@ -57,6 +58,8 @@ export interface TranslateRequestOptions {
   reasoningMetadata?: ReasoningMetadata;
   /** ChatGPT Codex OAuth requires instructions and manages its own output limit. */
   openAiOAuth?: boolean;
+  /** Hard cap on tools sent to the provider (e.g. Groq: 128). Excess tools are silently dropped. */
+  maxTools?: number;
 }
 
 /** Read reasoning effort from an Anthropic-format request body. */
@@ -199,6 +202,15 @@ export function translateMessages(messages: AnthropicMsg[], npm: string): ModelM
   return out;
 }
 
+/** Strip top-level null values so models that emit `null` for optional params don't fail schema validation. */
+function stripNullInputs(input: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input)) {
+    if (v !== null) out[k] = v;
+  }
+  return out;
+}
+
 export function translateTools(anthropicTools?: AnthropicTool[]): Record<string, ReturnType<typeof tool>> | undefined {
   if (!anthropicTools?.length) return undefined;
   const tools: Record<string, ReturnType<typeof tool>> = {};
@@ -234,14 +246,17 @@ export function translateRequest(
 
   // resolveUpstreamTools uses the shared proxy types; the adapter keeps its own
   // minimal request shapes, so cast at this boundary.
-  const upstreamTools = resolveUpstreamTools(
+  let upstreamTools = resolveUpstreamTools(
     body.tools as unknown as AnthropicToolDefinition[] | undefined,
     messages as unknown as AnthropicRequestMessage[],
   ) as unknown as AnthropicTool[];
+  if (options?.maxTools !== undefined && upstreamTools.length > options.maxTools) {
+    upstreamTools = upstreamTools.slice(0, options.maxTools);
+  }
   const effort = anthropicEffortFromRequest(body) ?? options?.defaultEffort;
   let providerOptions = deepMergeProviderOptions(
     thinkingProviderOptions(npm),
-    effortProviderOptions(npm, effort, body.model, options?.reasoningMetadata),
+    effortProviderOptions(npm, effort, options?.reasoningMetadata?.upstreamModelId ?? body.model, options?.reasoningMetadata),
   );
 
   // ChatGPT Codex OAuth backend requires `instructions` in providerOptions and
@@ -370,7 +385,7 @@ export async function writeAnthropicStream(
           });
           emit('content_block_delta', {
             type: 'content_block_delta', index: blockIndex,
-            delta: { type: 'input_json_delta', partial_json: JSON.stringify(part.input ?? {}) },
+            delta: { type: 'input_json_delta', partial_json: JSON.stringify(stripNullInputs(part.input as Record<string, unknown> ?? {})) },
           });
         }
         break;
@@ -391,9 +406,10 @@ export async function writeAnthropicStream(
       case 'error': {
         const e = part.error as { data?: unknown; message?: string } | undefined;
         const errMsg = e?.message || (typeof part.error === 'string' ? part.error : JSON.stringify(e?.data ?? part.error));
-        log?.(() => `sdk stream error: ${errMsg}`);
+        const errorType = anthropicErrorType(upstreamHttpStatus(part.error, errMsg));
+        log?.(() => `sdk stream error (${errorType}): ${errMsg}`);
         closeOpen();
-        emit('error', { type: 'error', error: { type: 'api_error', message: errMsg } });
+        emit('error', { type: 'error', error: { type: errorType, message: errMsg } });
         return;
       }
 
@@ -430,20 +446,37 @@ export async function generateAnthropicResponse(
   model: LanguageModel,
   params: SdkCallParams,
   modelId: string,
+  options?: { forceStream?: boolean },
 ): Promise<Record<string, unknown>> {
-  const r = await generateText({ model, ...params } as Parameters<typeof generateText>[0]);
+  let text: string;
+  let toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }>;
+  let finishReason: string;
+  let usage: { inputTokens?: number; outputTokens?: number } | undefined;
+
+  if (options?.forceStream) {
+    // Some upstreams (e.g. ChatGPT's Codex backend) reject non-streaming requests
+    // outright. Request a real stream from the SDK and collect it into one
+    // response instead of forwarding the client's non-streaming request upstream.
+    const r = streamText({ model, ...params, onError: () => {} } as Parameters<typeof streamText>[0]);
+    Promise.resolve(r.toolResults).catch(() => {});
+    [text, toolCalls, finishReason, usage] = await Promise.all([r.text, r.toolCalls, r.finishReason, r.usage]);
+  } else {
+    const r = await generateText({ model, ...params } as Parameters<typeof generateText>[0]);
+    ({ text, toolCalls, finishReason, usage } = r);
+  }
+
   return {
     id: 'msg_' + Date.now(), type: 'message', role: 'assistant', model: modelId,
     content: [
-      ...(r.text ? [{ type: 'text', text: r.text }] : []),
-      ...r.toolCalls.map(tc => ({
+      ...(text ? [{ type: 'text', text }] : []),
+      ...toolCalls.map(tc => ({
         type: 'tool_use',
         id: encodeToolUseId(tc.toolCallId, grabRoundTripSignature(tc as FullStreamPart)),
         name: tc.toolName,
-        input: tc.input as Record<string, unknown>,
+        input: stripNullInputs(tc.input as Record<string, unknown>),
       })),
     ],
-    stop_reason: r.finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
-    usage: { input_tokens: r.usage?.inputTokens ?? 0, output_tokens: r.usage?.outputTokens ?? 0 },
+    stop_reason: finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
+    usage: { input_tokens: usage?.inputTokens ?? 0, output_tokens: usage?.outputTokens ?? 0 },
   };
 }

@@ -5,11 +5,13 @@ import type { LanguageModel } from 'ai';
 import { wrapLanguageModel, extractReasoningMiddleware } from 'ai';
 import { VERTEX_ANTHROPIC_NPM } from './constants.js';
 import { extractOpenAiAccountId } from './oauth/openai.js';
+import {
+  CLAUDE_CODE_USER_AGENT,
+  injectClaudeIdentity,
+} from './oauth/claude-identity.js';
 
 /** Models that must use /v1/responses instead of /v1/chat/completions. */
 const RESPONSES_ONLY_PREFIXES = [
-  'gpt-5.4',
-  'gpt-5.5',
   'gpt-5-codex',
   'gpt-5-pro',
   'gpt-5.2-pro',
@@ -17,7 +19,7 @@ const RESPONSES_ONLY_PREFIXES = [
   'o4',
 ];
 
-type SdkProviderFactory = (options: { apiKey: string; baseURL?: string; name?: string }) => {
+type SdkProviderFactory = (options: { apiKey: string; baseURL?: string; name?: string; headers?: Record<string, string> }) => {
   (modelId: string): LanguageModel;
   chat: (modelId: string) => LanguageModel;
   responses: (modelId: string) => LanguageModel;
@@ -34,11 +36,31 @@ export function modelPrefersResponsesApi(modelId: string): boolean {
   if (RESPONSES_ONLY_PREFIXES.some(prefix => lower === prefix || lower.startsWith(`${prefix}-`))) {
     return true;
   }
+  // gpt-5.4 and later minor versions require the Responses API (e.g. gpt-5.4, gpt-5.5, gpt-5.6, gpt-5.6-fast).
+  const gpt5Minor = lower.match(/^gpt-5\.(\d+)(?:-|$)/);
+  if (gpt5Minor && Number(gpt5Minor[1]) >= 4) return true;
   // Versioned Codex IDs (e.g. gpt-5.3-codex) don't match the gpt-5-codex prefix.
   if (lower.startsWith('gpt-') && lower.includes('-codex')) return true;
   // xAI multiagent models (e.g. grok-4.20-multi-agent, grok-4.2-multiagent).
   if (lower.startsWith('grok-') && (lower.includes('multi-agent') || lower.includes('multiagent'))) return true;
   return false;
+}
+
+/**
+ * OpenAI's Responses API is a strict superset of Chat Completions for every
+ * current model — there is no OpenAI model that Chat Completions can serve
+ * that Responses cannot. So route every OpenAI model through Responses by
+ * default, except pre-chat legacy completion models that predate both APIs
+ * and are not agentic chat models at all.
+ */
+const OPENAI_CHAT_COMPLETIONS_ONLY = [
+  'davinci-002',
+  'babbage-002',
+  'gpt-3.5-turbo-instruct',
+];
+
+export function shouldUseOpenAiResponsesEndpoint(modelId: string): boolean {
+  return !OPENAI_CHAT_COMPLETIONS_ONLY.includes(modelId.toLowerCase());
 }
 
 export interface VertexProviderConfig {
@@ -58,13 +80,20 @@ export interface ProviderModelSpec {
   /** Registry authentication mode. OpenAI OAuth uses the ChatGPT Codex backend. */
   authType?: 'api' | 'oauth' | 'none';
   oauthAccountId?: string;
+  providerData?: Record<string, unknown>;
   /** Google Vertex AI — uses Application Default Credentials, not apiKey. */
   vertex?: VertexProviderConfig;
+  /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
+  headers?: Record<string, string>;
 }
 
 /** True when this provider routes through the SDK adapter (local providers + Zen/Go openai-format). */
 export function isSdkMigratedNpm(npm: string | undefined): boolean {
   return !!npm && npm !== '@ai-sdk/anthropic';
+}
+
+export function maxToolsForNpm(npm: string | undefined): number | undefined {
+  return npm === '@ai-sdk/groq' ? 128 : undefined;
 }
 
 function findCreateFactory(mod: Record<string, unknown>): SdkProviderFactory {
@@ -127,7 +156,7 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
           },
         }
       : { apiKey });
-    return modelPrefersResponsesApi(modelId) ? openai.responses(modelId) : openai.chat(modelId);
+    return shouldUseOpenAiResponsesEndpoint(modelId) ? openai.responses(modelId) : openai.chat(modelId);
   }
   if (npm === '@ai-sdk/xai') {
     const { createXai } = await import('@ai-sdk/xai');
@@ -147,27 +176,56 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
   if (npm === '@ai-sdk/anthropic') {
     const { createAnthropic } = await import('@ai-sdk/anthropic');
     const root = baseURL?.replace(/\/v1\/?$/, '').replace(/\/$/, '');
+    const anthropicOptions: Parameters<typeof createAnthropic>[0] = spec.authType === 'oauth'
+      ? {
+          authToken: apiKey,
+          ...(spec.providerId === 'claude-code'
+            ? {
+                headers: {
+                  'User-Agent': CLAUDE_CODE_USER_AGENT,
+                  'x-app': 'cli',
+                  'X-Claude-Code-Session-Id': injectClaudeIdentity(
+                    {},
+                    spec.providerData,
+                    spec.oauthAccountId ?? apiKey,
+                  ).sessionId,
+                },
+              }
+            : {}),
+        }
+      : { apiKey };
+    if (spec.headers) {
+      anthropicOptions.headers = { ...anthropicOptions.headers, ...spec.headers };
+    }
     if (!root || root === 'https://api.anthropic.com') {
-      return createAnthropic({ apiKey })(modelId);
+      return createAnthropic(anthropicOptions)(modelId);
     }
     const sdkBase = baseURL!.endsWith('/v1') ? baseURL : `${root}/v1`;
-    return createAnthropic({ apiKey, baseURL: sdkBase })(modelId);
+    return createAnthropic({ ...anthropicOptions, baseURL: sdkBase })(modelId);
   }
   let model: LanguageModel;
 
   if (npm === '@ai-sdk/openai-compatible') {
     const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
-    model = createOpenAICompatible({
+    const options = {
       name: spec.providerId ?? 'openai-compatible',
-      apiKey,
       baseURL: baseURL ?? '',
+      ...(apiKey.trim() ? { apiKey } : {}),
+      ...(spec.headers ? { headers: spec.headers } : {}),
+    };
+    model = createOpenAICompatible({
+      ...options,
     })(modelId);
   } else if (npm === '@openrouter/ai-sdk-provider') {
     const { createOpenRouter } = await import('@openrouter/ai-sdk-provider');
-    model = createOpenRouter({ apiKey, baseURL })(modelId);
+    model = createOpenRouter({ apiKey, baseURL, ...(spec.headers ? { headers: spec.headers } : {}) })(modelId);
   } else {
     const create = await loadSdkProviderFactory(npm);
-    const provider = create(baseURL ? { apiKey, baseURL } : { apiKey });
+    const provider = create({
+      apiKey,
+      ...(baseURL ? { baseURL } : {}),
+      ...(spec.headers ? { headers: spec.headers } : {}),
+    });
     model = provider(modelId);
   }
 
@@ -199,6 +257,12 @@ export interface ReasoningMetadata {
   supportedParameters?: string[];
   reasoning?: boolean;
   interleavedReasoningField?: string;
+  /**
+   * Bare upstream model id (e.g. 'grok-4.5'), distinct from the request's `model`
+   * field which may be a gateway alias or catalog slug (e.g. 'xai-oauth__grok-4.5').
+   * Reasoning-capability id-pattern checks must match against this, not body.model.
+   */
+  upstreamModelId?: string;
 }
 
 export interface ReasoningCapabilities {
@@ -219,6 +283,8 @@ const XAI_EFFORT_LEVELS = ['none', 'low', 'medium', 'high'] as const;
 const OPENROUTER_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 /** DeepSeek V4 wire values (low/medium map to high; xhigh maps to max). */
 const DEEPSEEK_EFFORT_LEVELS = ['high', 'max', 'off'] as const;
+/** GLM-5.2 published efforts (OpenRouter metadata): high and xhigh, default high. */
+const GLM_52_EFFORT_LEVELS = ['high', 'xhigh'] as const;
 
 const EMPTY_REASONING: ReasoningCapabilities = {
   levels: [],
@@ -294,8 +360,19 @@ function isXaiReasoningEffortModel(modelId: string): boolean {
   if (lower.startsWith('grok-imagine')) return false;
   if (modelPrefersResponsesApi(modelId)) return true;
   if (lower === 'grok-4.3' || lower.startsWith('grok-4.3-')) return true;
+  if (lower === 'grok-4.5' || lower.startsWith('grok-4.5-')) return true;
   if (lower.includes('-reasoning')) return true;
   return false;
+}
+
+/**
+ * xAI's own default reasoning_effort when the param is omitted (per xAI docs).
+ * Varies by model — grok-4.3 defaults to 'low', grok-4.5 defaults to 'high'.
+ */
+function xaiDefaultReasoningEffort(modelId: string): string {
+  const lower = modelId.toLowerCase();
+  if (lower === 'grok-4.5' || lower.startsWith('grok-4.5-')) return 'high';
+  return 'low';
 }
 
 /** DeepSeek V4 models with thinking mode + reasoning_effort (direct API). */
@@ -312,6 +389,23 @@ function isDeepSeekReasoningModel(modelId: string): boolean {
 function isKimiReasoningModel(modelId: string): boolean {
   const lower = modelId.toLowerCase();
   return lower.startsWith('kimi-');
+}
+
+// Keep exact matching. Kimi uses prefix matching, but switching GLM to prefix
+// would newly classify vendor-aliased IDs as reasoning models. That is a
+// behavior change, not duplication cleanup.
+function isGlm52ReasoningModel(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  return lower === 'glm-5.2'
+    || lower === 'z-ai/glm-5.2'
+    || lower === 'zai/glm-5.2'
+    || lower === 'zai-org/glm-5.2'
+    || lower === 'zai-org/glm5.2'
+    || lower === 'glm5.2';
+}
+
+function toCamelCase(str: string): string {
+  return str.replace(/[-_]([a-z])/g, (_, g) => g.toUpperCase());
 }
 
 function hasSupportedParameter(metadata: ReasoningMetadata | undefined, param: string): boolean {
@@ -383,13 +477,12 @@ function deepSeekEffortProviderOptions(
   if (mapped === 'off') {
     return {
       deepseek: spread,
-      'openai-compatible': spread,
+      openaiCompatible: spread,
     };
   }
   return {
-    openaiCompatible: { reasoningEffort: mapped },
+    openaiCompatible: { reasoningEffort: mapped, ...spread },
     deepseek: spread,
-    'openai-compatible': spread,
   };
 }
 
@@ -417,6 +510,18 @@ function mapCodexEffortToOpenAI(effort: string): string | undefined {
   if (effort === 'xhigh') return 'high';
   const allowed = ['low', 'medium', 'high'];
   return allowed.includes(effort) ? effort : undefined;
+}
+
+function mapCodexEffortToGlm52(effort: string): 'high' | 'max' | undefined {
+  switch (effort) {
+    case 'high':
+      return 'high';
+    case 'xhigh':
+    case 'max':
+      return 'max';
+    default:
+      return undefined;
+  }
 }
 
 function mapCodexEffortToXai(effort: string): string | undefined {
@@ -544,7 +649,7 @@ export function getReasoningCapabilities(
         : [...XAI_EFFORT_LEVELS];
       return {
         levels,
-        defaultLevel: 'low',
+        defaultLevel: xaiDefaultReasoningEffort(modelId),
         supportsSummaries: true,
         mode: 'controllable',
         source: 'provider-rule',
@@ -570,6 +675,18 @@ export function getReasoningCapabilities(
   if (isKimiReasoningModel(modelId)) {
     return {
       levels: [...OPENAI_EFFORT_LEVELS],
+      defaultLevel: 'high',
+      supportsSummaries: false,
+      mode: 'controllable',
+      source: 'provider-rule',
+      confidence: 'documented',
+      wireFormat: { kind: 'openai-reasoning-effort' },
+    };
+  }
+
+  if (isGlm52ReasoningModel(modelId)) {
+    return {
+      levels: [...GLM_52_EFFORT_LEVELS],
       defaultLevel: 'high',
       supportsSummaries: false,
       mode: 'controllable',
@@ -697,12 +814,24 @@ export function effortProviderOptions(
     }
     if (isKimiReasoningModel(modelId)) {
       const reasoningEffort = mapCodexEffortToOpenAI(effort);
-      return reasoningEffort ? { openai: { reasoningEffort } } : undefined;
+      if (reasoningEffort) {
+        const key = metadata?.providerId ? toCamelCase(metadata.providerId) : 'openaiCompatible';
+        return { [key]: { reasoningEffort } };
+      }
+      return undefined;
+    }
+    if (isGlm52ReasoningModel(modelId)) {
+      const reasoningEffort = mapCodexEffortToGlm52(effort);
+      if (reasoningEffort) {
+        const key = metadata?.providerId ? toCamelCase(metadata.providerId) : 'openaiCompatible';
+        return { [key]: { reasoningEffort } };
+      }
+      return undefined;
     }
     if (hasSupportedParameter(metadata, 'reasoning_effort')) {
       const reasoningEffort = mapCodexEffortToOpenAI(effort);
       return reasoningEffort
-        ? { openai: { reasoningEffort }, openaiCompatible: { reasoningEffort }, 'openai-compatible': { reasoningEffort } }
+        ? { openai: { reasoningEffort }, openaiCompatible: { reasoningEffort } }
         : undefined;
     }
     if (hasSupportedParameter(metadata, 'reasoning')) {

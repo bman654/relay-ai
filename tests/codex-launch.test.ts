@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildCodexChildEnv, ensureCodexSandboxArgs, stripCodexInheritedEnv } from '../src/codex/launch.js';
+import { buildCodexChildEnv, ensureCodexSandboxArgs, selectCodexBinary, stripCodexInheritedEnv } from '../src/codex/launch.js';
 
 describe('stripCodexInheritedEnv', () => {
   it('removes CI flags that trigger Codex read-only sandbox', () => {
@@ -53,5 +53,15 @@ describe('buildCodexChildEnv', () => {
     }, 12345);
     expect(env['RELAY_AI_CODEX_KEY']).toBe('proxy-local');
     expect(env['CI']).toBeUndefined();
+  });
+});
+
+describe('selectCodexBinary', () => {
+  it('skips broken Codex wrappers and chooses the first runnable binary', () => {
+    expect(selectCodexBinary(
+      ['/opt/homebrew/bin/codex', '/Users/me/.nvm/bin/codex'],
+      () => true,
+      path => path.includes('.nvm'),
+    )).toBe('/Users/me/.nvm/bin/codex');
   });
 });

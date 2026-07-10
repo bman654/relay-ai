@@ -22,6 +22,7 @@ import bundledPricing from '../data/pricing-cache.json';
 import { getAppHome } from '../paths.js';
 import type { CachedModel } from './types.js';
 import { loadRegistry, saveRegistry } from './io.js';
+import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 
 export const PRICING_API_URL = 'https://ai-model-pricing.com/api/v1/pricing.json';
 const FETCH_TIMEOUT_MS = 15_000;
@@ -214,7 +215,8 @@ export function enrichModelsWithPricing(
       lookupModelCost(index, model.id, platform) ??
       lookupModelCost(index, model.upstreamModelId, platform);
     if (!cost) return model;
-    return { ...model, cost };
+    const freeStatus = classifyFreeStatus({ model: { ...model, cost } });
+    return { ...model, cost, isFree: isFreeStatus(freeStatus), freeStatus };
   });
 }
 

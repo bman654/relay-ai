@@ -1,12 +1,11 @@
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
-import { fetchProviderCatalog, providersForPicker } from './provider-catalog.js';
+import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
 import { loadPreferences, savePreferences } from './config.js';
-import { resolveProviderCredential, resolveApiKey, readFromCredentialStore } from './env.js';
+import { resolveApiKey, readFromCredentialStore } from './env.js';
 import { resolveOrCollectApiKey } from './key-setup.js';
-import { oauthAuthRef } from './registry/import-build.js';
-import { loadRegistry } from './registry/io.js';
 import { pickCodexProvider, pickCodexModel } from './codex/prompts.js';
+import { resolveBootSelection } from './codex/favorites-launch.js';
 import {
   codexCompatibleProviders,
   routableModelsForProvider,
@@ -20,7 +19,13 @@ import { writeRelayAiConfig, getClaudeDesktopHome } from './claude-desktop/app-c
 import { getProxyDebugLogPath } from './trace-log.js';
 import { readSessionLock, recoverSession, hasStaleSession, writeSessionLock, setupExitCleanup, cleanupSession, backupMetaJson, isConcurrentLiveSession, waitForShutdown } from './claude-desktop/app-session.js';
 import { launchOrRestartClaudeApp, claudeAppSupported, isClaudeAppRunning, quitClaudeAppGracefully } from './claude-desktop/app-launch.js';
-import type { LocalProvider } from './types.js';
+import type { LocalProvider, LocalProviderModel } from './types.js';
+import {
+  buildCloudCodeProxyRoute,
+  startCloudCodeCatalogBackend,
+  type CloudCodeBackend,
+} from './cloud-code-backend.js';
+import type { ProxyRoute } from './proxy.js';
 
 export function claudeAppHelpText(): string {
   return `${pc.bold('relay-ai claude-app')} — launch Claude Desktop app in 3P mode with your registry providers
@@ -53,10 +58,42 @@ ${pc.bold('Cleanup:')}
 }
 
 function providerForClaudePicker(provider: LocalProvider): LocalProvider {
-  return { ...provider, models: routableModelsForProvider(provider, 'codex-app') };
+  return { ...provider, models: routableModelsForProvider(provider, 'claude-app') };
 }
 
-export async function runClaudeAppCommand(args: string[]): Promise<number> {
+export function modelToServerModelInfo(
+  model: LocalProviderModel,
+  provider: LocalProvider,
+  overrides: Partial<ServerModelInfo> = {},
+): ServerModelInfo {
+  return {
+    id: model.id,
+    name: model.name,
+    isFree: model.isFree ?? false,
+    brand: model.brand ?? '',
+    providerLabel: provider.name,
+    providerId: provider.id,
+    sourceBackend: provider.id,
+    modelFormat: model.modelFormat,
+    upstreamModelId: model.upstreamModelId,
+    cost: model.cost,
+    baseUrl: model.baseUrl,
+    completionsUrl: model.completionsUrl,
+    npm: model.npm,
+    apiBaseUrl: model.apiBaseUrl,
+    apiKey: provider.apiKey,
+    authType: provider.authType,
+    oauthAccountId: provider.oauthAccountId,
+    contextWindow: model.contextWindow,
+    supportedParameters: model.supportedParameters,
+    reasoning: model.reasoning,
+    interleavedReasoningField: model.interleavedReasoningField,
+    headers: provider.headers,
+    ...overrides,
+  };
+}
+
+export async function runClaudeAppCommand(args: string[], boot?: { launchProvider?: string; launchModel?: string }): Promise<number> {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(claudeAppHelpText());
     return 0;
@@ -108,7 +145,7 @@ export async function runClaudeAppCommand(args: string[]): Promise<number> {
   }
   catalogSpinner.stop('');
 
-  const compatible = codexCompatibleProviders(providersForPicker(catalog), 'codex-app');
+  const compatible = codexCompatibleProviders(providersForPicker(catalog), 'claude-app');
   if (compatible.length === 0) {
     p.log.warn('No compatible providers in your registry.');
     return 0;
@@ -122,22 +159,35 @@ export async function runClaudeAppCommand(args: string[]): Promise<number> {
   let selectedModel: any = null;
   let useFavorites = false;
 
-  const pickedProvider = await pickCodexProvider(compatible, prefs, hasFavorites);
-  if (!pickedProvider) return 0;
-
-  if (pickedProvider === '__favorites__') {
-    useFavorites = true;
+  if (boot?.launchProvider && boot?.launchModel) {
+    const bootSelection = resolveBootSelection(
+      compatible,
+      boot.launchProvider,
+      boot.launchModel,
+      providerForClaudePicker,
+    );
+    if ('error' in bootSelection) {
+      p.log.error(bootSelection.error);
+      return 1;
+    }
+    activeProvider = bootSelection.provider;
+    selectedModel = bootSelection.model;
   } else {
-    activeProvider = providerForClaudePicker(pickedProvider);
-    const pickedModel = await pickCodexModel(activeProvider, prefs);
-    if (!pickedModel) return 0;
-    selectedModel = pickedModel;
+    const pickedProvider = await pickCodexProvider(compatible, prefs, hasFavorites);
+    if (!pickedProvider) return 0;
 
-    const regEntry = loadRegistry().providers.find(pr => pr.id === activeProvider?.id);
-    const authRef = regEntry?.authRef
-      ?? (activeProvider.apiKey ? `keyring:provider:${activeProvider.id}` : oauthAuthRef(activeProvider.id));
-    const apiKey = activeProvider.apiKey?.trim()
-      || await resolveProviderCredential(activeProvider.id, authRef);
+    if (pickedProvider === '__favorites__') {
+      useFavorites = true;
+    } else {
+      activeProvider = providerForClaudePicker(pickedProvider);
+      const pickedModel = await pickCodexModel(activeProvider, prefs);
+      if (!pickedModel) return 0;
+      selectedModel = pickedModel;
+    }
+  }
+
+  if (activeProvider) {
+    const apiKey = await resolveLocalProviderApiKey(activeProvider);
     if (!apiKey) {
       p.log.error(`No credential for ${activeProvider.name}. Run relay-ai providers auth ${activeProvider.id}.`);
       return 1;
@@ -147,33 +197,81 @@ export async function runClaudeAppCommand(args: string[]): Promise<number> {
   }
 
   let serverModels: ServerModelInfo[] = [];
+  let cloudCodeBackend: CloudCodeBackend | null = null;
+  let cloudCodeFavBackend: CloudCodeBackend | null = null;
 
   if (useFavorites) {
+    // Identify cloud-code favorites from the already-fetched catalog
+    const antigravityProvider = catalog.find(lp => lp.id === 'antigravity');
+    const cloudCodeFavoriteModels = favorites
+      .map(fav => {
+        if (fav.providerId !== 'antigravity') return null;
+        const model = antigravityProvider?.models.find(m => m.id === fav.modelId);
+        return model?.modelFormat === 'cloud-code' ? model : null;
+      })
+      .filter((m): m is import('./types.js').LocalProviderModel => m !== null);
+
+    const regularFavorites = favorites.filter(
+      fav => !cloudCodeFavoriteModels.some(m => m.id === fav.modelId && fav.providerId === 'antigravity'),
+    );
+
+    // Start cloud-code backend if any cloud-code favorites
+    let cloudCodeServerModels: ServerModelInfo[] = [];
+
+    if (cloudCodeFavoriteModels.length > 0 && antigravityProvider?.apiKey) {
+      const cloudRoutes: ProxyRoute[] = cloudCodeFavoriteModels.map(model =>
+        buildCloudCodeProxyRoute(
+          model,
+          antigravityProvider.apiKey,
+          (antigravityProvider.providerData ?? {}) as Record<string, unknown>,
+        ),
+      );
+      const startingAlias = cloudRoutes[0]!.aliasId;
+      cloudCodeFavBackend = await startCloudCodeCatalogBackend(cloudRoutes, startingAlias, trace);
+      const favBackend = cloudCodeFavBackend;
+      cloudCodeServerModels = cloudCodeFavoriteModels.map(model => modelToServerModelInfo(model, antigravityProvider, {
+        isFree: false,
+        providerId: 'antigravity',
+        sourceBackend: 'antigravity',
+        modelFormat: 'anthropic' as const,
+        cost: undefined,
+        baseUrl: `http://127.0.0.1:${favBackend.port}`,
+        completionsUrl: undefined,
+        npm: undefined,
+        apiBaseUrl: undefined,
+        apiKey: favBackend.token,
+        authType: undefined,
+        oauthAccountId: undefined,
+        headers: undefined,
+      }));
+    }
+
+    // Load remaining (non-cloud-code) favorites via the normal path
     const allModels = await loadServerModels();
-    serverModels = filterServerModelsByFavorites(allModels, favorites);
+    const regularServerModels = filterServerModelsByFavorites(allModels, regularFavorites);
+    serverModels = [...cloudCodeServerModels, ...regularServerModels];
+  } else if (selectedModel.modelFormat === 'cloud-code') {
+    const providerData = (activeProvider!.providerData ?? {}) as Record<string, unknown>;
+    const cloudRoute = buildCloudCodeProxyRoute(selectedModel, activeProvider!.apiKey, providerData);
+    cloudCodeBackend = await startCloudCodeCatalogBackend([cloudRoute], cloudRoute.aliasId, trace);
+    serverModels = [modelToServerModelInfo(selectedModel, activeProvider!, {
+      modelFormat: 'anthropic',
+      baseUrl: `http://127.0.0.1:${cloudCodeBackend.port}`,
+      completionsUrl: undefined,
+      npm: undefined,
+      apiBaseUrl: undefined,
+      apiKey: cloudCodeBackend.token,
+      authType: undefined,
+      oauthAccountId: undefined,
+      headers: undefined,
+    })];
   } else {
-    serverModels = [{
-      id: selectedModel.id,
-      name: selectedModel.name,
-      isFree: selectedModel.isFree ?? false,
-      brand: selectedModel.brand ?? '',
-      providerLabel: activeProvider!.name,
-      providerId: activeProvider!.id,
-      sourceBackend: activeProvider!.id,
-      modelFormat: selectedModel.modelFormat,
-      upstreamModelId: selectedModel.upstreamModelId,
-      cost: selectedModel.cost,
-      baseUrl: selectedModel.baseUrl,
-      completionsUrl: selectedModel.completionsUrl,
-      npm: selectedModel.npm,
-      apiBaseUrl: selectedModel.apiBaseUrl,
-      apiKey: activeProvider!.apiKey,
-      contextWindow: selectedModel.contextWindow,
-    }];
+    serverModels = [modelToServerModelInfo(selectedModel, activeProvider!)];
   }
 
   let proxyHandle: ServerHandle | null = null;
   let sessionActive = false;
+  let uuid = '';
 
   try {
     backupMetaJson();
@@ -189,7 +287,7 @@ export async function runClaudeAppCommand(args: string[]): Promise<number> {
       debugLogPath,
     });
 
-    const uuid = writeRelayAiConfig(proxyHandle.port);
+    uuid = writeRelayAiConfig(proxyHandle.port);
 
     writeSessionLock({
       pid: process.pid,
@@ -234,6 +332,8 @@ export async function runClaudeAppCommand(args: string[]): Promise<number> {
     // and if the user hits Ctrl+C again during the prompt, it's already restored.
     cleanupSession(uuid);
     sessionActive = false;
+    if (cloudCodeBackend) cloudCodeBackend.handle.close();
+    if (cloudCodeFavBackend) cloudCodeFavBackend.handle.close();
 
     if (isClaudeAppRunning()) {
       const shouldClose = await p.confirm({ message: 'Claude Desktop is still running. Close it?' });
@@ -245,9 +345,11 @@ export async function runClaudeAppCommand(args: string[]): Promise<number> {
 
   } catch (err) {
     if (proxyHandle) await proxyHandle.close();
-    if (sessionActive && proxyHandle) {
-      cleanupSession(proxyHandle.port.toString());
+    if (sessionActive && uuid) {
+      cleanupSession(uuid);
     }
+    if (cloudCodeBackend) cloudCodeBackend.handle.close();
+    if (cloudCodeFavBackend) cloudCodeFavBackend.handle.close();
     return 1;
   }
 }

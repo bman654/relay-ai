@@ -32,42 +32,6 @@ describe('buildCatalogRoutes', () => {
   });
 });
 
-describe('makeRouteResolver zen/go routes', () => {
-  const goModel: ModelInfo = {
-    id: 'kimi-k2.7-code',
-    name: 'Kimi K2.7 Code',
-    isFree: false,
-    brand: 'Kimi',
-    sourceBackend: 'go',
-    modelFormat: 'openai',
-    contextWindow: 262144,
-  };
-
-  it('resolves OpenCode Go models via zenGoModelToRoute', () => {
-    const provider = {
-      id: 'go',
-      name: 'OpenCode Go',
-      apiKey: '',
-      models: [{
-        id: goModel.id,
-        name: goModel.name,
-        family: 'Kimi',
-        brand: goModel.brand,
-        modelFormat: 'openai' as const,
-        upstreamModelId: goModel.id,
-        contextWindow: goModel.contextWindow,
-      }],
-    };
-    const resolveRoute = makeRouteResolver(null, [], [goModel], 'oc-key');
-    expect(resolveRoute('go', goModel.id)).toMatchObject({
-      realModelId: 'kimi-k2.7-code',
-      apiKey: 'oc-key',
-      npm: '@ai-sdk/openai-compatible',
-      baseURL: 'https://opencode.ai/zen/go/v1',
-    });
-    expect(localModelToRoute(provider, provider.models[0]!)).toBeNull();
-  });
-});
 
 describe('localModelToRoute', () => {
   it('uses upstreamModelId for SDK calls while keeping catalog id as alias', () => {
@@ -91,6 +55,52 @@ describe('localModelToRoute', () => {
       aliasId: 'anthropic-openai__gpt-5.5-fast[1m]',
       realModelId: 'gpt-5.5',
     });
+  });
+
+  it('preserves OAuth provider data for catalog routes', () => {
+    const provider: LocalProvider = {
+      id: 'antigravity',
+      name: 'Antigravity',
+      apiKey: 'oauth-token',
+      authType: 'oauth',
+      providerData: { projectId: 'project-123', tier: 'free-tier' },
+      models: [{
+        id: 'gemini-3.5-flash-high',
+        name: 'Gemini 3.5 Flash High',
+        family: 'gemini',
+        brand: 'Google',
+        modelFormat: 'cloud-code',
+        upstreamModelId: 'gemini-3.5-flash-high',
+      }],
+    };
+    const route = localModelToRoute(provider, provider.models[0]!);
+    expect(route).toMatchObject({
+      aliasId: 'anthropic-antigravity__gemini-3.5-flash-high[1m]',
+      modelFormat: 'cloud-code',
+      upstreamUrl: 'https://daily-cloudcode-pa.googleapis.com',
+      providerData: { projectId: 'project-123', tier: 'free-tier' },
+    });
+  });
+
+  it('passes through custom endpoint headers for catalog routes', () => {
+    const provider: LocalProvider = {
+      id: 'custom-zai',
+      name: 'Z.AI Coding Plan',
+      apiKey: 'sk-test',
+      headers: { 'X-Plan': 'coding' },
+      models: [{
+        id: 'glm-5.2',
+        name: 'GLM-5.2',
+        family: 'glm',
+        brand: 'Other',
+        modelFormat: 'openai',
+        upstreamModelId: 'glm-5.2',
+        npm: '@ai-sdk/openai-compatible',
+        apiBaseUrl: 'https://api.z.ai/api/coding/paas/v4',
+      }],
+    };
+    const route = localModelToRoute(provider, provider.models[0]!);
+    expect(route).toMatchObject({ headers: { 'X-Plan': 'coding' } });
   });
 
   it('returns null when routing fields are missing for non-SDK openai models', () => {

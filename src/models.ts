@@ -55,6 +55,8 @@ export function readModelsFromCache(
       modelFormat,
       cost: entry.cost,
       contextWindow: resolveContextWindow(entry.id, entry.limit?.context),
+      reasoning: entry.reasoning,
+      interleavedReasoningField: entry.interleaved?.field,
     });
   }
   return result;
@@ -85,7 +87,8 @@ export function mergeModels(
   cache: Map<string, ModelInfo> | null,
   backendId: 'zen' | 'go',
 ): ModelInfo[] {
-  return apiIds
+  const uniqueIds = Array.from(new Set(apiIds));
+  return uniqueIds
     .filter(id => !shouldHideModel({ providerId: backendId, modelId: id, agent: 'claude' }))
     .map(id => {
       const cached = cache?.get(id);

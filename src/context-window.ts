@@ -20,6 +20,8 @@ export interface OpencodeCacheModel {
   provider?: { npm?: string };
   cost?: { input: number; output: number };
   limit?: { context?: number; output?: number };
+  reasoning?: boolean;
+  interleaved?: { field?: string };
 }
 
 export type OpencodeCacheFile = Record<string, { models?: Record<string, OpencodeCacheModel> }>;
@@ -45,6 +47,8 @@ const HEURISTIC_RULES: Array<[RegExp, number]> = [
   [/minimax/i, 128_000],
   [/mistral-large|ministral|mistral/i, 262_144],
   [/llama-3\.[23]|llama3/i, 131_072],
+  [/grok-4\.20/i, 1_000_000],
+  [/grok-4\.5/i, 500_000],
   [/grok-3|grok-4/i, 131_072],
   [/nemotron/i, 131_072],
   [/glm-4/i, 128_000],

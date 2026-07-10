@@ -53,6 +53,43 @@ describe('shouldHideModel', () => {
     expect(entry).not.toBeNull();
     expect(entry?.agents).toBeUndefined();
   });
+
+  it('hides unvalidated Antigravity OAuth Cloud Code slots', () => {
+    expect(shouldHideModel({
+      providerId: 'antigravity',
+      modelId: 'gemini-2.5-pro',
+      agent: 'claude',
+    })).toBe(true);
+    expect(hideReason({
+      providerId: 'antigravity',
+      modelId: 'gemini-2.5-pro',
+      agent: 'claude',
+    })).toContain('not a validated');
+  });
+
+  it('keeps validated Antigravity OAuth agent slots visible', () => {
+    const validated = [
+      'gemini-3.5-flash-low',
+      'gemini-3.5-flash-extra-low',
+      'gemini-3.1-pro-low',
+      'gemini-pro-agent',
+      'claude-sonnet-4-6',
+      'claude-opus-4-6-thinking',
+      'gpt-oss-120b-medium',
+    ];
+
+    for (const modelId of validated) {
+      expect(shouldHideModel({ providerId: 'antigravity', modelId, agent: 'claude' }), modelId).toBe(false);
+    }
+  });
+
+  it('does not apply the Antigravity OAuth allowlist to normal Google API models', () => {
+    expect(shouldHideModel({
+      providerId: 'google',
+      modelId: 'gemini-2.5-pro',
+      agent: 'claude',
+    })).toBe(false);
+  });
 });
 
 describe('models.dev capability rules', () => {

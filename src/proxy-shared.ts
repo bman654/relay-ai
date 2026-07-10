@@ -15,6 +15,7 @@ export type FullStreamPart = {
     openai?: { reasoningEncryptedContent?: string | null };
   };
   error?: unknown;
+  reason?: string;
 };
 
 export function grabRoundTripSignature(part: FullStreamPart): string | undefined {
@@ -34,6 +35,16 @@ export function silenceSdkWarnings(): void {
 }
 
 const TOOL_USE_SIG_SEP = '__ts__';
+const MAX_INLINE_TOOL_SIGNATURE_BYTES = 256;
+const MAX_STORED_TOOL_SIGNATURES = 1000;
+const toolSignatureRegistry = new Map<string, string>();
+
+function rememberToolSignature(rawId: string, thoughtSignature: string): void {
+  toolSignatureRegistry.set(rawId, thoughtSignature);
+  if (toolSignatureRegistry.size <= MAX_STORED_TOOL_SIGNATURES) return;
+  const oldest = toolSignatureRegistry.keys().next().value as string | undefined;
+  if (oldest) toolSignatureRegistry.delete(oldest);
+}
 
 export function parseToolArguments(value: unknown): Record<string, unknown> {
   if (value === null || value === undefined) return {};
@@ -52,6 +63,66 @@ export function parseToolArguments(value: unknown): Record<string, unknown> {
 
 export function sseChunk(eventType: string, data: unknown): string {
   return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * DeepSeek V4's "DSML" tool-calling protocol: an XML-style block using the fullwidth
+ * pipe `｜` as a marker character, e.g. `<｜DSML｜tool_calls><｜DSML｜invoke name="x">
+ * <｜DSML｜parameter name="y" string="true">value</｜DSML｜parameter></｜DSML｜invoke>
+ * </｜DSML｜tool_calls>`. Not officially documented by DeepSeek, but widely reported
+ * (vLLM issue #41240, Cherry Studio issue #14714) as leaking into plain assistant text
+ * instead of firing real tool calls when a serving backend's tool-call parser doesn't
+ * fully handle it — observed live via OpenCode Zen's free deepseek-v4-flash-free.
+ * The marker is also observed rendered with stray ASCII pipes/whitespace instead of the
+ * clean fullwidth character, so matching tolerates either.
+ */
+const DSML_NOISE = '[|｜\\s]*';
+const DSML_BLOCK_RE = new RegExp(`<${DSML_NOISE}DSML${DSML_NOISE}tool_calls>([\\s\\S]*?)<\\/${DSML_NOISE}DSML${DSML_NOISE}tool_calls>`, 'i');
+const DSML_INVOKE_RE = new RegExp(`<${DSML_NOISE}DSML${DSML_NOISE}invoke\\s+name="([^"]+)"[^>]*>([\\s\\S]*?)<\\/${DSML_NOISE}DSML${DSML_NOISE}invoke>`, 'gi');
+const DSML_PARAM_RE = new RegExp(`<${DSML_NOISE}DSML${DSML_NOISE}parameter\\s+name="([^"]+)"(?:\\s+string="(true|false)")?[^>]*>([\\s\\S]*?)<\\/${DSML_NOISE}DSML${DSML_NOISE}parameter>`, 'gi');
+
+export interface DsmlToolCall {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+export interface DsmlParseResult {
+  /** Any text before the <DSML tool_calls> block (usually empty). */
+  leadingText: string;
+  calls: DsmlToolCall[];
+}
+
+/** Returns null when no complete DSML tool_calls block is present (including a
+ *  truncated/unclosed one — safer to leave a partial block as visible text than
+ *  guess at incomplete arguments). */
+export function parseDsmlToolCalls(text: string): DsmlParseResult | null {
+  const outer = DSML_BLOCK_RE.exec(text);
+  if (!outer) return null;
+
+  const calls: DsmlToolCall[] = [];
+  for (const invokeMatch of outer[1]!.matchAll(DSML_INVOKE_RE)) {
+    const name = invokeMatch[1]!;
+    const body = invokeMatch[2]!;
+    const args: Record<string, unknown> = {};
+    for (const paramMatch of body.matchAll(DSML_PARAM_RE)) {
+      const paramName = paramMatch[1]!;
+      const isJson = paramMatch[2] === 'false';
+      const rawValue = paramMatch[3] ?? '';
+      if (isJson) {
+        try {
+          args[paramName] = JSON.parse(rawValue.trim());
+        } catch {
+          args[paramName] = rawValue;
+        }
+      } else {
+        args[paramName] = rawValue;
+      }
+    }
+    calls.push({ name, args });
+  }
+  if (!calls.length) return null;
+
+  return { leadingText: text.slice(0, outer.index).trim(), calls };
 }
 
 /** Parse one SSE line into a JSON payload string, or null if not a data line. */
@@ -85,11 +156,16 @@ export function splitToolUseId(id: string): { rawId: string; thoughtSignature?: 
     };
   }
 
-  return { rawId: id };
+  return { rawId: id, thoughtSignature: toolSignatureRegistry.get(id) };
 }
 
-export function encodeToolUseId(rawId: string, thoughtSignature?: string): string {
+export function encodeToolUseId(rawId: string, thoughtSignature?: string, inline = true): string {
   if (!thoughtSignature) return rawId;
+  rememberToolSignature(rawId, thoughtSignature);
+  if (!inline) return rawId;
+  if (Buffer.byteLength(thoughtSignature, 'utf8') > MAX_INLINE_TOOL_SIGNATURE_BYTES) {
+    return rawId;
+  }
   const encoded = Buffer.from(thoughtSignature, 'utf8').toString('base64url');
   return `${rawId}${TOOL_USE_SIG_SEP}${encoded}`;
 }

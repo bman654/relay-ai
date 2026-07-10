@@ -105,6 +105,24 @@ describe('translateGeminiRequest', () => {
     expect(params.tools.getWeather.description).toBe('Get weather for city');
   });
 
+  it('limits Gemini function declarations when maxTools is set', () => {
+    const body = {
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+      tools: [{
+        functionDeclarations: Array.from({ length: 130 }, (_, i) => ({
+          name: `tool_${i}`,
+          parameters: { type: 'OBJECT' },
+        })),
+      }],
+    };
+
+    const params = translateGeminiRequest(body, { maxTools: 128 });
+
+    expect(Object.keys(params.tools ?? {})).toHaveLength(128);
+    expect(params.tools?.tool_127).toBeDefined();
+    expect(params.tools?.tool_128).toBeUndefined();
+  });
+
   it('translates function response to tool-result and groups consecutive tool turns', () => {
     const body = {
       contents: [

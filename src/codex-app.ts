@@ -1,14 +1,12 @@
-// codex-app.ts — relay-ai codex-app: launch Codex desktop app with registry providers
+// codex-app.ts — relay-ai codex-app / chatgpt: launch the ChatGPT desktop app (Codex mode) with registry providers
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
-import { fetchProviderCatalog, providersForPicker } from './provider-catalog.js';
+import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
 import { loadPreferences, savePreferences } from './config.js';
-import { resolveProviderCredential, resolveApiKey, readFromCredentialStore } from './env.js';
+import { resolveApiKey, readFromCredentialStore } from './env.js';
 import { resolveOrCollectApiKey } from './key-setup.js';
-import { oauthAuthRef } from './registry/import-build.js';
-import { loadRegistry } from './registry/io.js';
 import { startCodexProxy } from './codex-proxy.js';
-import type { CodexProxyHandle } from './codex-proxy.js';
+import type { CodexProxyHandle, CodexProxyRoute } from './codex-proxy.js';
 import { getCodexProxyDebugLogPath, printTraceLog } from './trace-log.js';
 import { buildAppCatalogFile, formatCodexModelLabel, serializeCatalog } from './codex/catalog.js';
 import { pickCodexProvider, pickCodexModel, confirmCodexLaunch } from './codex/prompts.js';
@@ -16,11 +14,12 @@ import {
   codexCompatibleProviders,
   resolveCodexRoute,
   routableModelsForProvider,
-  buildCodexProxyRoutesForProvider,
+  type CodexRoute,
 } from './codex/routing.js';
+import { buildCodexAppProviderCatalogRoutes } from './codex/app-provider-routes.js';
 import { applyAppConfigPatch, previewAppConfigToml } from './codex/app-config.js';
 import { PREVIEW_PROXY_PORT, type CodexAppConfigSpec } from './codex/app-profile.js';
-import type { LocalProvider } from './types.js';
+import type { LocalProvider, LocalProviderModel } from './types.js';
 import {
   backupConfigToml,
   checkAppSessionLock,
@@ -42,7 +41,7 @@ import {
   logCodexProxy,
   printCodexAppSessionPanel,
 } from './codex/ui.js';
-import { resolveFirstAvailableFavorite, type ResolvedFavorite } from './favorites-resolver.js';
+import type { ResolvedFavorite } from './favorites-resolver.js';
 import { buildFavoritesAppCatalog, codexCliFavoritesSlug } from './codex/favorites-catalog.js';
 import {
   buildVertexRuntimeConfig,
@@ -51,8 +50,39 @@ import {
 } from './server/vertex-config.js';
 import { VERTEX_ANTHROPIC_NPM } from './constants.js';
 import { resolveContextWindow } from './context-window.js';
-import { buildCodexProxyRoutesFromResolved, resolveCodexFavorites } from './codex/favorites-launch.js';
+import {
+  buildCodexProxyRoutesFromResolved,
+  pickFavoriteStartingModel,
+  resolveBootSelection,
+  resolveCodexFavorites,
+} from './codex/favorites-launch.js';
 import { getFavoritesAppCatalogPath } from './codex/profile.js';
+import {
+  buildCloudCodeProxyRoute,
+  buildOAuthAnthropicProxyRoute,
+  startCloudCodeCatalogBackend,
+  type CloudCodeBackend,
+} from './cloud-code-backend.js';
+import type { ProxyRoute } from './proxy.js';
+
+function codexProxyRouteToCodexRoute(route: CodexProxyRoute, fallbackProviderId: string): CodexRoute {
+  return {
+    tier: 'proxy',
+    modelId: route.modelId,
+    providerId: route.providerId ?? fallbackProviderId,
+    npm: route.npm,
+    apiKey: route.apiKey,
+    baseURL: route.baseURL,
+    upstreamModelId: route.upstreamModelId,
+    authType: route.authType,
+    oauthAccountId: route.oauthAccountId,
+    contextWindow: route.contextWindow,
+    supportedParameters: route.supportedParameters,
+    reasoning: route.reasoning,
+    interleavedReasoningField: route.interleavedReasoningField,
+    headers: route.headers,
+  };
+}
 
 async function waitForShutdownWithConfirm(): Promise<void> {
   while (true) {
@@ -60,22 +90,34 @@ async function waitForShutdownWithConfirm(): Promise<void> {
     if (signal !== 'sigint') break; // SIGTERM/SIGHUP: close immediately, no one to ask
     console.log('');
     const choice = await p.select({
-      message: 'Close Codex Desktop and restore your Codex config?',
+      message: 'Close ChatGPT Desktop and restore your Codex config?',
       options: [
-        { value: 'yes', label: 'Yes, close Codex and restore config' },
+        { value: 'yes', label: 'Yes, close ChatGPT Desktop and restore config' },
         { value: 'no', label: 'No, keep session running' },
       ],
     });
     if (p.isCancel(choice) || choice === 'yes') break; // Ctrl+C or Yes = close
-    // confirmed === false means user typed 'n' → loop back and keep waiting
+    // choice === 'no' → loop back and keep waiting
+  }
+}
+
+export async function maybeCloseRunningCodexApp(): Promise<void> {
+  if (!isCodexAppRunning()) return;
+
+  const shouldClose = await p.confirm({ message: 'ChatGPT Desktop is still running. Close it?' });
+  if (shouldClose && !p.isCancel(shouldClose)) {
+    p.log.step('Stopping ChatGPT Desktop...');
+    quitCodexAppGracefully();
   }
 }
 
 export function codexAppHelpText(): string {
-  return `${pc.bold('relay-ai codex-app')} — launch Codex desktop app with your registry providers
+  return `${pc.bold('relay-ai codex-app')} — launch the ChatGPT desktop app (Codex mode) with your registry providers
+${pc.dim('(OpenAI merged the Codex app into ChatGPT desktop on 2026-07-09; "chatgpt" is an alias for this command)')}
 
 ${pc.bold('Usage:')}
   relay-ai codex-app [options]
+  relay-ai chatgpt [options]
   relay-ai codex-app --vertex
   relay-ai codex-app --restore
   relay-ai codex-app --config
@@ -93,10 +135,10 @@ ${pc.bold('Options:')}
 ${pc.bold('Description:')}
   Picks a provider and model from ~/.relay-ai/providers.json, patches ~/.codex/config.toml
   (with backup + restore on Ctrl+C), starts a local Responses proxy, and opens the
-  Codex desktop app. Keep this terminal open while using Codex.
+  ChatGPT desktop app in Codex mode. Keep this terminal open while using Codex.
 
 ${pc.bold('Platforms:')}
-  macOS and Windows. Linux is not supported (no Codex desktop app).
+  macOS and Windows. Linux is not supported (no ChatGPT desktop app).
 
 ${pc.bold('Cleanup:')}
   Ctrl+C stops the proxy and restores your previous Codex config.
@@ -212,6 +254,7 @@ async function runCodexAppVertexLaunch(configOnly: boolean, trace = false): Prom
         apiKey: '',
         providerId: 'vertex',
         vertex: vertexConfig,
+        contextWindow: m.contextWindow,
       })),
       { requireAuth: false, debug: trace },
     );
@@ -263,15 +306,11 @@ async function runCodexAppVertexLaunch(configOnly: boolean, trace = false): Prom
     await waitForShutdownWithConfirm();
     console.log('');
 
-    if (isCodexAppRunning()) {
-      p.log.step('Stopping Codex Desktop...');
-      quitCodexAppGracefully();
-    }
-
     if (sessionActive) {
       restoreCodexAppOverlay();
       sessionActive = false;
     }
+    await maybeCloseRunningCodexApp();
     return 0;
   } finally {
     proxyHandle?.close();
@@ -279,7 +318,7 @@ async function runCodexAppVertexLaunch(configOnly: boolean, trace = false): Prom
   }
 }
 
-export async function runCodexAppCommand(args: string[], opts: { vertex?: boolean } = {}): Promise<number> {
+export async function runCodexAppCommand(args: string[], opts: { vertex?: boolean; launchProvider?: string; launchModel?: string } = {}): Promise<number> {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(codexAppHelpText());
     return 0;
@@ -369,7 +408,20 @@ export async function runCodexAppCommand(args: string[], opts: { vertex?: boolea
   let selectedModel = activeProvider.models.find(m => m.id === prefs.lastCodexModel)
     ?? activeProvider.models[0]!;
 
-  if (!configOnly) {
+  if (!configOnly && opts.launchProvider && opts.launchModel) {
+    const bootSelection = resolveBootSelection(
+      compatible,
+      opts.launchProvider,
+      opts.launchModel,
+      providerForCodexPicker,
+    );
+    if ('error' in bootSelection) {
+      p.log.error(bootSelection.error);
+      return 1;
+    }
+    activeProvider = bootSelection.provider;
+    selectedModel = bootSelection.model;
+  } else if (!configOnly) {
     let currentInitialProvider = prefs.lastCodexProvider && compatible.some(o => o.id === prefs.lastCodexProvider)
       ? prefs.lastCodexProvider
       : compatible[0]!.id;
@@ -378,15 +430,16 @@ export async function runCodexAppCommand(args: string[], opts: { vertex?: boolea
       if (!pickedProvider) return 0;
       
       if (pickedProvider === '__favorites__') {
-        const favoriteProviders = compatible.map(providerForCodexPicker);
-        const favoriteStart = resolveFirstAvailableFavorite(favorites, favoriteProviders);
-        if (!favoriteStart) {
-          p.log.warn('No saved Codex App favorites are currently available.');
-          return 0;
-        }
-        activeProvider = favoriteStart.provider;
-        selectedModel = favoriteStart.model;
-        p.log.step(`Loaded Favorites Catalog. Starting model: ${selectedModel.name || selectedModel.id} (${activeProvider.name})`);
+        const favoritePick = await pickFavoriteStartingModel(
+          compatible,
+          favorites,
+          'codex-app',
+          'Codex App',
+          providerForCodexPicker,
+        );
+        if (favoritePick === 'cancelled' || favoritePick === 'unavailable') return 0;
+        activeProvider = favoritePick.provider;
+        selectedModel = favoritePick.model;
         break;
       } else {
         activeProvider = providerForCodexPicker(pickedProvider as LocalProvider);
@@ -402,11 +455,7 @@ export async function runCodexAppCommand(args: string[], opts: { vertex?: boolea
     }
   }
 
-  const regEntry = loadRegistry().providers.find(pr => pr.id === activeProvider.id);
-  const authRef = regEntry?.authRef
-    ?? (activeProvider.apiKey ? `keyring:provider:${activeProvider.id}` : oauthAuthRef(activeProvider.id));
-  const apiKey = activeProvider.apiKey?.trim()
-    || await resolveProviderCredential(activeProvider.id, authRef);
+  const apiKey = await resolveLocalProviderApiKey(activeProvider);
   if (!apiKey) {
     if (!configOnly) {
       p.log.error(`No credential for ${activeProvider.name}. Run relay-ai providers auth ${activeProvider.id}.`);
@@ -416,32 +465,25 @@ export async function runCodexAppCommand(args: string[], opts: { vertex?: boolea
 
   activeProvider.apiKey = apiKey;
 
-  const route = resolveCodexRoute(activeProvider, selectedModel, apiKey);
+  let cloudCodeBackend: CloudCodeBackend | null = null;
+  let cloudCodeBackendFav: CloudCodeBackend | null = null;
+  const appProviderRoutes = favoritesActive
+    ? null
+    : await buildCodexAppProviderCatalogRoutes(activeProvider, apiKey, selectedModel.id, trace);
+  cloudCodeBackend = appProviderRoutes?.backend ?? null;
+
+  const route = appProviderRoutes
+    ? codexProxyRouteToCodexRoute(appProviderRoutes.selectedRoute, activeProvider.id)
+    : resolveCodexRoute(activeProvider, selectedModel, apiKey);
   const appRoute = { ...route, tier: 'proxy' as const };
-  const routable = routableModelsForProvider(activeProvider, 'codex-app');
+  const routable = appProviderRoutes?.routable ?? routableModelsForProvider(activeProvider, 'codex-app');
+  const catalogModels = appProviderRoutes?.catalogModels ?? routable;
 
   let resolvedFavorites: ResolvedFavorite[] = [];
   let providersById: Map<string, LocalProvider> = new Map();
 
   if (favoritesActive) {
-    let zenGoApiKey: string | null = null;
-    const hasZenGo = favorites.some(f => f.providerId === 'zen' || f.providerId === 'go') || activeProvider.id === 'zen' || activeProvider.id === 'go';
-    if (hasZenGo) {
-      if (!configOnly) {
-        zenGoApiKey = await resolveOrCollectApiKey(false, false);
-      } else {
-        const existing = resolveApiKey();
-        if (existing) {
-          zenGoApiKey = existing;
-        } else {
-          const stored = await readFromCredentialStore(() => {});
-          if (stored) {
-            zenGoApiKey = stored;
-          }
-        }
-      }
-    }
-    const res = resolveCodexFavorites(activeProvider, selectedModel, compatible, favorites, 'codex-app', zenGoApiKey);
+    const res = await resolveCodexFavorites(activeProvider, selectedModel, compatible, favorites, 'codex-app');
     resolvedFavorites = res.resolvedFavorites;
     providersById = res.providersById;
   }
@@ -454,7 +496,10 @@ export async function runCodexAppCommand(args: string[], opts: { vertex?: boolea
       selectedModel.id,
       appRoute,
     );
-    if (!confirmed) return 0;
+    if (!confirmed) {
+      cloudCodeBackend?.handle.close();
+      return 0;
+    }
   }
 
   let proxyHandle: CodexProxyHandle | null = null;
@@ -519,20 +564,65 @@ export async function runCodexAppCommand(args: string[], opts: { vertex?: boolea
       return 0;
     }
 
-    const proxyPort = favoritesActive && resolvedFavorites.length > 0
-      ? (proxyHandle = await startCodexProxy(
-        buildCodexProxyRoutesFromResolved(resolvedFavorites, providersById),
+    let proxyPort: number;
+    if (favoritesActive && resolvedFavorites.length > 0) {
+      const needsBackend = (r: typeof resolvedFavorites[0]) => {
+        const m = r.model as LocalProviderModel;
+        const prov = providersById.get(r.providerId);
+        return m.modelFormat === 'cloud-code'
+          || (m.modelFormat === 'anthropic' && prov?.authType === 'oauth');
+      };
+      const backendResolved = resolvedFavorites.filter(needsBackend);
+      const regularResolved = resolvedFavorites.filter(r => !needsBackend(r));
+
+      let backendCodexRoutes: import('./codex-proxy.js').CodexProxyRoute[] = [];
+      if (backendResolved.length > 0) {
+        const backendRoutes: ProxyRoute[] = backendResolved.map(r => {
+          const provider = providersById.get(r.providerId);
+          const providerData = (provider?.providerData ?? {}) as Record<string, unknown>;
+          const m = r.model as LocalProviderModel;
+          const route = m.modelFormat === 'cloud-code'
+            ? buildCloudCodeProxyRoute(m, r.apiKey, providerData)
+            : buildOAuthAnthropicProxyRoute(m, r.apiKey, r.providerId, providerData);
+          return { ...route, oauthAccountId: provider?.oauthAccountId, providerData };
+        });
+        const startingAlias = backendRoutes[0]!.aliasId;
+        cloudCodeBackendFav = await startCloudCodeCatalogBackend(backendRoutes, startingAlias, trace);
+        backendCodexRoutes = backendRoutes.map(cr => ({
+          modelId: cr.aliasId,
+          npm: '@ai-sdk/anthropic',
+          apiKey: cloudCodeBackendFav!.token,
+          baseURL: `http://127.0.0.1:${cloudCodeBackendFav!.port}`,
+          upstreamModelId: cr.aliasId,
+          providerId: cr.providerId ?? 'antigravity',
+          authType: 'oauth' as const,
+          oauthAccountId: cr.oauthAccountId,
+          providerData: cr.providerData,
+          contextWindow: cr.contextWindow,
+        }));
+      }
+
+      const regularRoutes = buildCodexProxyRoutesFromResolved(regularResolved, providersById);
+      proxyHandle = await startCodexProxy(
+        [...backendCodexRoutes, ...regularRoutes],
         { requireAuth: false, debug: trace },
-      )).port
-      : (proxyHandle = await startCodexProxy(
-        buildCodexProxyRoutesForProvider(activeProvider, apiKey, selectedModel.id, 'codex-app'),
+      );
+      proxyPort = proxyHandle.port;
+    } else {
+      if (!appProviderRoutes) {
+        throw new Error('Codex App provider routes were not initialized');
+      }
+      proxyHandle = await startCodexProxy(
+        appProviderRoutes.routes,
         { requireAuth: false, debug: trace },
-      )).port;
+      );
+      proxyPort = proxyHandle.port;
+    }
 
     const modelLabel = formatCodexModelLabel(selectedModel);
     const catalogFile = favoritesActive && resolvedFavorites.length > 0
       ? buildFavoritesAppCatalog(resolvedFavorites)
-      : buildAppCatalogFile(routable, activeProvider.name, selectedModel.id);
+      : buildAppCatalogFile(catalogModels, activeProvider.name, appRoute.modelId);
 
     writeOverlayFile(catalogPath, serializeCatalog(catalogFile));
 
@@ -588,18 +678,20 @@ export async function runCodexAppCommand(args: string[], opts: { vertex?: boolea
     if (trace) printTraceLog(debugLogPath);
     console.log('');
 
-    if (isCodexAppRunning()) {
-      p.log.step('Stopping Codex Desktop...');
-      quitCodexAppGracefully();
-    }
-
     if (sessionActive) {
       restoreCodexAppOverlay();
       sessionActive = false;
     }
+    await maybeCloseRunningCodexApp();
     return 0;
   } finally {
     proxyHandle?.close();
+    if (cloudCodeBackend) {
+      cloudCodeBackend.handle.close();
+    }
+    if (cloudCodeBackendFav) {
+      cloudCodeBackendFav.handle.close();
+    }
     if (sessionActive) restoreCodexAppOverlay();
   }
 }

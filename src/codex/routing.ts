@@ -1,11 +1,16 @@
 // Codex routing: tier 1 (direct OpenAI) vs tier 2 (Responses proxy).
 import type { CodexProxyRoute } from '../codex-proxy.js';
-import { shouldHideModel, type CompatibilityAgent } from '../model-compatibility.js';
 import { BACKENDS } from '../constants.js';
+import {
+  isTargetCompatibleModel,
+  providersForTarget,
+  routableModelsForTarget,
+  type RelayLaunchTarget,
+} from '../target-compatibility.js';
 import type { LocalProvider, LocalProviderModel } from '../types.js';
 
 export interface CodexRoute {
-  tier: 'direct' | 'proxy';
+  tier: 'direct' | 'proxy' | 'cloud-code';
   npm: string;
   baseURL?: string;
   upstreamModelId: string;
@@ -15,33 +20,29 @@ export interface CodexRoute {
   providerId: string;
   authType?: 'api' | 'oauth' | 'none';
   oauthAccountId?: string;
+  providerData?: Record<string, unknown>;
   supportedParameters?: string[];
   reasoning?: boolean;
   interleavedReasoningField?: string;
+  /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
+  headers?: Record<string, string>;
 }
 
 export function isRoutableModel(
   model: LocalProviderModel,
   providerId: string,
-  agent: CompatibilityAgent = 'codex',
+  agent: RelayLaunchTarget = 'codex',
+  authType?: LocalProvider['authType'],
 ): boolean {
-  if (shouldHideModel({ providerId, modelId: model.id, agent })) return false;
-  if (model.modelFormat === 'anthropic') return true;
-  if (model.modelFormat === 'openai') {
-    if (providerId === 'zen' || providerId === 'go') return true;
-    if (model.npm) return true;
-  }
-  return false;
+  return isTargetCompatibleModel({ target: agent, providerId, authType, model }).compatible;
 }
 
 /** Registry providers with at least one routable model (includes Anthropic). */
 export function codexCompatibleProviders(
   providers: LocalProvider[],
-  agent: CompatibilityAgent = 'codex',
+  agent: RelayLaunchTarget = 'codex',
 ): LocalProvider[] {
-  return providers.filter(lp =>
-    lp.models.some(m => isRoutableModel(m, lp.id, agent)),
-  );
+  return providersForTarget(providers, agent);
 }
 
 function resolveBaseURL(model: LocalProviderModel, provider: LocalProvider): string | undefined {
@@ -76,10 +77,32 @@ export function resolveCodexRoute(
     providerId: provider.id,
     authType: provider.authType,
     oauthAccountId: provider.oauthAccountId,
+    providerData: provider.providerData,
     supportedParameters: model.supportedParameters,
     reasoning: model.reasoning,
     interleavedReasoningField: model.interleavedReasoningField,
+    headers: provider.headers,
   };
+
+  if (model.modelFormat === 'cloud-code') {
+    return {
+      tier: 'cloud-code',
+      npm: '@ai-sdk/anthropic',
+      baseURL: '',
+      upstreamModelId: model.upstreamModelId || model.id,
+      apiKey,
+      contextWindow: model.contextWindow,
+      modelId: model.id,
+      providerId: provider.id,
+      authType: provider.authType,
+      oauthAccountId: provider.oauthAccountId,
+      providerData: provider.providerData,
+      supportedParameters: model.supportedParameters,
+      reasoning: model.reasoning,
+      interleavedReasoningField: model.interleavedReasoningField,
+      headers: provider.headers,
+    };
+  }
 
   if (model.npm === '@ai-sdk/openai' && provider.authType !== 'oauth' && model.modelFormat === 'openai') {
     return { tier: 'direct', ...base };
@@ -90,16 +113,16 @@ export function resolveCodexRoute(
 
 export function routableModelsForProvider(
   provider: LocalProvider,
-  agent: CompatibilityAgent = 'codex',
+  agent: RelayLaunchTarget = 'codex',
 ): LocalProviderModel[] {
-  return provider.models.filter(m => isRoutableModel(m, provider.id, agent));
+  return routableModelsForTarget(provider, agent);
 }
 
 export function buildCodexProxyRoutesForProvider(
   provider: LocalProvider,
   apiKey: string,
   selectedModelId?: string,
-  agent: CompatibilityAgent = 'codex',
+  agent: RelayLaunchTarget = 'codex',
 ): CodexProxyRoute[] {
   const routable = routableModelsForProvider(provider, agent);
   const ordered = selectedModelId
@@ -119,10 +142,12 @@ export function buildCodexProxyRoutesForProvider(
       providerId: route.providerId,
       authType: route.authType,
       oauthAccountId: route.oauthAccountId,
+      providerData: route.providerData,
       supportedParameters: route.supportedParameters,
       reasoning: route.reasoning,
       interleavedReasoningField: route.interleavedReasoningField,
       contextWindow: route.contextWindow,
+      headers: route.headers,
     };
   });
 }

@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildCodexProxyRoutesFromResolved, resolveCodexFavorites } from '../src/codex/favorites-launch.js';
+import {
+  buildCodexProxyRoutesFromResolved,
+  pickFavoriteStartingModel,
+  resolveBootSelection,
+  resolveCodexFavorites,
+} from '../src/codex/favorites-launch.js';
 import { getFavoritesCatalogPath, getFavoritesAppCatalogPath } from '../src/codex/profile.js';
 import { ownedOverlayPaths, getRelayAiCodexDir } from '../src/codex/session.js';
 import { buildCodexChildEnv } from '../src/codex/launch.js';
@@ -107,13 +112,13 @@ describe('buildCodexProxyRoutesFromResolved', () => {
 });
 
 describe('resolveCodexFavorites', () => {
-  it('resolves active provider + favorites and filters stale favorites', () => {
+  it('resolves active provider + favorites and filters stale favorites', async () => {
     const favorites: FavoriteModel[] = [
       { providerId: 'anthropic', modelId: 'claude-sonnet-4.5' },
       { providerId: 'unknown', modelId: 'missing-model' }, // stale
     ];
     const compatible = [anthropicProvider];
-    const { resolvedFavorites, providersById } = resolveCodexFavorites(
+    const { resolvedFavorites, providersById } = await resolveCodexFavorites(
       anthropicProvider,
       anthropicProvider.models[0]!,
       compatible,
@@ -127,59 +132,32 @@ describe('resolveCodexFavorites', () => {
     expect(providersById.get('anthropic')).toEqual(anthropicProvider);
   });
 
-  it('resolves Zen starting model when zenGoApiKey is provided', () => {
-    const zenModel: ModelInfo = {
-      id: 'deepseek-v4-flash-free',
-      name: 'DeepSeek V4 Flash Free',
-      family: 'deepseek',
-      modelFormat: 'openai',
-      sourceBackend: 'zen',
-    };
-    const zenProvider: LocalProvider = {
-      id: 'zen',
-      name: 'OpenCode Zen',
-      apiKey: '',
-      models: [zenModel as LocalProvider['models'][number]],
-    };
-    const { resolvedFavorites } = resolveCodexFavorites(
-      zenProvider,
-      zenProvider.models[0]!,
-      [zenProvider],
-      [],
-      'codex',
-      'zen-key',
+});
+
+describe('codex launch selection helpers', () => {
+  it('resolves boot provider/model through the supplied wrapper', () => {
+    const result = resolveBootSelection(
+      [anthropicProvider],
+      'anthropic',
+      'claude-sonnet-4.5',
+      provider => ({ ...provider, name: `${provider.name} wrapped` }),
     );
 
-    expect(resolvedFavorites).toHaveLength(1);
-    expect(resolvedFavorites[0]?.providerId).toBe('zen');
-    expect(resolvedFavorites[0]?.model.id).toBe('deepseek-v4-flash-free');
-    expect(resolvedFavorites[0]?.apiKey).toBe('zen-key');
+    expect(result).toMatchObject({
+      provider: expect.objectContaining({ name: 'Anthropic wrapped' }),
+      model: expect.objectContaining({ id: 'claude-sonnet-4.5' }),
+    });
   });
 
-  it('drops Zen favorites when zenGoApiKey is missing', () => {
-    const zenModel: ModelInfo = {
-      id: 'deepseek-v4-flash-free',
-      name: 'DeepSeek V4 Flash Free',
-      family: 'deepseek',
-      modelFormat: 'openai',
-      sourceBackend: 'zen',
-    };
-    const zenProvider: LocalProvider = {
-      id: 'zen',
-      name: 'OpenCode Zen',
-      apiKey: '',
-      models: [zenModel as LocalProvider['models'][number]],
-    };
-    const { resolvedFavorites } = resolveCodexFavorites(
-      zenProvider,
-      zenProvider.models[0]!,
-      [zenProvider],
+  it('returns a product-specific unavailable state for missing favorite choices', async () => {
+    const result = await pickFavoriteStartingModel(
       [],
+      [{ providerId: 'missing', modelId: 'ghost' }],
       'codex',
-      null,
+      'Codex',
     );
 
-    expect(resolvedFavorites).toEqual([]);
+    expect(result).toBe('unavailable');
   });
 });
 

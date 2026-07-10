@@ -1,6 +1,6 @@
 // OpenAI Responses API (/v1/responses) ↔ Vercel AI SDK. One turn per request; Codex owns the tool loop.
 import { streamText, generateText, tool, jsonSchema } from 'ai';
-import type { LanguageModel, ModelMessage } from 'ai';
+import type { LanguageModel, ModelMessage, ToolSet } from 'ai';
 import {
   sseChunk,
   encodeToolUseId,
@@ -9,6 +9,7 @@ import {
   parseToolArguments,
   silenceSdkWarnings,
   grabRoundTripSignature,
+  parseDsmlToolCalls,
   type FullStreamPart,
 } from './proxy-shared.js';
 import {
@@ -55,12 +56,27 @@ export type ResponsesInputItem =
   | ResponsesFunctionCallOutputItem
   | ResponsesReasoningItem;
 
-export interface ResponsesTool {
+export interface ResponsesFunctionTool {
   type: 'function';
   name: string;
   description?: string;
   parameters?: Record<string, unknown>;
 }
+
+/**
+ * Codex App's proprietary wrapper for MCP server tools. The real ChatGPT backend
+ * unwraps this server-side before the model ever sees it; custom Responses-API
+ * providers (us) receive it as-is and must flatten it themselves, or the model
+ * never sees any usable MCP tools. See translateResponsesTools.
+ */
+export interface ResponsesNamespaceTool {
+  type: 'namespace';
+  name: string;
+  description?: string;
+  tools: ResponsesFunctionTool[];
+}
+
+export type ResponsesTool = ResponsesFunctionTool | ResponsesNamespaceTool;
 
 export interface ResponsesRequest {
   model: string;
@@ -77,10 +93,14 @@ export interface ResponsesRequest {
 export interface CodexSdkCallParams {
   system?: string;
   messages: ModelMessage[];
-  tools?: Record<string, ReturnType<typeof tool>>;
+  tools?: ToolSet;
   maxOutputTokens?: number;
   temperature?: number;
   providerOptions?: Record<string, Record<string, unknown>>;
+}
+
+export interface TranslateToolOptions {
+  maxTools?: number;
 }
 
 type WriteFn = (chunk: string) => void;
@@ -140,9 +160,9 @@ function mergeConsecutiveMessages(messages: ModelMessage[]): ModelMessage[] {
 }
 
 function ensureUserFirst(messages: ModelMessage[]): ModelMessage[] {
-  if (messages.length === 0) return [{ role: 'user', content: [{ type: 'text', text: '' }] } as ModelMessage];
+  if (messages.length === 0) return [{ role: 'user', content: [{ type: 'text', text: '(empty input)' }] } as ModelMessage];
   if (messages[0]!.role === 'assistant') {
-    return [{ role: 'user', content: [{ type: 'text', text: '' }] } as ModelMessage, ...messages];
+    return [{ role: 'user', content: [{ type: 'text', text: '(conversation continued)' }] } as ModelMessage, ...messages];
   }
   return messages;
 }
@@ -225,15 +245,35 @@ export function translateResponsesInput(
   };
 }
 
-export function translateResponsesTools(tools?: ResponsesTool[]): CodexSdkCallParams['tools'] {
+export function translateResponsesTools(
+  tools?: ResponsesTool[],
+  options: TranslateToolOptions = {},
+): CodexSdkCallParams['tools'] {
   if (!tools?.length) return undefined;
   const out: Record<string, ReturnType<typeof tool>> = {};
-  for (const t of tools) {
-    if (t.type !== 'function' || !t.name) continue;
-    out[t.name] = tool({
-      description: t.description ?? '',
-      inputSchema: jsonSchema(t.parameters ?? { type: 'object', properties: {} }),
+  let toolCount = 0;
+  const addTool = (name: string, definition: ResponsesFunctionTool): void => {
+    if (options.maxTools !== undefined && toolCount >= options.maxTools) return;
+    out[name] = tool({
+      description: definition.description ?? '',
+      inputSchema: jsonSchema(definition.parameters ?? { type: 'object', properties: {} }),
     });
+    toolCount++;
+  };
+
+  for (const t of tools) {
+    if (t.type === 'namespace') {
+      // Flatten "mcp__<server>" + nested "query_docs" -> "mcp__<server>__query_docs",
+      // matching Codex's own flattened-name convention so the model's tool_call name
+      // round-trips back to Codex's dispatcher unchanged.
+      for (const nested of t.tools ?? []) {
+        if (nested.type !== 'function' || !nested.name) continue;
+        addTool(`${t.name}__${nested.name}`, nested);
+      }
+      continue;
+    }
+    if (t.type !== 'function' || !t.name) continue;
+    addTool(t.name, t);
   }
   return Object.keys(out).length ? out : undefined;
 }
@@ -242,17 +282,19 @@ export function translateResponsesRequest(
   body: ResponsesRequest,
   npm: string,
   metadata?: ReasoningMetadata,
+  options: TranslateToolOptions = {},
 ): CodexSdkCallParams {
   const { system, messages } = translateResponsesInput(body.input, body.instructions, npm);
   const effort = body.reasoning?.effort;
   const providerOptions = deepMergeProviderOptions(
     thinkingProviderOptions(npm),
-    effortProviderOptions(npm, effort, body.model, metadata),
+    effortProviderOptions(npm, effort, metadata?.upstreamModelId ?? body.model, metadata),
   );
+  const tools = translateResponsesTools(body.tools, options);
   return {
     system,
     messages,
-    tools: translateResponsesTools(body.tools),
+    tools,
     maxOutputTokens: body.max_output_tokens,
     temperature: body.temperature,
     providerOptions,
@@ -281,10 +323,79 @@ interface StreamingToolState {
   args: string;
 }
 
+export interface ResponsesStreamSummary {
+  reasoningChars: number;
+  reasoningPreview: string;
+  textChars: number;
+  toolCallCount: number;
+  toolNames: string[];
+  /** Set when writeResponsesStream force-stopped the generation early — see REPEAT_TAIL_CHARS. */
+  loopDetected?: 'reasoning' | 'text';
+  /** Set when leaked DeepSeek DSML tool-call markup was recovered into real function calls. */
+  dsmlToolCallsRecovered?: number;
+  /** Set when the stream was aborted (idle timeout — upstream stopped sending data). */
+  aborted?: boolean;
+  /** Set when the stream ended with an upstream error part (e.g. HTTP 4xx/5xx). */
+  errorMessage?: string;
+}
+
+export interface ResponsesStreamProgress {
+  reasoningChars: number;
+  reasoningTail: string;
+  textChars: number;
+  toolCallCount: number;
+  elapsedMs: number;
+}
+
+/** Minimum time between onProgress calls, so a genuinely runaway/looping generation is
+ *  still visible in the trace log before (or instead of) a final onDone summary. */
+const PROGRESS_INTERVAL_MS = 3_000;
+
+/**
+ * Observed live: xAI grok-4.5 given a large, tools-stripped compaction request can finish
+ * reasoning normally, then free-run regenerating an identical block of text forever instead
+ * of reaching `finish` (same trailing 200 chars unchanged across dozens of progress checks
+ * while textChars kept climbing). Checked on the same cadence as onProgress, independent of
+ * whether tracing is enabled — this is a safety mechanism, not a debug feature.
+ */
+const REPEAT_TAIL_CHARS = 200;
+/** Consecutive stale-tail checks (each PROGRESS_INTERVAL_MS apart) before concluding the
+ *  model is looping rather than coincidentally producing similar output between checks. */
+const REPEAT_STREAK_LIMIT = 3;
+const LOOP_NOTICE = '\n\n[relay-ai: generation stopped after detecting a repetition loop]';
+
+interface RepeatTracker {
+  tail: string;
+  len: number;
+  streak: number;
+}
+
+const INITIAL_REPEAT_TRACKER: RepeatTracker = { tail: '', len: 0, streak: 0 };
+
+/** Stale tail + substantial continued growth = regenerating the same content, not just
+ *  naturally ending on similar words. Requiring both avoids false positives on a stream
+ *  that briefly stalls with no new output at all. */
+function trackRepetition(current: string, prev: RepeatTracker): RepeatTracker {
+  const tail = current.length >= REPEAT_TAIL_CHARS ? current.slice(-REPEAT_TAIL_CHARS) : current;
+  const grew = current.length - prev.len >= REPEAT_TAIL_CHARS;
+  const stale = tail.length === REPEAT_TAIL_CHARS && tail === prev.tail && grew;
+  return { tail, len: current.length, streak: stale ? prev.streak + 1 : 0 };
+}
+
+export interface WriteResponsesStreamOptions {
+  /** Called when the stream is force-stopped (repetition loop) BEFORE breaking out of
+   *  fullStream. Breaking alone does not cancel the SDK's upstream request — the SDK
+   *  keeps consuming internally to settle its own promises — so the caller must abort. */
+  onForceStop?: (reason: string) => void;
+}
+
 export async function writeResponsesStream(
   fullStream: AsyncIterable<FullStreamPart>,
   modelId: string,
   write: WriteFn,
+  onDone?: (summary: ResponsesStreamSummary) => void,
+  onProgress?: (progress: ResponsesStreamProgress) => void,
+  options?: WriteResponsesStreamOptions,
 ): Promise<void> {
   const emit = (type: string, data: unknown) => write(sseChunk(type, data));
   const responseId = newResponseId();
@@ -310,10 +421,15 @@ export async function writeResponsesStream(
   const toolStates: StreamingToolState[] = [];
   const toolStatesById = new Map<string, StreamingToolState>();
   let currentToolState: StreamingToolState | null = null;
+  const streamStartedAt = Date.now();
+  let lastProgressAt = streamStartedAt;
   let reasoningItemId: string | null = null;
   let reasoningText = '';
   let reasoningOutputIndex = 0;
   const outputItems: unknown[] = [];
+  let reasoningRepeat = INITIAL_REPEAT_TRACKER;
+  let textRepeat = INITIAL_REPEAT_TRACKER;
+  let loopDetected: 'reasoning' | 'text' | undefined;
 
   const ensureTextItem = (): string => {
     if (!textItemId) {
@@ -352,7 +468,7 @@ export async function writeResponsesStream(
     const itemId = rawId ?? newItemId('fc');
     const state = rememberToolState({
       itemId,
-      callId: encodeToolUseId(itemId, signature),
+      callId: encodeToolUseId(itemId, signature, false),
       name: name ?? 'unknown',
       outputIndex: outputIndex++,
       args: '',
@@ -462,6 +578,36 @@ export async function writeResponsesStream(
         if (part.totalUsage) usage = usageFromPart(part);
         break;
 
+      case 'abort': {
+        // The SDK ends the stream cleanly after an abort (no throw), so without
+        // this case a timed-out request would finalize as status:"completed" and
+        // Codex would treat dead-connection silence as a valid empty answer.
+        const msg = `stream aborted: ${part.reason ?? 'no data received from provider'}`;
+        process.stderr.write(`[relay-ai] ${modelId}: ${msg}\n`);
+        onDone?.({
+          reasoningChars: reasoningText.length,
+          reasoningPreview: reasoningText.slice(0, 200),
+          textChars: textFull.length,
+          toolCallCount: toolStates.length,
+          toolNames: toolStates.map(t => t.name),
+          loopDetected,
+          aborted: true,
+        });
+        emit('response.completed', {
+          type: 'response.completed',
+          response: {
+            id: responseId,
+            object: 'response',
+            model: modelId,
+            created_at: createdAt,
+            status: 'failed',
+            output: [],
+            error: { message: msg, type: 'api_error' },
+          },
+        });
+        return;
+      }
+
       case 'error': {
         const msg = formatUpstreamError(part.error);
         const is429 = msg.includes('429') ||
@@ -469,6 +615,15 @@ export async function writeResponsesStream(
             ((part.error as { statusCode?: number }).statusCode === 429 ||
              (part.error as { lastError?: { statusCode?: number } }).lastError?.statusCode === 429));
         process.stderr.write(`[relay-ai] ${modelId}: ${msg}\n`);
+        onDone?.({
+          reasoningChars: reasoningText.length,
+          reasoningPreview: reasoningText.slice(0, 200),
+          textChars: textFull.length,
+          toolCallCount: toolStates.length,
+          toolNames: toolStates.map(t => t.name),
+          loopDetected,
+          errorMessage: msg,
+        });
         if (is429) {
           writeResponsesRateLimitStream(modelId, msg, write);
         } else {
@@ -491,9 +646,101 @@ export async function writeResponsesStream(
       default:
         break;
     }
+
+    const now = Date.now();
+    if (now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
+      lastProgressAt = now;
+      reasoningRepeat = trackRepetition(reasoningText, reasoningRepeat);
+      textRepeat = trackRepetition(textFull, textRepeat);
+      if (reasoningRepeat.streak >= REPEAT_STREAK_LIMIT) loopDetected = 'reasoning';
+      else if (textRepeat.streak >= REPEAT_STREAK_LIMIT) loopDetected = 'text';
+
+      if (onProgress) {
+        onProgress({
+          reasoningChars: reasoningText.length,
+          reasoningTail: reasoningText.slice(-200),
+          textChars: textFull.length,
+          toolCallCount: toolStates.length,
+          elapsedMs: now - streamStartedAt,
+        });
+      }
+
+      if (loopDetected) {
+        options?.onForceStop?.(`repetition loop detected (${loopDetected})`);
+        break;
+      }
+    }
   }
 
-  if (textItemId) {
+  if (loopDetected) {
+    ensureTextItem();
+    textFull += LOOP_NOTICE;
+    emit('response.output_text.delta', {
+      type: 'response.output_text.delta',
+      item_id: textItemId,
+      output_index: textOutputIndex,
+      content_index: 0,
+      delta: LOOP_NOTICE,
+    });
+  }
+
+  const dsml = loopDetected ? null : parseDsmlToolCalls(textFull);
+
+  if (dsml) {
+    // The client already streamed the raw DSML markup live as ordinary text-delta events
+    // (we don't know it's a tool-call block until the closing tag arrives) - but the
+    // *final* output is what Codex actually acts on, so replace the garbled text item
+    // with the real function calls the model intended, matching a normal tool-call turn.
+    if (dsml.leadingText && textItemId) {
+      emit('response.output_text.done', {
+        type: 'response.output_text.done',
+        item_id: textItemId,
+        output_index: textOutputIndex,
+        content_index: 0,
+        text: dsml.leadingText,
+      });
+      emit('response.content_part.done', {
+        type: 'response.content_part.done',
+        item_id: textItemId,
+        output_index: textOutputIndex,
+        content_index: 0,
+        part: { type: 'output_text', text: dsml.leadingText },
+      });
+      const textItem = {
+        id: textItemId,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: dsml.leadingText }],
+      };
+      emit('response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: textOutputIndex,
+        item: textItem,
+      });
+      outputItems.push(textItem);
+    }
+    for (const call of dsml.calls) {
+      const itemId = newItemId('fc');
+      const callId = encodeToolUseId(itemId, undefined, false);
+      const idx = outputIndex++;
+      const args = JSON.stringify(call.args);
+      emit('response.output_item.added', {
+        type: 'response.output_item.added',
+        output_index: idx,
+        item: { type: 'function_call', id: itemId, call_id: callId, name: call.name, arguments: '', status: 'in_progress' },
+      });
+      emit('response.function_call_arguments.done', {
+        type: 'response.function_call_arguments.done',
+        item_id: itemId,
+        output_index: idx,
+        arguments: args,
+      });
+      const fcItem = { type: 'function_call', id: itemId, call_id: callId, name: call.name, arguments: args, status: 'completed' };
+      emit('response.output_item.done', { type: 'response.output_item.done', output_index: idx, item: fcItem });
+      outputItems.push(fcItem);
+    }
+  } else if (textItemId) {
     emit('response.output_text.done', {
       type: 'response.output_text.done',
       item_id: textItemId,
@@ -556,6 +803,20 @@ export async function writeResponsesStream(
     outputItems.push(fcItem);
   }
 
+  if (outputItems.length === 0) {
+    outputItems.push({ id: newItemId('msg'), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '(conversation context was too large to summarize)' }] });
+  }
+
+  onDone?.({
+    reasoningChars: reasoningText.length,
+    reasoningPreview: reasoningText.slice(0, 200),
+    textChars: textFull.length,
+    toolCallCount: toolStates.length,
+    toolNames: toolStates.map(t => t.name),
+    loopDetected,
+    dsmlToolCallsRecovered: dsml?.calls.length,
+  });
+
   emit('response.completed', {
     type: 'response.completed',
     response: {
@@ -570,13 +831,38 @@ export async function writeResponsesStream(
   });
 }
 
+/**
+ * Observed live: OpenCode Zen silently dropped an upstream connection before sending a
+ * single byte — no HTTP error, no stream error, no TCP reset our fetch could see. With
+ * no timeout anywhere in this path, the `for await` over fullStream waited forever and
+ * every safety mechanism (progress logging, repetition detector) was invisible because
+ * they only run when a part arrives. This watchdog is armed immediately (unlike the
+ * SDK's `timeout.chunkMs`, which only arms after the first chunk) and reset on every
+ * part, so it bounds both zero-byte hangs and mid-stream connection death.
+ */
+const STREAM_IDLE_TIMEOUT_MS = 120_000;
+
+export interface StreamResponsesOptions {
+  idleTimeoutMs?: number;
+}
+
 export async function streamResponsesResponse(
   model: LanguageModel,
   params: CodexSdkCallParams,
   modelId: string,
   write: WriteFn,
+  onDone?: (summary: ResponsesStreamSummary) => void,
+  onProgress?: (progress: ResponsesStreamProgress) => void,
+  options?: StreamResponsesOptions,
 ): Promise<void> {
-  const result = streamText({ model, ...params, onError: () => {} } as Parameters<typeof streamText>[0]);
+  const idleTimeoutMs = options?.idleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS;
+  const abort = new AbortController();
+  let idleTimer = setTimeout(
+    () => abort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
+    idleTimeoutMs,
+  );
+
+  const result = streamText({ model, ...params, abortSignal: abort.signal, onError: () => {} } as Parameters<typeof streamText>[0]);
   // Prevent unhandled promise rejections on stream properties:
   Promise.resolve(result.text).catch(() => {});
   Promise.resolve(result.toolCalls).catch(() => {});
@@ -585,7 +871,24 @@ export async function streamResponsesResponse(
   Promise.resolve(result.usage).catch(() => {});
   Promise.resolve(result.response).catch(() => {});
 
-  await writeResponsesStream(result.fullStream as AsyncIterable<FullStreamPart>, modelId, write);
+  const watchedStream = (async function* () {
+    try {
+      for await (const part of result.fullStream as AsyncIterable<FullStreamPart>) {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(
+          () => abort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
+          idleTimeoutMs,
+        );
+        yield part;
+      }
+    } finally {
+      clearTimeout(idleTimer);
+    }
+  })();
+
+  await writeResponsesStream(watchedStream, modelId, write, onDone, onProgress, {
+    onForceStop: reason => abort.abort(new Error(reason)),
+  });
 }
 
 export async function generateResponsesResponse(
@@ -602,7 +905,7 @@ export async function generateResponsesResponse(
     output.push(makeReasoningOutputItem(newItemId('rs'), r.reasoningText));
   }
 
-  if (r.text) {
+  if (r.text !== null && r.text !== undefined) {
     output.push({
       id: newItemId('msg'),
       type: 'message',
@@ -613,7 +916,7 @@ export async function generateResponsesResponse(
   }
 
   for (const tc of r.toolCalls) {
-    const encodedId = encodeToolUseId(tc.toolCallId, grabRoundTripSignature(tc as FullStreamPart));
+    const encodedId = encodeToolUseId(tc.toolCallId, grabRoundTripSignature(tc as FullStreamPart), false);
     output.push({
       type: 'function_call',
       id: tc.toolCallId,
@@ -622,6 +925,10 @@ export async function generateResponsesResponse(
       arguments: JSON.stringify(tc.input ?? {}),
       status: 'completed',
     });
+  }
+
+  if (output.length === 0) {
+    output.push({ id: newItemId('msg'), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '(conversation context was too large to summarize)' }] });
   }
 
   const inputTokens = r.usage?.inputTokens ?? 0;
@@ -670,6 +977,17 @@ export function writeResponsesRateLimitStream(modelId: string, message: string, 
   const itemId = newItemId('msg');
   const createdAt = Math.floor(Date.now() / 1000);
   const content = [{ type: 'output_text', text: message }];
+  write(sseChunk('response.created', {
+    type: 'response.created',
+    response: {
+      id: responseId,
+      object: 'response',
+      model: modelId,
+      created_at: createdAt,
+      status: 'in_progress',
+      output: [],
+    },
+  }));
   write(sseChunk('response.output_item.added', {
     type: 'response.output_item.added',
     output_index: 0,

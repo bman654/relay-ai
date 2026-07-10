@@ -10,7 +10,7 @@ import {
 import { getReasoningCapabilities } from '../provider-factory.js';
 import { getCodexHome } from './session.js';
 
-type TomlRecord = Record<string, unknown>;
+export type TomlRecord = Record<string, unknown>;
 
 export function getCodexConfigPath(): string {
   return join(getCodexHome(), 'config.toml');
@@ -39,7 +39,7 @@ export interface CodexAppRestoreState {
   modelAutoCompactTokenLimit?: number;
 }
 
-function asRecord(value: unknown): TomlRecord {
+export function asRecord(value: unknown): TomlRecord {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as TomlRecord
     : {};

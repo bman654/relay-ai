@@ -3,6 +3,7 @@
 import { positiveSecondsToMs, sleepMs } from './pkce.js';
 import type { OAuthTokenResponse } from './types.js';
 import { VERSION } from '../constants.js';
+import { postOAuthRefresh } from './refresh-http.js';
 
 const CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828';
 const TOKEN_URL = 'https://auth.x.ai/oauth2/token';
@@ -94,20 +95,21 @@ export async function pollXaiDeviceCodeToken(
 }
 
 export async function refreshXaiAccessToken(refreshToken: string): Promise<OAuthTokenResponse> {
-  const response = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: new URLSearchParams({
+  return postOAuthRefresh(
+    TOKEN_URL,
+    new URLSearchParams({
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
       client_id: CLIENT_ID,
-    }).toString(),
-  });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => '');
-    throw new Error(`xAI token refresh failed (${response.status})${detail ? `: ${detail}` : ''}`);
-  }
-  return response.json() as Promise<OAuthTokenResponse>;
+    }),
+    {
+      contentType: 'form',
+      errorPrefix: 'xAI token refresh failed',
+      includeStatus: true,
+      includeBody: true,
+      headers: authHeaders(),
+    },
+  );
 }
 
 export async function runXaiDeviceCodeFlow(

@@ -2,12 +2,13 @@
 import { resolveContextWindow } from '../context-window.js';
 import { aliasModelId } from '../proxy.js';
 import { maskGatewayModelId } from './vendor-mask.js';
+import type { FreeStatus } from '../free-models.js';
 
 export interface GatewayModelOptions {
   maskGatewayIds?: boolean;
 }
 
-export type ServerModelFormat = 'anthropic' | 'openai' | 'unsupported';
+export type ServerModelFormat = 'anthropic' | 'openai' | 'cloud-code' | 'unsupported';
 export type ServerBackendId = 'zen' | 'go';
 export type ServerModelSource = ServerBackendId | 'vertex' | (string & {});
 
@@ -15,6 +16,7 @@ export interface ServerModelInfo {
   id: string;
   name: string;
   isFree: boolean;
+  freeStatus?: FreeStatus;
   brand: string;
   sourceBackend: ServerModelSource;
   modelFormat: ServerModelFormat;
@@ -43,6 +45,10 @@ export interface ServerModelInfo {
   providerLabel?: string;
   /** Provider id for filtering: `zen`, `go`, or a local OpenCode provider id. */
   providerId?: string;
+  /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
+  headers?: Record<string, string>;
+  /** OAuth provider identity data (e.g. Claude Code's cliUserID/accountUUID) needed to fingerprint requests. */
+  providerData?: Record<string, unknown>;
 }
 
 export interface ModelCatalog {
@@ -158,6 +164,30 @@ export function upstreamModelId(model: ServerModelInfo): string {
   const id = model.upstreamModelId ?? model.id;
   // Claude Code uses a [1m] suffix for 1M context with third-party APIs; Vertex ids omit it.
   return id.replace(/\[1m\]$/i, '');
+}
+
+export interface ModelCatalogRow {
+  name: string;
+  anthropicId: string;
+  openaiId: string;
+}
+
+/** Dedupe by (name, anthropicId, openaiId) — same model can appear twice in a provider's raw list. */
+export function buildDedupedModelRows(models: ServerModelInfo[], opts?: GatewayModelOptions): ModelCatalogRow[] {
+  const seen = new Set<string>();
+  const rows: ModelCatalogRow[] = [];
+  for (const model of [...models].sort((a, b) => a.name.localeCompare(b.name))) {
+    const row: ModelCatalogRow = {
+      name: model.name,
+      anthropicId: exposedGatewayAliasId(model, opts),
+      openaiId: model.id,
+    };
+    const key = `${row.name}\u0000${row.anthropicId}\u0000${row.openaiId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push(row);
+  }
+  return rows;
 }
 
 export function supportsDirectOpenAIChatCompletions(model: ServerModelInfo): boolean {
