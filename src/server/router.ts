@@ -29,6 +29,7 @@ import {
 import { writeSecureLogLine, resetTraceLog } from '../trace-log.js';
 import type { LanguageModel } from 'ai';
 import { createLanguageModel, isSdkMigratedNpm, maxToolsForNpm } from '../provider-factory.js';
+import { formatUpstreamError, upstreamHttpStatus } from '../codex/upstream-error.js';
 import {
   translateRequest as sdkTranslateRequest,
   streamAnthropicResponse,
@@ -267,10 +268,12 @@ async function handleAnthropicMessages(
         sendJson(res, 200, anthropicResponse);
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = formatUpstreamError(err);
       plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
-      if (!res.headersSent) sendJson(res, 502, { error: { message } });
-      else res.end();
+      if (!res.headersSent) {
+        const status = upstreamHttpStatus(err, message);
+        sendJson(res, status === 500 ? 502 : status, { error: { message } });
+      } else res.end();
     }
     return;
   }
@@ -337,10 +340,12 @@ async function handleOpenAIChatCompletions(
       sendJson(res, 200, response);
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = formatUpstreamError(err);
     plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
-    if (!res.headersSent) sendJson(res, 502, { error: { message } });
-    else res.end();
+    if (!res.headersSent) {
+      const status = upstreamHttpStatus(err, message);
+      sendJson(res, status === 500 ? 502 : status, { error: { message } });
+    } else res.end();
   }
 }
 

@@ -2,6 +2,7 @@
 import {
   BACKENDS,
   MAX_MODEL_CATALOG,
+  VERSION,
   addCustomEndpointProvider,
   addProviderFromTemplate,
   buildAntigravityAuthUrl,
@@ -63,7 +64,7 @@ import {
   summarizeServerProviders,
   validateCustomEndpointUrl,
   writeSecureLogLine
-} from "./chunk-2GUFTECU.js";
+} from "./chunk-PIIIU3YS.js";
 import {
   __toCommonJS,
   init_provider_templates,
@@ -1284,7 +1285,10 @@ function buildStaticCache() {
   try {
     for (const name of readdirSync(PUBLIC_DIR)) {
       const mime = MIME[ext(name)];
-      if (mime) cache.set(`/${name}`, { content: readFileSync(join2(PUBLIC_DIR, name)), mime });
+      if (!mime) continue;
+      const raw = readFileSync(join2(PUBLIC_DIR, name));
+      const content = name === "index.html" ? Buffer.from(raw.toString("utf8").replace("{{VERSION}}", VERSION)) : raw;
+      cache.set(`/${name}`, { content, mime });
     }
   } catch {
   }
@@ -1412,4 +1416,4 @@ export {
   resolveUiShutdownDecision,
   runUiCommand
 };
-//# sourceMappingURL=ui-command-64SLLWW4.js.map
+//# sourceMappingURL=ui-command-GL6WWFNU.js.map

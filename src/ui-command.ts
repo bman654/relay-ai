@@ -8,6 +8,7 @@ import * as p from '@clack/prompts';
 import { getAppHome } from './paths.js';
 import { handleUiApiRequest } from './ui/api.js';
 import { getUiDebugLogPath, makeTraceLogger } from './trace-log.js';
+import { VERSION } from './constants.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, 'ui', 'public');
@@ -32,7 +33,10 @@ function buildStaticCache(): Map<string, { content: Buffer; mime: string }> {
   try {
     for (const name of readdirSync(PUBLIC_DIR)) {
       const mime = MIME[ext(name)];
-      if (mime) cache.set(`/${name}`, { content: readFileSync(join(PUBLIC_DIR, name)), mime });
+      if (!mime) continue;
+      const raw = readFileSync(join(PUBLIC_DIR, name));
+      const content = name === 'index.html' ? Buffer.from(raw.toString('utf8').replace('{{VERSION}}', VERSION)) : raw;
+      cache.set(`/${name}`, { content, mime });
     }
   } catch {}
   return cache;

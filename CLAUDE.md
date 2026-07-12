@@ -19,6 +19,8 @@ git push --follow-tags                   # tag push triggers CI → npm publish 
 
 `package.json` is the single source of truth for the version. Never edit `src/constants.ts` manually for version bumps. `dist/` is committed, so rebuild it in the release commit.
 
+**Every version display must derive from `package.json`, never a hardcoded string.** `src/constants.ts::VERSION` reads `pkg.version`; `relay-ai ui`'s sidebar (`src/ui/public/index.html`'s `v{{VERSION}}` placeholder) is substituted at server-start by `buildStaticCache()` in `src/ui-command.ts` using that same `VERSION` constant. Both update automatically on `npm run build` — no manual edit needed. If you add a new version display anywhere (CLI banner, UI, docs generator), wire it to `VERSION`/`pkg.version` rather than hardcoding a string, or it will go stale on the next release (this happened once: the UI sidebar showed `v0.4.0` while `package.json` was already at `0.4.1`).
+
 ## Commands
 
 ```bash

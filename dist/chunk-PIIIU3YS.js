@@ -7287,10 +7287,12 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
         sendJson(res, 200, anthropicResponse);
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = formatUpstreamError(err);
       plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
-      if (!res.headersSent) sendJson(res, 502, { error: { message } });
-      else res.end();
+      if (!res.headersSent) {
+        const status = upstreamHttpStatus(err, message);
+        sendJson(res, status === 500 ? 502 : status, { error: { message } });
+      } else res.end();
     }
     return;
   }
@@ -7340,10 +7342,12 @@ async function handleOpenAIChatCompletions(req, res, options, modelCache, plog) 
       sendJson(res, 200, response);
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = formatUpstreamError(err);
     plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
-    if (!res.headersSent) sendJson(res, 502, { error: { message } });
-    else res.end();
+    if (!res.headersSent) {
+      const status = upstreamHttpStatus(err, message);
+      sendJson(res, status === 500 ? 502 : status, { error: { message } });
+    } else res.end();
   }
 }
 function lookupModel(res, catalog, modelId) {
@@ -10404,4 +10408,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-2GUFTECU.js.map
+//# sourceMappingURL=chunk-PIIIU3YS.js.map
