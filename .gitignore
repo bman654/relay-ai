@@ -1,6 +1,7 @@
 node_modules/
 docs/plans/
 *.js.map
+*.tgz
 .env
 .env.*
 .DS_Store
