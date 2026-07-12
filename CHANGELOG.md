@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.3] - 2026-07-11
+
+### Fixed
+
+- **Registry server errors now preserve the real upstream status and detail** — SDK-backed Anthropic and OpenAI routes no longer collapse provider errors into an opaque `502 Bad Gateway`, making authentication, rate-limit, and invalid-request failures actionable.
+- **The web UI version now stays synchronized with the CLI** — the sidebar version is derived from `package.json` at server startup instead of using a hardcoded value.
+- **README demo previews render reliably** — broken embedded video previews now use YouTube-hosted thumbnails.
+
+### Documentation
+
+- **Restored the complete project documentation set** — setup and reference guides for Claude Desktop, Codex, Gemini, providers, the API server, model compatibility, troubleshooting, and AI agents are tracked in the repository again.
+- **Package archives are excluded from source and npm packages** — generated `.tgz` files can no longer pollute the repository root or recursively include themselves in a release archive.
+
 ## [0.4.1] - 2026-07-11
 
 ### Fixed
