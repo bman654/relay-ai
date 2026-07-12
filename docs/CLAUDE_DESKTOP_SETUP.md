@@ -83,11 +83,15 @@ To use Claude in Chrome, [restore 1P mode](#restore-claude-desktop-to-anthropics
    relay-ai providers add   # if starting fresh
    relay-ai claude           # stores key in Keychain / credential store
    ```
-3. **Latest Claude Desktop** from [claude.com/download](https://claude.com/download). Older builds may not show the third-party inference UI.
-4. **About 16 GB of free disk space for Cowork plugins and connectors.** Claude Desktop downloads a separate Linux sandbox VM before the first marketplace, plugin, or connector operation. This download belongs to Claude Desktop and does not pass through the Relay AI gateway.
-5. *(Optional)* **OpenCode CLI** with providers configured. Whatever you've set up in OpenCode (Groq, Mistral, OpenAI, Gemini, Ollama, etc.) appears in the server catalog automatically.
-6. *(Optional)* **Favorites** via `relay-ai models` to cap the catalog at up to 20 models.
-7. *(Optional)* **Google Vertex** — configure in Claude Desktop (**Developer → third-party inference → Vertex**).
+3. **A supported Cowork device:**
+   - macOS 14 or later on Apple silicon or Intel x64, installed with the `.dmg` package.
+   - Windows 10 build 19041 or later on x64 or Arm64, installed with the `.msix` package. The legacy `.exe` installer does not include Cowork.
+   - Working hardware virtualization. Anthropic's [Cowork readiness check](https://claude.com/docs/third-party/claude-desktop/installation#check-device-readiness) verifies this and the platform requirements.
+4. **Latest Claude Desktop** from [claude.com/download](https://claude.com/download).
+5. **Network access to the required services.** Standard installations fetch the Cowork VM workspace and Claude CLI from `downloads.claude.ai`; Claude Desktop also needs access to your configured inference provider.
+6. *(Optional)* **OpenCode CLI** with providers configured. Whatever you've set up in OpenCode (Groq, Mistral, OpenAI, Gemini, Ollama, etc.) appears in the server catalog automatically.
+7. *(Optional)* **Favorites** via `relay-ai models` to cap the catalog at up to 20 models.
+8. *(Optional)* **Google Vertex** — configure in Claude Desktop (**Developer → third-party inference → Vertex**).
 
 ---
 
@@ -431,7 +435,7 @@ relay-ai providers import
 
 ### "Failed to add marketplace"
 
-Claude Desktop installs its Cowork Linux sandbox VM before it can add a marketplace, plugin, or connector. The VM requires about 16 GB of free disk space. If the diagnostic report shows `VMDownloadError`, `ENOSPC`, or `Insufficient disk space`, free at least 16 GB, restart Claude Desktop, and try again. Inference can continue working because it does not depend on this VM.
+Standard Claude Desktop installations fetch the Cowork VM workspace from `downloads.claude.ai` at session start. If the diagnostic report shows `VMDownloadError`, `ENOSPC`, or `Insufficient disk space`, free the amount reported there, restart Claude Desktop, and try again. One reported case required 16.1 GB, but Anthropic does not publish a fixed requirement. Inference can continue working because it does not depend on this VM.
 
 ### Generate a diagnostic report
 
