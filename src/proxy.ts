@@ -6,7 +6,12 @@ import { appendFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { readBody, extractApiKey, sendJson } from './http-utils.js';
 import { formatAnthropicModelEntry, formatAnthropicModelList } from './server/models.js';
 import { claudeCodeClientModelId, routeLookupIds, stripOneMContextSuffix } from './context-model-id.js';
-import { getProxyDebugLogPath, redactTraceLine, resetTraceLog } from './trace-log.js';
+import {
+  getProxyDebugLogPath,
+  redactTraceLine,
+  resetTraceLog,
+  writeInferenceResponseErrorLog,
+} from './trace-log.js';
 import { fetchWithOAuthRetry, relayAnthropicMessages, UpstreamUnreachableError } from './upstream-forward.js';
 import {
   CLAUDE_CODE_CLI_VERSION,
@@ -24,7 +29,12 @@ import {
   generateAnthropicResponse,
   silenceSdkWarnings,
 } from './sdk-adapter.js';
-import { anthropicErrorType, upstreamHttpStatus } from './codex/upstream-error.js';
+import {
+  anthropicErrorType,
+  formatUpstreamError,
+  sdkUpstreamErrorDetails,
+  upstreamHttpStatus,
+} from './codex/upstream-error.js';
 
 type ProxyLog = (message: string | (() => string)) => void;
 
@@ -130,6 +140,7 @@ export function startProxyCatalog(
   routes: ProxyRoute[],
   defaultAliasId: string,
   debug = false,
+  inferenceLogPath?: string,
 ): Promise<ProxyHandle> {
   const proxyToken = randomUUID();
   silenceSdkWarnings();
@@ -249,15 +260,24 @@ export function startProxyCatalog(
         }
 
         try {
-          await relayAnthropicMessages(
-            res, targetUrl, forwardBody, apiKey, clientWantsStream, effectiveBeta,
-            isOAuth ? 'oauth' : 'api',
-            message => plog(message),
+          await relayAnthropicMessages(res, targetUrl, forwardBody, apiKey, clientWantsStream, {
+            inboundBeta: effectiveBeta,
+            authType: isOAuth ? 'oauth' : 'api',
+            log: message => plog(message),
             claudeCodeSessionId,
-            route.headers,
-            route.refreshToken,
-            refreshed => { route.apiKey = refreshed; },
-          );
+            extraHeaders: route.headers,
+            refreshToken: route.refreshToken,
+            onTokenRefreshed: refreshed => { route.apiKey = refreshed; },
+            onUpstreamError: inferenceLogPath
+              ? (statusCode, errorContent) => writeInferenceResponseErrorLog(inferenceLogPath, {
+                  modelId: originalModel,
+                  provider: route.providerId ?? route.aliasId.split(':')[1] ?? 'unknown',
+                  route: 'passthrough',
+                  statusCode,
+                  errorContent,
+                })
+              : undefined,
+          });
         } catch (err) {
           const message = err instanceof UpstreamUnreachableError ? err.message : String(err);
           plog(() => `anthropic-passthrough error: ${message}`);
@@ -303,12 +323,18 @@ export function startProxyCatalog(
             onDebug: (msg: string) => plog(() => msg),
           });
           if (clientWantsStream) {
-            res.writeHead(200, {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive',
-            });
-            await streamAnthropicResponse(model, params, originalModel, (c) => res.write(c), plog);
+            const writeStreamChunk = (chunk: string) => {
+              if (!res.headersSent) {
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'Connection': 'keep-alive',
+                });
+              }
+              res.write(chunk);
+            };
+            await streamAnthropicResponse(model, params, originalModel, writeStreamChunk, plog);
+            if (!res.headersSent) writeStreamChunk('');
             res.end();
           } else {
             // ChatGPT's Codex backend (OpenAI OAuth) rejects non-streaming requests
@@ -320,16 +346,25 @@ export function startProxyCatalog(
             sendJson(res, 200, anthropicResponse);
           }
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          const body = err && typeof err === 'object' && 'responseBody' in err
-            ? (err as { responseBody?: string }).responseBody
-            : undefined;
-          plog(() => `sdk error: ${message}${body ? ` — body: ${body}` : ''}`);
+          const message = formatUpstreamError(err);
+          const details = sdkUpstreamErrorDetails(err);
+          const upstreamStatus = details?.statusCode ?? upstreamHttpStatus(err, message);
+          plog(() => `sdk error: ${message}${details?.errorContent ? ` — body: ${details.errorContent}` : ''}`);
+          if (inferenceLogPath && upstreamStatus >= 400) {
+            writeInferenceResponseErrorLog(inferenceLogPath, {
+              modelId: originalModel,
+              provider: route.providerId ?? route.aliasId.split(':')[1] ?? 'unknown',
+              route: 'translated',
+              statusCode: upstreamStatus,
+              errorContent: details?.errorContent ?? message,
+              isRetryable: details?.isRetryable,
+              attemptCount: details?.attemptCount,
+            });
+          }
           if (!res.headersSent) {
-            const status = upstreamHttpStatus(err, message);
-            anthropicError(res, status === 500 ? 502 : status, message);
+            anthropicError(res, upstreamStatus === 500 ? 502 : upstreamStatus, message);
           } else {
-            const errorType = anthropicErrorType(upstreamHttpStatus(err, message));
+            const errorType = anthropicErrorType(upstreamStatus);
             res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: errorType, message } })}\n\n`);
             res.end();
           }

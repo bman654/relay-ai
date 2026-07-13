@@ -384,22 +384,21 @@ describe('writeAnthropicStream', () => {
     });
   });
 
-  it('maps a mid-stream 401 to a non-retryable authentication_error instead of a generic api_error', async () => {
-    const { events } = await collect([
-      { type: 'start' },
-      { type: 'error', error: { statusCode: 401, message: 'Unauthorized' } },
-    ]);
-    const errorEvent = events.find(e => e.event === 'error')!;
-    expect(errorEvent.data.error).toEqual({ type: 'authentication_error', message: 'Unauthorized' });
+  it('propagates an AI SDK stream failure so the HTTP layer can preserve its status', async () => {
+    const upstreamError = { statusCode: 401, message: 'Unauthorized' };
+    async function* parts() {
+      yield { type: 'error', error: upstreamError };
+    }
+
+    await expect(writeAnthropicStream(parts() as any, 'm', () => {})).rejects.toBe(upstreamError);
   });
 
-  it('falls back to a generic api_error for an unrecognized upstream failure', async () => {
-    const { events } = await collect([
-      { type: 'start' },
-      { type: 'error', error: { message: 'Something went wrong' } },
-    ]);
-    const errorEvent = events.find(e => e.event === 'error')!;
-    expect(errorEvent.data.error).toEqual({ type: 'api_error', message: 'Something went wrong' });
+  it('wraps a string stream failure for the HTTP layer', async () => {
+    async function* parts() {
+      yield { type: 'error', error: 'Something went wrong' };
+    }
+
+    await expect(writeAnthropicStream(parts() as any, 'm', () => {})).rejects.toThrow('Something went wrong');
   });
 
   it('encodes thought_signature into the tool_use id and reports tool_use stop', async () => {
