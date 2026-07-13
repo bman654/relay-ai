@@ -277,11 +277,13 @@ Run relay-ai as a foreground API gateway on port **17645**:
 | **HTTP proxy** | `relay-ai server --http-proxy` | Claude Code's own Anthropic login + provider keys for favorites | Anthropic models plus favorite `relay:` models |
 | **Vertex gateway** | `relay-ai server --vertex` | gcloud Application Default Credentials | Claude on Vertex AI |
 
-All server modes append one privacy-minimal JSON record per inference request to `~/.relay-ai/logs/inference-requests.jsonl` (or the equivalent under `RELAY_AI_HOME`). Each record contains the timestamp, requested model id, known effort, provider, and whether the request was passed through or translated. Prompts, headers, credentials, and response bodies are never logged. The terminal and UI Server tab both show the exact path; watch it live with:
+All server modes append one privacy-minimal JSON record per inference request to `~/.relay-ai/logs/inference-requests.jsonl` (or the equivalent under `RELAY_AI_HOME`). Each record contains the timestamp, requested model id, known effort, provider, and whether the request was passed through or translated. By default, prompts, headers, credentials, and response bodies are never logged. The terminal and UI Server tab both show the exact path; watch it live with:
 
 ```bash
 tail -f ~/.relay-ai/logs/inference-requests.jsonl
 ```
+
+For temporary local debugging, set `RELAY_AI_LOG_REQUEST_PREVIEW=1` before starting the server. Each record then includes `requestPreview`, containing the role and up to 240 characters of text from the most recent message. Non-text blocks are represented only by their types; image data, tool inputs/results, headers, credentials, and response bodies remain excluded. Request text may contain sensitive information, so unset the variable and restart the server when debugging is complete.
 
 > **Claude Desktop (Cowork + Code):** For the automated macOS/Windows setup, use `relay-ai claude-app`. For manual or network setups, see [docs/CLAUDE_DESKTOP_SETUP.md](docs/CLAUDE_DESKTOP_SETUP.md).
 

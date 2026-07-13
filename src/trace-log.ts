@@ -68,25 +68,66 @@ export function getInferenceRequestLogPath(): string {
   return join(ensureLogsDir(), INFERENCE_REQUEST_LOG);
 }
 
+const REQUEST_PREVIEW_ENV = 'RELAY_AI_LOG_REQUEST_PREVIEW';
+const REQUEST_PREVIEW_MAX = 240;
+
+function compactLogValue(value: string, max = 500): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+export function getLatestMessagePreview(messages: unknown): string | undefined {
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  const message = messages[messages.length - 1];
+  if (!message || typeof message !== 'object') return undefined;
+
+  const record = message as Record<string, unknown>;
+  const role = typeof record.role === 'string' ? record.role : 'message';
+  const content = record.content;
+  let summary: string | undefined;
+
+  if (typeof content === 'string') {
+    summary = content;
+  } else if (Array.isArray(content)) {
+    const text = content
+      .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === 'object'))
+      .filter(block => block.type === 'text' && typeof block.text === 'string')
+      .map(block => block.text as string)
+      .join(' ');
+    if (text.trim()) {
+      summary = text;
+    } else {
+      const blockTypes = [...new Set(content
+        .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === 'object'))
+        .map(block => typeof block.type === 'string' ? block.type : 'unknown'))];
+      if (blockTypes.length > 0) summary = `[${blockTypes.join(', ')}]`;
+    }
+  }
+
+  const compact = summary ? compactLogValue(summary, REQUEST_PREVIEW_MAX) : '';
+  return compact ? `${role}: ${compact}` : undefined;
+}
+
 export interface InferenceRequestLogEntry {
   modelId: string;
   provider: string;
   effort?: string;
   route: 'passthrough' | 'translated';
+  requestPreview?: string;
 }
 
-/** Append privacy-minimal routing metadata. Prompts, headers, and response bodies are never logged. */
+/** Append privacy-minimal routing metadata, plus an explicitly enabled request preview. */
 export function writeInferenceRequestLog(
   path: string,
   entry: InferenceRequestLogEntry,
 ): void {
-  const compact = (value: string, max = 500) => value.replace(/[\r\n]/g, ' ').slice(0, max);
+  const includePreview = process.env[REQUEST_PREVIEW_ENV] === '1' && entry.requestPreview;
   writeSecureLogLine(path, JSON.stringify({
     timestamp: new Date().toISOString(),
-    modelId: compact(entry.modelId),
-    ...(entry.effort ? { effort: compact(entry.effort, 100) } : {}),
-    provider: compact(entry.provider, 200),
+    modelId: compactLogValue(entry.modelId),
+    ...(entry.effort ? { effort: compactLogValue(entry.effort, 100) } : {}),
+    provider: compactLogValue(entry.provider, 200),
     route: entry.route,
+    ...(includePreview ? { requestPreview: compactLogValue(entry.requestPreview!, REQUEST_PREVIEW_MAX + 20) } : {}),
   }));
 }
 

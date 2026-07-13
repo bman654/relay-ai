@@ -74,6 +74,8 @@ describe('selective HTTP proxy', () => {
   it('forwards first-party request bytes and auth unchanged', async () => {
     const certificates = ensureHttpProxyCertificates();
     const inferenceLogPath = join(testHome, 'anthropic-inference.jsonl');
+    const previousRequestPreview = process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+    process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = '1';
     let receivedBody = Buffer.alloc(0);
     let receivedAuth: string | undefined;
     let receivedPath: string | undefined;
@@ -99,7 +101,7 @@ describe('selective HTTP proxy', () => {
     });
 
     try {
-      const body = Buffer.from('{\n  "model" : "claude-sonnet-4-6",\n  "output_config":{"effort":"high"},\n  "messages":[]\n}\n');
+      const body = Buffer.from('{\n  "model" : "claude-sonnet-4-6",\n  "output_config":{"effort":"high"},\n  "messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"private-image-data"}},{"type":"text","text":"identify this Sonnet request"}]}]\n}\n');
       const secure = await connectMitm(proxy.port, certificates.caCert);
       let response = '';
       secure.on('data', chunk => { response += chunk.toString(); });
@@ -119,13 +121,18 @@ describe('selective HTTP proxy', () => {
       expect(receivedPath).toBe('/v1/messages?beta=true');
       expect(receivedAuth).toBe('Bearer subscription-oauth-token');
       expect(receivedBody.equals(body)).toBe(true);
-      expect(JSON.parse(readFileSync(inferenceLogPath, 'utf8').trim())).toMatchObject({
+      const inferenceLog = readFileSync(inferenceLogPath, 'utf8');
+      expect(JSON.parse(inferenceLog.trim())).toMatchObject({
         modelId: 'claude-sonnet-4-6',
         effort: 'high',
         provider: 'anthropic',
         route: 'passthrough',
+        requestPreview: 'user: identify this Sonnet request',
       });
+      expect(inferenceLog).not.toContain('private-image-data');
     } finally {
+      if (previousRequestPreview === undefined) delete process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+      else process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = previousRequestPreview;
       await proxy.close();
       await new Promise<void>(resolve => origin.close(() => resolve()));
     }

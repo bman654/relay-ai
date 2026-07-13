@@ -8,7 +8,7 @@ import { startProxyCatalog } from '../proxy.js';
 import { ensureHttpProxyCertificates } from './ca.js';
 import { routeLookupIds } from '../context-model-id.js';
 import { anthropicEffortFromRequest, type AnthropicRequest } from '../sdk-adapter.js';
-import { writeInferenceRequestLog } from '../trace-log.js';
+import { getLatestMessagePreview, writeInferenceRequestLog } from '../trace-log.js';
 
 const ANTHROPIC_HOST = 'api.anthropic.com';
 const MAX_BODY_BYTES = 50 * 1024 * 1024;
@@ -217,6 +217,7 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
           effort: parsed ? anthropicEffortFromRequest(parsed) : undefined,
           provider,
           route: route ? 'translated' : 'passthrough',
+          requestPreview: getLatestMessagePreview(parsed?.messages),
         });
       }
 

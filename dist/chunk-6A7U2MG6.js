@@ -3903,14 +3903,42 @@ function getUiDebugLogPath() {
 function getInferenceRequestLogPath() {
   return join8(ensureLogsDir(), INFERENCE_REQUEST_LOG);
 }
+var REQUEST_PREVIEW_ENV = "RELAY_AI_LOG_REQUEST_PREVIEW";
+var REQUEST_PREVIEW_MAX = 240;
+function compactLogValue(value, max = 500) {
+  return value.replace(/\s+/g, " ").trim().slice(0, max);
+}
+function getLatestMessagePreview(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return void 0;
+  const message = messages[messages.length - 1];
+  if (!message || typeof message !== "object") return void 0;
+  const record = message;
+  const role = typeof record.role === "string" ? record.role : "message";
+  const content = record.content;
+  let summary;
+  if (typeof content === "string") {
+    summary = content;
+  } else if (Array.isArray(content)) {
+    const text4 = content.filter((block) => Boolean(block && typeof block === "object")).filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text).join(" ");
+    if (text4.trim()) {
+      summary = text4;
+    } else {
+      const blockTypes = [...new Set(content.filter((block) => Boolean(block && typeof block === "object")).map((block) => typeof block.type === "string" ? block.type : "unknown"))];
+      if (blockTypes.length > 0) summary = `[${blockTypes.join(", ")}]`;
+    }
+  }
+  const compact = summary ? compactLogValue(summary, REQUEST_PREVIEW_MAX) : "";
+  return compact ? `${role}: ${compact}` : void 0;
+}
 function writeInferenceRequestLog(path, entry) {
-  const compact = (value, max = 500) => value.replace(/[\r\n]/g, " ").slice(0, max);
+  const includePreview = process.env[REQUEST_PREVIEW_ENV] === "1" && entry.requestPreview;
   writeSecureLogLine(path, JSON.stringify({
     timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-    modelId: compact(entry.modelId),
-    ...entry.effort ? { effort: compact(entry.effort, 100) } : {},
-    provider: compact(entry.provider, 200),
-    route: entry.route
+    modelId: compactLogValue(entry.modelId),
+    ...entry.effort ? { effort: compactLogValue(entry.effort, 100) } : {},
+    provider: compactLogValue(entry.provider, 200),
+    route: entry.route,
+    ...includePreview ? { requestPreview: compactLogValue(entry.requestPreview, REQUEST_PREVIEW_MAX + 20) } : {}
   }));
 }
 function makeTraceLogger(logPath) {
@@ -7288,7 +7316,8 @@ async function startHttpProxy(options) {
           modelId: typeof parsed?.model === "string" ? parsed.model : "unknown",
           effort: parsed ? anthropicEffortFromRequest(parsed) : void 0,
           provider,
-          route: route ? "translated" : "passthrough"
+          route: route ? "translated" : "passthrough",
+          requestPreview: getLatestMessagePreview(parsed?.messages)
         });
       }
       if (route && adapter) {
@@ -7822,7 +7851,8 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
       modelId: body.model,
       effort: anthropicEffortFromRequest(body) ?? model.defaultEffort,
       provider: inferenceProvider(model),
-      route: "passthrough"
+      route: "passthrough",
+      requestPreview: getLatestMessagePreview(body.messages)
     });
     let effectiveBeta = inboundBeta;
     let claudeCodeSessionId;
@@ -7863,7 +7893,8 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
       modelId: body.model,
       effort: anthropicEffortFromRequest(body) ?? model.defaultEffort,
       provider: inferenceProvider(model),
-      route: "translated"
+      route: "translated",
+      requestPreview: getLatestMessagePreview(body.messages)
     });
     const languageModel = await getOrInitLanguageModel(modelCache, model, model.npm, model.apiBaseUrl, apiKey, options.vertex);
     const npmMaxTools = maxToolsForNpm(model.npm);
@@ -7931,7 +7962,8 @@ async function handleOpenAIChatCompletions(req, res, options, modelCache, plog) 
       modelId: body.model,
       effort: openAiEffort(body),
       provider: inferenceProvider(model),
-      route: "passthrough"
+      route: "passthrough",
+      requestPreview: getLatestMessagePreview(body.messages)
     });
     await relayAnthropicMessages(res, completionsUrl, body, apiKey2, Boolean(body.stream));
     return;
@@ -7946,7 +7978,8 @@ async function handleOpenAIChatCompletions(req, res, options, modelCache, plog) 
     modelId: body.model,
     effort: openAiEffort(body),
     provider: inferenceProvider(model),
-    route: "translated"
+    route: "translated",
+    requestPreview: getLatestMessagePreview(body.messages)
   });
   const baseURL = model.modelFormat === "anthropic" ? model.baseUrl : model.apiBaseUrl;
   const languageModel = await getOrInitLanguageModel(modelCache, model, npm, baseURL, apiKey, options.vertex);
@@ -11055,4 +11088,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-EIBXQTAH.js.map
+//# sourceMappingURL=chunk-6A7U2MG6.js.map

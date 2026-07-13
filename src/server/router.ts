@@ -27,6 +27,7 @@ import {
   selectBetaFlags,
 } from '../oauth/claude-identity.js';
 import {
+  getLatestMessagePreview,
   writeInferenceRequestLog,
   writeSecureLogLine,
   resetTraceLog,
@@ -227,6 +228,7 @@ async function handleAnthropicMessages(
       effort: anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
       provider: inferenceProvider(model),
       route: 'passthrough',
+      requestPreview: getLatestMessagePreview(body.messages),
     });
 
     let effectiveBeta = inboundBeta;
@@ -267,6 +269,7 @@ async function handleAnthropicMessages(
       effort: anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
       provider: inferenceProvider(model),
       route: 'translated',
+      requestPreview: getLatestMessagePreview(body.messages),
     });
     const languageModel = await getOrInitLanguageModel(modelCache, model, model.npm!, model.apiBaseUrl, apiKey, options.vertex);
     const npmMaxTools = maxToolsForNpm(model.npm);
@@ -352,6 +355,7 @@ async function handleOpenAIChatCompletions(
       effort: openAiEffort(body),
       provider: inferenceProvider(model),
       route: 'passthrough',
+      requestPreview: getLatestMessagePreview(body.messages),
     });
     await relayAnthropicMessages(res, completionsUrl, body, apiKey, Boolean(body.stream));
     return;
@@ -370,6 +374,7 @@ async function handleOpenAIChatCompletions(
     effort: openAiEffort(body),
     provider: inferenceProvider(model),
     route: 'translated',
+    requestPreview: getLatestMessagePreview(body.messages),
   });
   const baseURL = model.modelFormat === 'anthropic' ? model.baseUrl : model.apiBaseUrl;
   const languageModel = await getOrInitLanguageModel(modelCache, model, npm, baseURL, apiKey, options.vertex);
