@@ -9,6 +9,8 @@ import {
   writeAnthropicStream,
   streamAnthropicResponse,
   supportsOpenAiPromptCacheBreakpoints,
+  extractClaudeSessionId,
+  claudeSessionPromptCacheKey,
 } from '../src/sdk-adapter.js';
 
 describe('supportsOpenAiPromptCacheBreakpoints', () => {
@@ -159,6 +161,38 @@ describe('translateRequest', () => {
     expect(params.instructions).toBeUndefined();
     expect(params.providerOptions?.openai?.instructions).toBe('You are a coding assistant.');
     expect(params.maxOutputTokens).toBeUndefined();
+  });
+
+  it('strips Claude Code Anthropic billing attribution from OpenAI OAuth instructions only', () => {
+    const body = {
+      model: 'gpt-5.6-terra',
+      system: [
+        {
+          text: 'x-anthropic-billing-header: cc_version=2.1.207.9bb; cc_entrypoint=cli; cch=24e85;',
+        },
+        { text: 'You are Claude Code.\nFollow the user instructions.' },
+      ],
+      messages: [{ role: 'user' as const, content: 'hello' }],
+    };
+
+    const oauth = translateRequest(body, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(oauth.providerOptions?.openai?.instructions)
+      .toBe('You are Claude Code.\nFollow the user instructions.');
+
+    const changedAttribution = translateRequest({
+      ...body,
+      system: [
+        { text: 'x-anthropic-billing-header: cc_version=2.1.207.9bb; cc_entrypoint=cli; cch=cb57d;' },
+        body.system[1]!,
+      ],
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(changedAttribution.providerOptions?.openai?.instructions)
+      .toBe(oauth.providerOptions?.openai?.instructions);
+    expect(changedAttribution.providerOptions?.openai?.promptCacheKey)
+      .toBe(oauth.providerOptions?.openai?.promptCacheKey);
+
+    const publicApi = translateRequest({ ...body, model: 'gpt-5.5' }, '@ai-sdk/openai');
+    expect(publicApi.instructions).toContain('x-anthropic-billing-header:');
   });
 
   it('maps output_config.effort to Google thinking budget without dropping includeThoughts', () => {
@@ -726,16 +760,35 @@ describe('translateRequest openai promptCacheKey', () => {
     expect(keyOf(withReminder('10:00:01'))).toBe(keyOf(withReminder('10:05:42')));
   });
 
-  it('omits cache controls on the ChatGPT/Codex OAuth path after the compatibility probe', () => {
+  it('sends a session-derived key but omits risky cache options on ChatGPT/Codex OAuth', () => {
+    const sessionId = '11111111-1111-4111-8111-111111111111';
     const params = translateRequest({
       ...req(),
       model: 'gpt-5.6-sol',
+      metadata: { user_id: JSON.stringify({ session_id: sessionId, device_id: 'private' }) },
     }, '@ai-sdk/openai', {
       openAiOAuth: true,
       reasoningMetadata: { upstreamModelId: 'gpt-5.6-sol' },
     });
-    expect(params.providerOptions?.openai?.promptCacheKey).toBeUndefined();
+    expect(params.providerOptions?.openai?.promptCacheKey).toBe(claudeSessionPromptCacheKey(sessionId));
     expect(params.providerOptions?.openai?.promptCacheOptions).toBeUndefined();
+  });
+
+  it('uses the body session before the header and falls back safely on malformed metadata', () => {
+    const bodySession = '11111111-1111-4111-8111-111111111111';
+    const headerSession = '22222222-2222-4222-8222-222222222222';
+    expect(extractClaudeSessionId({
+      metadata: { user_id: JSON.stringify({ session_id: bodySession }) },
+    }, headerSession)).toBe(bodySession);
+    expect(extractClaudeSessionId({ metadata: { user_id: '{bad json' } }, headerSession)).toBe(headerSession);
+    expect(extractClaudeSessionId({ metadata: { user_id: JSON.stringify({ session_id: 'not-a-uuid' }) } })).toBeUndefined();
+  });
+
+  it('keeps a Claude session key stable across system/tool changes', () => {
+    const sessionId = '11111111-1111-4111-8111-111111111111';
+    const options = { openAiOAuth: true, claudeSessionId: sessionId };
+    expect(keyOf(req({ system: 'first' }), '@ai-sdk/openai', options))
+      .toBe(keyOf(req({ system: 'second', tools: [] }), '@ai-sdk/openai', options));
   });
 
   it('omits the key for non-OpenAI providers', () => {

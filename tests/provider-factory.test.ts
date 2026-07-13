@@ -216,6 +216,7 @@ describe('createLanguageModel', () => {
     expect(createOpenAI).toHaveBeenCalledWith({
       apiKey: accessToken,
       baseURL: 'https://chatgpt.com/backend-api/codex',
+      fetch: expect.any(Function),
       headers: {
         'ChatGPT-Account-Id': 'stored-acct-456',
         originator: 'relay-ai',

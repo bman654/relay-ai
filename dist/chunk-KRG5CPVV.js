@@ -321,8 +321,42 @@ async function runOpenAiDeviceCodeFlow(onDeviceCode, opts) {
 }
 
 // src/oauth/responses-websocket.ts
+import { createHash } from "crypto";
 var RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite";
 var TERMINAL_EVENT_TYPES = /* @__PURE__ */ new Set(["response.completed", "response.failed", "response.incomplete"]);
+var FAILURE_EVENT_TYPES = /* @__PURE__ */ new Set(["error", "response.failed", "response.incomplete"]);
+var RESPONSES_WS_HARD_TTL_MS = 55 * 6e4;
+var RESPONSES_WS_IDLE_TTL_MS = 30 * 6e4;
+var RESPONSES_WS_MAX_CONNECTIONS = 32;
+var connections = /* @__PURE__ */ new Map();
+var nextConnectionDebugId = 1;
+function connectionEntries(key) {
+  return key ? [...connections.get(key) ?? []] : [...connections.values()].flatMap((entries) => [...entries]);
+}
+function connectionCount() {
+  let count = 0;
+  for (const entries of connections.values()) count += entries.size;
+  return count;
+}
+function registerEntry(entry) {
+  if (!entry.key) return;
+  let entries = connections.get(entry.key);
+  if (!entries) {
+    entries = /* @__PURE__ */ new Set();
+    connections.set(entry.key, entries);
+  }
+  entries.add(entry);
+}
+function unregisterEntry(entry) {
+  if (!entry.key) return;
+  const entries = connections.get(entry.key);
+  if (!entries) return;
+  entries.delete(entry);
+  if (entries.size === 0) connections.delete(entry.key);
+}
+function debugKey(key) {
+  return key ? key.slice(0, 12) : "none";
+}
 function toHeaderRecord(headers) {
   const out = {};
   if (!headers) return out;
@@ -339,7 +373,7 @@ function toHeaderRecord(headers) {
 }
 function hasResponsesLiteHeader(headers) {
   return Object.entries(headers).some(
-    ([k, v]) => k.toLowerCase() === RESPONSES_LITE_HEADER && v.toLowerCase() === "true"
+    ([key, value]) => key.toLowerCase() === RESPONSES_LITE_HEADER && value.toLowerCase() === "true"
   );
 }
 function bodyToString(body) {
@@ -352,120 +386,546 @@ function bodyToString(body) {
 function applyResponsesLiteShape(payload) {
   const reasoning = payload.reasoning && typeof payload.reasoning === "object" ? { ...payload.reasoning } : {};
   reasoning.context = "all_turns";
-  return {
-    ...payload,
-    reasoning,
-    parallel_tool_calls: false,
-    store: false
-  };
+  return { ...payload, reasoning, parallel_tool_calls: false, store: false };
 }
-function createResponsesWebSocketFetch(wsUrl, log8) {
-  const debug = (msg) => {
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const key of Object.keys(value).sort()) {
+    const child = value[key];
+    if (child !== void 0) out[key] = canonicalize(child);
+  }
+  return out;
+}
+function canonicalJson(value) {
+  return JSON.stringify(canonicalize(value));
+}
+function responsesWebSocketPromptFingerprint(payload) {
+  const stable = { ...payload };
+  delete stable.input;
+  delete stable.previous_response_id;
+  delete stable.stream;
+  delete stable.background;
+  return createHash("sha256").update(canonicalJson(stable)).digest("hex");
+}
+function responsesWebSocketPromptFieldHashes(payload) {
+  const hashes = {};
+  for (const key of Object.keys(payload).sort()) {
+    if (key === "input" || key === "previous_response_id" || key === "stream" || key === "background") continue;
+    hashes[key] = createHash("sha256").update(canonicalJson(payload[key])).digest("hex").slice(0, 12);
+  }
+  return hashes;
+}
+function changedPromptFields(previous, current) {
+  if (!previous) return [];
+  return [.../* @__PURE__ */ new Set([...Object.keys(previous), ...Object.keys(current)])].filter((key) => previous[key] !== current[key]).sort();
+}
+function instructionsFromPayload(payload) {
+  return typeof payload.instructions === "string" ? payload.instructions : void 0;
+}
+function instructionChangeSummary(previous, current) {
+  if (previous === void 0 || current === void 0 || previous === current) return void 0;
+  const comparable = Math.min(previous.length, current.length);
+  let prefix = 0;
+  while (prefix < comparable && previous[prefix] === current[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < comparable - prefix && previous[previous.length - 1 - suffix] === current[current.length - 1 - suffix]) suffix += 1;
+  const firstDiffLine = previous.slice(0, prefix).split("\n").length;
+  return `instructions changed: previous_chars=${previous.length} current_chars=${current.length} common_prefix_chars=${prefix} common_suffix_chars=${suffix} first_diff_line=${firstDiffLine}`;
+}
+function responsesWebSocketPartitionKey(wsUrl, payload, options = {}) {
+  const promptCacheKey = payload.prompt_cache_key;
+  const model = payload.model;
+  if (typeof promptCacheKey !== "string" || !promptCacheKey || typeof model !== "string" || !model) return void 0;
+  const reasoning = payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : void 0;
+  const effort = typeof reasoning?.effort === "string" ? reasoning.effort.trim().toLowerCase() : "";
+  const material = [
+    wsUrl,
+    options.providerId ?? "openai",
+    options.accountId ?? "",
+    model,
+    effort,
+    promptCacheKey
+  ].join("");
+  return createHash("sha256").update(material).digest("hex");
+}
+function inputArray(payload) {
+  return Array.isArray(payload.input) ? payload.input : [];
+}
+function normalizeToolCallJson(value) {
+  if (Array.isArray(value)) return value.map(normalizeToolCallJson);
+  if (!value || typeof value !== "object") return value;
+  const record = value;
+  const out = {};
+  for (const [key, child] of Object.entries(record)) out[key] = normalizeToolCallJson(child);
+  const jsonField = record.type === "function_call" ? "arguments" : record.type === "custom_tool_call" ? "input" : void 0;
+  if (jsonField && typeof record[jsonField] === "string") {
     try {
-      log8?.(`ws: ${msg}`);
+      out[jsonField] = canonicalJson(JSON.parse(record[jsonField]));
     } catch {
     }
+  }
+  return out;
+}
+function arraysEqual(left, right) {
+  return canonicalJson(normalizeToolCallJson(left)) === canonicalJson(normalizeToolCallJson(right));
+}
+function conversationItemKind(value) {
+  if (!value || typeof value !== "object") return typeof value;
+  const record = value;
+  if (typeof record.type === "string") return record.type;
+  if (typeof record.role === "string") return record.role;
+  return "object";
+}
+function continuationMismatchSummary(entry, payload) {
+  const full = inputArray(payload);
+  const prefix = [...entry.requestInput ?? [], ...entry.expectedAssistant ?? []];
+  const comparable = Math.min(full.length, prefix.length);
+  let mismatch = comparable;
+  for (let index = 0; index < comparable; index += 1) {
+    if (!arraysEqual([full[index]], [prefix[index]])) {
+      mismatch = index;
+      break;
+    }
+  }
+  const expected = mismatch < prefix.length ? conversationItemKind(prefix[mismatch]) : "none";
+  const actual = mismatch < full.length ? conversationItemKind(full[mismatch]) : "none";
+  return `full_items=${full.length} expected_prefix_items=${prefix.length} first_mismatch=${mismatch} expected=${expected} actual=${actual}`;
+}
+function continuationDelta(entry, payload) {
+  if (!entry.responseId || !entry.requestInput || !entry.expectedAssistant) return void 0;
+  const full = inputArray(payload);
+  const prefix = [...entry.requestInput, ...entry.expectedAssistant];
+  if (full.length <= prefix.length || !arraysEqual(full.slice(0, prefix.length), prefix)) return void 0;
+  return full.slice(prefix.length);
+}
+function eventType(event) {
+  return event && typeof event === "object" && typeof event.type === "string" ? event.type : void 0;
+}
+function responseErrorCode(event) {
+  if (!event || typeof event !== "object") return void 0;
+  const record = event;
+  if (typeof record.code === "string") return record.code;
+  const error = record.error && typeof record.error === "object" ? record.error : void 0;
+  if (typeof error?.code === "string") return error.code;
+  const response = record.response && typeof record.response === "object" ? record.response : void 0;
+  const responseError = response?.error && typeof response.error === "object" ? response.error : void 0;
+  return typeof responseError?.code === "string" ? responseError.code : void 0;
+}
+function responseIdFromEvent(event) {
+  if (!event || typeof event !== "object") return void 0;
+  const response = event.response;
+  if (!response || typeof response !== "object") return void 0;
+  return typeof response.id === "string" ? response.id : void 0;
+}
+function responseUsageDebug(event) {
+  if (!event || typeof event !== "object") return void 0;
+  const response = event.response;
+  if (!response || typeof response !== "object") return void 0;
+  const usage = response.usage;
+  if (!usage || typeof usage !== "object") return void 0;
+  const usageRecord = usage;
+  const details = usageRecord.input_tokens_details && typeof usageRecord.input_tokens_details === "object" ? usageRecord.input_tokens_details : {};
+  const number = (value) => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  return `usage input_tokens=${number(usageRecord.input_tokens)} cached_tokens=${number(details.cached_tokens)} cache_write_tokens=${number(details.cache_write_tokens ?? usageRecord.cache_write_tokens)} output_tokens=${number(usageRecord.output_tokens)}`;
+}
+function outputAccumulator(ctx, index) {
+  let accumulator = ctx.outputByIndex.get(index);
+  if (!accumulator) {
+    accumulator = { text: "", summaries: /* @__PURE__ */ new Map() };
+    ctx.outputByIndex.set(index, accumulator);
+  }
+  return accumulator;
+}
+function captureOutput(ctx, event) {
+  if (!event || typeof event !== "object") return;
+  const record = event;
+  const type = eventType(event);
+  if (type === "response.created") {
+    ctx.responseId = responseIdFromEvent(event) ?? ctx.responseId;
+    return;
+  }
+  if (type === "response.output_item.added" && typeof record.output_index === "number") {
+    const item = record.item && typeof record.item === "object" ? record.item : {};
+    const accumulator = outputAccumulator(ctx, record.output_index);
+    accumulator.type = typeof item.type === "string" ? item.type : accumulator.type;
+    accumulator.itemId = typeof item.id === "string" ? item.id : accumulator.itemId;
+    if (accumulator.itemId) ctx.outputIndexByItemId.set(accumulator.itemId, record.output_index);
+    return;
+  }
+  if (type === "response.output_text.delta" && typeof record.item_id === "string") {
+    const index = ctx.outputIndexByItemId.get(record.item_id);
+    if (index !== void 0 && typeof record.delta === "string") outputAccumulator(ctx, index).text += record.delta;
+    return;
+  }
+  if (type === "response.reasoning_summary_text.delta" && typeof record.item_id === "string") {
+    const index = ctx.outputIndexByItemId.get(record.item_id);
+    if (index !== void 0 && typeof record.delta === "string") {
+      const accumulator = outputAccumulator(ctx, index);
+      const summaryIndex = typeof record.summary_index === "number" ? record.summary_index : 0;
+      accumulator.summaries.set(summaryIndex, (accumulator.summaries.get(summaryIndex) ?? "") + record.delta);
+    }
+    return;
+  }
+  if (type === "response.output_item.done" && typeof record.output_index === "number") {
+    const item = record.item && typeof record.item === "object" ? record.item : {};
+    const accumulator = outputAccumulator(ctx, record.output_index);
+    accumulator.type = typeof item.type === "string" ? item.type : accumulator.type;
+    accumulator.done = item;
+    return;
+  }
+  if (TERMINAL_EVENT_TYPES.has(type ?? "")) {
+    ctx.responseId = responseIdFromEvent(event) ?? ctx.responseId;
+    const response = record.response && typeof record.response === "object" ? record.response : void 0;
+    if (Array.isArray(response?.output) && ctx.outputByIndex.size === 0) {
+      response.output.forEach((item, index) => {
+        if (item && typeof item === "object") {
+          outputAccumulator(ctx, index).done = item;
+          outputAccumulator(ctx, index).type = typeof item.type === "string" ? item.type : void 0;
+        }
+      });
+    }
+  }
+}
+function withoutEphemeralFields(item) {
+  const out = { ...item };
+  delete out.id;
+  delete out.status;
+  delete out.phase;
+  delete out.role;
+  for (const [key, value] of Object.entries(out)) {
+    if (value == null) delete out[key];
+  }
+  return out;
+}
+function expectedAssistantItems(ctx) {
+  const output = [];
+  for (const [, accumulator] of [...ctx.outputByIndex.entries()].sort(([left], [right]) => left - right)) {
+    const done = accumulator.done ?? {};
+    const type = accumulator.type ?? (typeof done.type === "string" ? done.type : void 0);
+    if (type === "message") {
+      const doneContent = Array.isArray(done.content) ? done.content : void 0;
+      const text4 = accumulator.text || (doneContent ? doneContent.filter((part) => part && typeof part === "object" && part.type === "output_text").map((part) => String(part.text ?? "")).join("") : "");
+      output.push({ role: "assistant", content: [{ type: "output_text", text: text4 }] });
+      continue;
+    }
+    if (type === "reasoning") {
+      const summary = accumulator.summaries.size ? [...accumulator.summaries.entries()].sort(([a], [b]) => a - b).map(([, text4]) => ({ type: "summary_text", text: text4 })) : Array.isArray(done.summary) ? done.summary : [];
+      output.push({ ...withoutEphemeralFields(done), type: "reasoning", summary });
+      continue;
+    }
+    if (type === "function_call" || type === "custom_tool_call") {
+      output.push({ ...withoutEphemeralFields(done), type });
+    }
+  }
+  return output;
+}
+function encodeSse(ctx, event) {
+  if (ctx.closed) return;
+  ctx.controller.enqueue(ctx.encoder.encode(`data: ${JSON.stringify(event)}
+
+`));
+}
+function flushPending(ctx) {
+  for (const event of ctx.pendingEvents) encodeSse(ctx, event);
+  ctx.pendingEvents = [];
+}
+function closeContext(ctx) {
+  if (ctx.closed) return;
+  ctx.closed = true;
+  ctx.abortCleanup?.();
+  try {
+    ctx.controller.close();
+  } catch {
+  }
+}
+function deleteEntry(entry, closeSocket = true) {
+  entry.inFlight = false;
+  entry.current = void 0;
+  unregisterEntry(entry);
+  if (closeSocket) {
+    try {
+      entry.socket.close();
+    } catch {
+    }
+  }
+}
+function failContext(entry, ctx, message) {
+  if (ctx.closed || entry.current !== ctx) return;
+  entry.debug(`fail: ${message}`);
+  flushPending(ctx);
+  encodeSse(ctx, { type: "error", error: { message } });
+  deleteEntry(entry);
+  closeContext(ctx);
+}
+function cleanupConnections(now, maxConnections) {
+  for (const entry of connectionEntries()) {
+    if (entry.inFlight) continue;
+    if (now - entry.createdAt >= entry.options.hardTtlMs || now - entry.lastUsedAt >= entry.options.idleTtlMs) {
+      entry.debug("evicting expired idle connection");
+      deleteEntry(entry);
+    }
+  }
+  const idle = connectionEntries().filter((entry) => !entry.inFlight).sort((left, right) => left.lastUsedAt - right.lastUsedAt);
+  while (connectionCount() >= maxConnections && idle.length) {
+    const oldest = idle.shift();
+    if (oldest) deleteEntry(oldest);
+  }
+}
+function isModelDataEvent(type) {
+  return Boolean(type && (type.includes(".delta") || type === "response.output_item.added" || type === "response.output_item.done"));
+}
+function outgoingPayload(payload) {
+  return JSON.stringify({ type: "response.create", ...payload });
+}
+function sendContext(entry, ctx) {
+  const outgoing = outgoingPayload(ctx.sendPayload);
+  entry.debug(
+    `connection=${entry.debugId} key=${debugKey(entry.key)} sending ${outgoing.length}B payload` + (ctx.continued ? " (continuation)" : "")
+  );
+  entry.socket.send(outgoing);
+}
+function dispatchContext(entry, ctx) {
+  entry.inFlight = true;
+  entry.current = ctx;
+  entry.lastUsedAt = entry.options.now();
+  ctx.entry = entry;
+  if (entry.open) sendContext(entry, ctx);
+}
+function resetContextForRetry(ctx) {
+  ctx.continued = false;
+  ctx.sendPayload = ctx.originalPayload;
+  ctx.pendingEvents = [];
+  ctx.emittedModelData = false;
+  ctx.responseId = void 0;
+  ctx.outputByIndex.clear();
+  ctx.outputIndexByItemId.clear();
+}
+function handleSocketMessage(entry, data) {
+  const ctx = entry.current;
+  if (!ctx || ctx.closed) return;
+  const text4 = Array.isArray(data) ? Buffer.concat(data).toString("utf8") : data.toString("utf8");
+  ctx.frameCount += 1;
+  let event;
+  try {
+    event = JSON.parse(text4);
+  } catch {
+    ctx.pendingEvents.push(text4.replace(/\r?\n/g, " "));
+    flushPending(ctx);
+    return;
+  }
+  const type = eventType(event);
+  captureOutput(ctx, event);
+  if (type === "response.completed") {
+    const usage = responseUsageDebug(event);
+    if (usage) entry.debug(usage);
+  }
+  if (isModelDataEvent(type)) ctx.emittedModelData = true;
+  const previousMissing = responseErrorCode(event) === "previous_response_not_found";
+  if (previousMissing && ctx.continued && !ctx.retried && !ctx.emittedModelData) {
+    ctx.retried = true;
+    entry.debug("previous response unavailable; retrying once with full context");
+    deleteEntry(entry);
+    resetContextForRetry(ctx);
+    const replacement = ctx.createReplacement();
+    dispatchContext(replacement, ctx);
+    return;
+  }
+  ctx.pendingEvents.push(event);
+  if (isModelDataEvent(type)) flushPending(ctx);
+  if (TERMINAL_EVENT_TYPES.has(type ?? "") || type === "error") {
+    flushPending(ctx);
+    const failed = FAILURE_EVENT_TYPES.has(type ?? "");
+    if (!failed && ctx.responseId && entry.persistent) {
+      entry.responseId = ctx.responseId;
+      entry.requestInput = inputArray(ctx.originalPayload);
+      entry.expectedAssistant = expectedAssistantItems(ctx);
+      entry.promptFieldHashes = ctx.promptFieldHashes;
+      entry.instructionsSnapshot = ctx.instructionsSnapshot;
+      entry.lastUsedAt = entry.options.now();
+      entry.inFlight = false;
+      entry.current = void 0;
+      entry.debug(`chain head updated; socket retained (${ctx.frameCount} frame(s))`);
+    } else {
+      deleteEntry(entry);
+    }
+    if (!entry.persistent) {
+      try {
+        entry.socket.close();
+      } catch {
+      }
+    }
+    closeContext(ctx);
+  }
+}
+function createConnection(WebSocket, wsUrl, headers, persistent, key, options, debug) {
+  const now = options.now();
+  const socket = new WebSocket(wsUrl, { headers });
+  const entry = {
+    debugId: nextConnectionDebugId++,
+    key: persistent ? key : void 0,
+    socket,
+    persistent,
+    open: false,
+    createdAt: now,
+    lastUsedAt: now,
+    inFlight: false,
+    options,
+    debug
+  };
+  if (persistent && key) registerEntry(entry);
+  debug(
+    `connection=${entry.debugId} key=${debugKey(entry.key)} created persistent=${persistent}`
+  );
+  socket.on("open", () => {
+    entry.open = true;
+    debug(`connection=${entry.debugId} opened`);
+    socket._socket?.unref?.();
+    const ctx = entry.current;
+    if (ctx && !ctx.closed) sendContext(entry, ctx);
+  });
+  socket.on("unexpected-response", (_request, response) => {
+    debug(`unexpected-response status=${response.statusCode}`);
+  });
+  socket.on("message", (data) => handleSocketMessage(entry, data));
+  socket.on("error", (error) => {
+    const ctx = entry.current;
+    if (ctx) failContext(entry, ctx, error.message);
+    else deleteEntry(entry);
+  });
+  socket.on("close", (code, reason) => {
+    entry.open = false;
+    const ctx = entry.current;
+    debug(`connection=${entry.debugId} closed code=${code} in_flight=${Boolean(ctx && !ctx.closed)}`);
+    if (ctx && !ctx.closed) {
+      const suffix = reason?.length ? `: ${reason.toString("utf8")}` : "";
+      failContext(entry, ctx, `WebSocket closed (${code})${suffix}`);
+    } else {
+      deleteEntry(entry, false);
+    }
+  });
+  return entry;
+}
+function createResponsesWebSocketFetch(wsUrl, log8, options = {}) {
+  const debug = (message) => {
+    try {
+      log8?.(`ws: ${message}`);
+    } catch {
+    }
+  };
+  const resolvedOptions = {
+    hardTtlMs: options.hardTtlMs ?? RESPONSES_WS_HARD_TTL_MS,
+    idleTtlMs: options.idleTtlMs ?? RESPONSES_WS_IDLE_TTL_MS,
+    maxConnections: options.maxConnections ?? RESPONSES_WS_MAX_CONNECTIONS,
+    now: options.now ?? Date.now
   };
   return async (_input, init) => {
     const { WebSocket } = await import("ws");
     const headers = toHeaderRecord(init?.headers);
     headers["OpenAI-Beta"] = CODEX_RESPONSES_WEBSOCKETS_BETA;
-    debug(`connecting ${wsUrl} headers=[${Object.keys(headers).join(", ")}]`);
-    let payload = {};
+    let payload;
     try {
       payload = JSON.parse(bodyToString(init?.body));
     } catch {
       payload = {};
     }
-    if (hasResponsesLiteHeader(headers)) {
-      payload = applyResponsesLiteShape(payload);
+    if (hasResponsesLiteHeader(headers)) payload = applyResponsesLiteShape(payload);
+    const partitionKey = responsesWebSocketPartitionKey(wsUrl, payload, options);
+    const promptFingerprint = responsesWebSocketPromptFingerprint(payload);
+    const promptFieldHashes = responsesWebSocketPromptFieldHashes(payload);
+    const instructionsSnapshot = instructionsFromPayload(payload);
+    const now = resolvedOptions.now();
+    cleanupConnections(now, resolvedOptions.maxConnections);
+    const candidates = partitionKey ? connectionEntries(partitionKey) : [];
+    const idleCandidates = candidates.filter((entry) => !entry.inFlight);
+    const matches = idleCandidates.map((entry) => ({ entry, delta: continuationDelta(entry, payload) })).filter((match) => match.delta !== void 0).sort((left, right) => left.delta.length - right.delta.length);
+    let selected = matches[0]?.entry;
+    const selectedDelta = matches[0]?.delta;
+    const diagnosticEntry = selected ?? [...idleCandidates].sort((left, right) => right.lastUsedAt - left.lastUsedAt)[0] ?? candidates[0];
+    debug(
+      `lookup key=${debugKey(partitionKey)} prompt=${debugKey(promptFingerprint)} hit=${candidates.length > 0} heads=${candidates.length} active_connections=${connectionCount()}`
+    );
+    const promptChanges = changedPromptFields(diagnosticEntry?.promptFieldHashes, promptFieldHashes);
+    if (promptChanges.length) debug(`prompt fields changed: ${promptChanges.join(",")}`);
+    if (promptChanges.includes("instructions")) {
+      const summary = instructionChangeSummary(diagnosticEntry?.instructionsSnapshot, instructionsSnapshot);
+      if (summary) debug(summary);
     }
-    const outgoing = JSON.stringify({ type: "response.create", ...payload });
-    const encoder = new TextEncoder();
-    let socket;
-    let frameCount = 0;
+    let sendPayload = payload;
+    let continued = false;
+    let persistent = Boolean(partitionKey);
+    if (selected && selectedDelta) {
+      sendPayload = { ...payload, input: selectedDelta, previous_response_id: selected.responseId };
+      continued = true;
+      debug(`continuing chain with ${selectedDelta.length} incremental input item(s)`);
+    } else if (candidates.some((entry) => entry.inFlight)) {
+      selected = void 0;
+      persistent = false;
+      debug("parallel request using an isolated socket");
+    } else if (diagnosticEntry) {
+      debug(
+        `history mismatch starting an additional chain; retained ${candidates.length} existing head(s) (${continuationMismatchSummary(diagnosticEntry, payload)})`
+      );
+    }
+    let activeContext;
     const stream = new ReadableStream({
       start(controller) {
-        let closed = false;
-        const close = () => {
-          if (closed) return;
-          closed = true;
-          try {
-            controller.close();
-          } catch {
-          }
-          try {
-            socket.close();
-          } catch {
-          }
+        const ctx = {
+          controller,
+          encoder: new TextEncoder(),
+          originalPayload: payload,
+          sendPayload,
+          promptFieldHashes,
+          instructionsSnapshot,
+          continued,
+          retried: false,
+          closed: false,
+          frameCount: 0,
+          pendingEvents: [],
+          emittedModelData: false,
+          outputByIndex: /* @__PURE__ */ new Map(),
+          outputIndexByItemId: /* @__PURE__ */ new Map(),
+          createReplacement: () => createConnection(
+            WebSocket,
+            wsUrl,
+            headers,
+            Boolean(partitionKey),
+            partitionKey,
+            resolvedOptions,
+            debug
+          )
         };
-        const fail = (message) => {
-          if (closed) return;
-          debug(`fail: ${message}`);
-          try {
-            controller.enqueue(encoder.encode(
-              `data: ${JSON.stringify({ type: "error", error: { message } })}
-
-`
-            ));
-          } catch {
-          }
-          close();
-        };
-        socket = new WebSocket(wsUrl, { headers });
-        socket.on("open", () => {
-          debug(`open \u2014 sending ${outgoing.length}B payload`);
-          socket.send(outgoing);
-        });
-        socket.on("unexpected-response", (_req, res) => {
-          debug(`unexpected-response status=${res.statusCode}`);
-        });
-        socket.on("message", (data) => {
-          const text4 = Array.isArray(data) ? Buffer.concat(data).toString("utf8") : data.toString("utf8");
-          frameCount += 1;
-          if (frameCount <= 3) debug(`frame#${frameCount}: ${text4.slice(0, 200)}`);
-          let event;
-          try {
-            event = JSON.parse(text4);
-          } catch {
-            controller.enqueue(encoder.encode(`data: ${text4.replace(/\r?\n/g, " ")}
-
-`));
-            return;
-          }
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}
-
-`));
-          const type = event.type;
-          if (typeof type === "string" && TERMINAL_EVENT_TYPES.has(type)) {
-            debug(`terminal event: ${type} (after ${frameCount} frames)`);
-            close();
-          }
-        });
-        socket.on("error", (err) => fail(err.message));
-        socket.on("close", (code, reason) => {
-          debug(`close code=${code} frames=${frameCount}${reason?.length ? ` reason=${reason.toString("utf8").slice(0, 200)}` : ""}`);
-          if (closed) return;
-          if (code === 1e3 || code === 1005) {
-            close();
-            return;
-          }
-          fail(`WebSocket closed (${code})${reason?.length ? `: ${reason.toString("utf8")}` : ""}`);
-        });
+        activeContext = ctx;
+        const entry = selected ?? createConnection(
+          WebSocket,
+          wsUrl,
+          headers,
+          persistent,
+          partitionKey,
+          resolvedOptions,
+          debug
+        );
+        dispatchContext(entry, ctx);
         const signal = init?.signal;
         if (signal) {
-          if (signal.aborted) {
-            close();
-            return;
+          const abort = () => {
+            if (ctx.closed) return;
+            if (ctx.entry) deleteEntry(ctx.entry);
+            closeContext(ctx);
+          };
+          if (signal.aborted) abort();
+          else {
+            signal.addEventListener("abort", abort, { once: true });
+            ctx.abortCleanup = () => signal.removeEventListener("abort", abort);
           }
-          signal.addEventListener("abort", close, { once: true });
         }
       },
       cancel() {
-        try {
-          socket?.close();
-        } catch {
-        }
+        const ctx = activeContext;
+        if (!ctx || ctx.closed) return;
+        if (ctx.entry) deleteEntry(ctx.entry);
+        closeContext(ctx);
       }
     });
     return new Response(stream, {
@@ -476,7 +936,7 @@ function createResponsesWebSocketFetch(wsUrl, log8) {
 }
 
 // src/oauth/claude-identity.ts
-import { createHash, randomUUID } from "crypto";
+import { createHash as createHash2, randomUUID } from "crypto";
 var CLAUDE_CODE_CLI_VERSION = "2.1.195";
 var CLAUDE_CODE_USER_AGENT = `claude-cli/${CLAUDE_CODE_CLI_VERSION} (external, cli)`;
 var CLAUDE_CODE_ENTRYPOINT = process.env.CLAUDE_CODE_ENTRYPOINT ?? "cli";
@@ -491,7 +951,7 @@ function getOrCreateSessionId(seed) {
   return id;
 }
 function uuidFromHash(input) {
-  const h = createHash("sha256").update(input).digest("hex");
+  const h = createHash2("sha256").update(input).digest("hex");
   return [
     h.slice(0, 8),
     h.slice(8, 12),
@@ -505,7 +965,7 @@ var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function resolveCliUserID(providerData, seed) {
   const v = providerData?.cliUserID;
   if (typeof v === "string" && HEX64_RE.test(v)) return v;
-  return createHash("sha256").update(`cliUserID:${seed}`).digest("hex");
+  return createHash2("sha256").update(`cliUserID:${seed}`).digest("hex");
 }
 function resolveAccountUUID(providerData, seed) {
   const v = providerData?.accountUUID;
@@ -666,6 +1126,7 @@ async function createLanguageModel(spec) {
   }
   if (npm === "@ai-sdk/openai") {
     const { createOpenAI } = await import("@ai-sdk/openai");
+    const useResponsesEndpoint = shouldUseOpenAiResponsesEndpoint(modelId);
     const accountId = spec.authType === "oauth" ? spec.oauthAccountId ?? extractOpenAiAccountId({ access_token: apiKey }) : void 0;
     const oauthOptions = spec.authType === "oauth" ? {
       apiKey,
@@ -677,12 +1138,19 @@ async function createLanguageModel(spec) {
         // e.g. gpt-5.6-luna) require these on the request.
         ...spec.useResponsesLite ? { version: CODEX_RESPONSES_LITE_VERSION, "x-openai-internal-codex-responses-lite": "true" } : {}
       },
-      // Models the backend flags with prefer_websockets are only served over
-      // the WebSocket Responses transport, not HTTP.
-      ...spec.preferWebSockets ? { fetch: createResponsesWebSocketFetch(CODEX_RESPONSES_LITE_WS_URL, spec.onDebug) } : {}
+      // Keep every ChatGPT/Codex OAuth Responses conversation on the
+      // persistent WebSocket transport. Models flagged prefer_websockets
+      // require it; the remaining OAuth Responses models benefit from the
+      // same connection-local previous_response_id continuation cache.
+      ...useResponsesEndpoint ? {
+        fetch: createResponsesWebSocketFetch(CODEX_RESPONSES_LITE_WS_URL, spec.onDebug, {
+          providerId: spec.providerId ?? "openai",
+          accountId
+        })
+      } : {}
     } : { apiKey };
     const openai = createOpenAI(oauthOptions);
-    return shouldUseOpenAiResponsesEndpoint(modelId) ? openai.responses(modelId) : openai.chat(modelId);
+    return useResponsesEndpoint ? openai.responses(modelId) : openai.chat(modelId);
   }
   if (npm === "@ai-sdk/xai") {
     const { createXai } = await import("@ai-sdk/xai");
@@ -4434,8 +4902,8 @@ function parseToolArguments(value) {
   }
   return {};
 }
-function sseChunk(eventType, data) {
-  return `event: ${eventType}
+function sseChunk(eventType2, data) {
+  return `event: ${eventType2}
 data: ${JSON.stringify(data)}
 
 `;
@@ -5155,7 +5623,7 @@ async function collectCloudCodeToAnthropic(upstreamRes, model, log8) {
 import { randomUUID as randomUUID5 } from "crypto";
 
 // src/sdk-adapter.ts
-import { createHash as createHash2 } from "crypto";
+import { createHash as createHash3 } from "crypto";
 import { streamText, generateText, tool as tool2, jsonSchema as jsonSchema2 } from "ai";
 
 // src/tool-search.ts
@@ -5305,6 +5773,27 @@ function sanitizeMessage(message) {
 }
 
 // src/sdk-adapter.ts
+var CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function validClaudeSessionId(value) {
+  if (typeof value !== "string") return void 0;
+  const trimmed = value.trim();
+  return CLAUDE_SESSION_ID_RE.test(trimmed) ? trimmed.toLowerCase() : void 0;
+}
+function extractClaudeSessionId(body, headerFallback) {
+  const userId = body.metadata?.user_id;
+  if (typeof userId === "string") {
+    try {
+      const parsed = JSON.parse(userId);
+      const fromMetadata = validClaudeSessionId(parsed?.session_id);
+      if (fromMetadata) return fromMetadata;
+    } catch {
+    }
+  }
+  return validClaudeSessionId(headerFallback);
+}
+function claudeSessionPromptCacheKey(sessionId) {
+  return "relay-session-" + createHash3("sha256").update(sessionId).digest("hex").slice(0, 32);
+}
 function anthropicEffortFromRequest(body) {
   const effort = body.output_config?.effort;
   if (typeof effort === "string" && effort.trim()) return effort.trim();
@@ -5313,7 +5802,7 @@ function anthropicEffortFromRequest(body) {
 function openAiPromptCacheKey(system, tools) {
   const toolSig = (tools ?? []).map((t) => `${t.name}${t.description ?? ""}${JSON.stringify(t.input_schema ?? {})}`).join("");
   const material = `${system ?? ""}\0${toolSig}`;
-  return "relay-" + createHash2("sha256").update(material).digest("hex").slice(0, 32);
+  return "relay-" + createHash3("sha256").update(material).digest("hex").slice(0, 32);
 }
 function supportsOpenAiPromptCacheBreakpoints(modelId) {
   const match = modelId.toLowerCase().match(/^gpt-(\d+)(?:\.(\d+))?(?:-|$)/);
@@ -5322,10 +5811,22 @@ function supportsOpenAiPromptCacheBreakpoints(modelId) {
   const minor = Number(match[2] ?? 0);
   return major > 5 || major === 5 && minor >= 6;
 }
-function systemToString(system) {
+function stripClaudeCodeBillingHeader(text4) {
+  if (!text4.startsWith(CLAUDE_CODE_BILLING_HEADER_PREFIX)) return text4;
+  const newline = text4.indexOf("\n");
+  return newline === -1 ? void 0 : text4.slice(newline + 1);
+}
+function systemToString(system, stripAnthropicBillingHeader = false) {
   if (!system) return void 0;
-  if (typeof system === "string") return system;
-  return system.map((b) => typeof b === "string" ? b : b.text ?? "").join("\n");
+  if (typeof system === "string") {
+    return stripAnthropicBillingHeader ? stripClaudeCodeBillingHeader(system) : system;
+  }
+  const blocks = system.map((b) => typeof b === "string" ? b : b.text ?? "");
+  if (!stripAnthropicBillingHeader) return blocks.join("\n");
+  return blocks.flatMap((text4) => {
+    const stripped = stripClaudeCodeBillingHeader(text4);
+    return stripped === void 0 ? [] : [stripped];
+  }).join("\n");
 }
 function openAiCacheBreakpoint(block, enabled) {
   if (!enabled || !block.cache_control) return void 0;
@@ -5494,7 +5995,7 @@ function translateToolChoice(tc) {
 function translateRequest2(body, npm, options) {
   const messages = body.messages ?? [];
   annotateToolNames(messages);
-  const baseSystem = systemToString(body.system);
+  const baseSystem = systemToString(body.system, options?.openAiOAuth === true);
   const systemText = baseSystem?.trim() || (options?.openAiOAuth ? "You are a coding assistant." : void 0);
   let upstreamTools = resolveUpstreamTools(
     body.tools,
@@ -5515,10 +6016,11 @@ function translateRequest2(body, npm, options) {
   }
   const upstreamModelId2 = options?.reasoningMetadata?.upstreamModelId ?? body.model;
   const supportsExplicitOpenAiCaching = !options?.openAiOAuth && supportsOpenAiPromptCacheBreakpoints(upstreamModelId2);
-  if (npm === "@ai-sdk/openai" && !options?.openAiOAuth) {
+  if (npm === "@ai-sdk/openai") {
+    const claudeSessionId = extractClaudeSessionId(body, options?.claudeSessionId);
     providerOptions = deepMergeProviderOptions(providerOptions, {
       openai: {
-        promptCacheKey: openAiPromptCacheKey(baseSystem, upstreamTools),
+        promptCacheKey: claudeSessionId ? claudeSessionPromptCacheKey(claudeSessionId) : openAiPromptCacheKey(baseSystem, upstreamTools),
         ...supportsExplicitOpenAiCaching ? { promptCacheOptions: { mode: "implicit", ttl: "30m" } } : {}
       }
     });
@@ -6167,6 +6669,7 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
         try {
           const params = translateRequest2(anthropicBody, route.npm, {
             openAiOAuth,
+            claudeSessionId: Array.isArray(req.headers["x-claude-code-session-id"]) ? req.headers["x-claude-code-session-id"][0] : req.headers["x-claude-code-session-id"],
             maxTools: maxToolsForNpm(route.npm),
             reasoningMetadata: {
               providerId: route.providerId,
@@ -7666,24 +8169,25 @@ ${additionalCa}
 var ANTHROPIC_HOST = "api.anthropic.com";
 var MAX_BODY_BYTES = 50 * 1024 * 1024;
 var MAX_ERROR_BODY_BYTES = 64 * 1024;
-var MAX_MESSAGE_START_SSE_BYTES = 64 * 1024;
+var MAX_USAGE_SSE_BLOCK_BYTES = 64 * 1024;
 function numericUsage(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : void 0;
 }
-function messageStartUsageFromSseBlock(block) {
+function responseUsageFromSseBlock(block) {
   const lines = block.split("\n");
   const event = lines.find((line) => line.startsWith("event:"))?.slice("event:".length).trim();
-  if (event && event !== "message_start") return void 0;
   const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice("data:".length).trimStart()).join("\n");
   if (!data) return void 0;
   try {
     const parsed = JSON.parse(data);
-    if (parsed.type !== "message_start") return void 0;
-    const message = parsed.message;
-    const usage = message?.usage;
+    const type = parsed.type;
+    if (type !== "message_start" && type !== "message_delta") return void 0;
+    if (event && event !== type) return void 0;
+    const message = type === "message_start" ? parsed.message : void 0;
+    const usage = type === "message_start" ? message?.usage : parsed.usage;
     if (!usage) return void 0;
     return {
-      usageStage: "message_start",
+      usageStage: type,
       inputTokens: numericUsage(usage.input_tokens),
       outputTokens: numericUsage(usage.output_tokens),
       cacheCreationInputTokens: numericUsage(usage.cache_creation_input_tokens),
@@ -7693,41 +8197,27 @@ function messageStartUsageFromSseBlock(block) {
     return void 0;
   }
 }
-function createMessageStartUsageCapture(onUsage, onDone) {
+function createResponseUsageCapture(onUsage) {
   let buffered = "";
-  let capturedBytes = 0;
-  let done = false;
-  const finish = () => {
-    if (done) return;
-    done = true;
-    onDone?.();
-  };
   return (chunk) => {
-    if (done) return;
-    const available = MAX_MESSAGE_START_SSE_BYTES - capturedBytes;
-    const captured = chunk.length > available ? chunk.subarray(0, available) : chunk;
-    capturedBytes += captured.length;
-    buffered = (buffered + captured.toString("utf8")).replace(/\r\n/g, "\n");
+    buffered = (buffered + chunk.toString("utf8")).replace(/\r\n/g, "\n");
     let boundary;
     while ((boundary = buffered.indexOf("\n\n")) >= 0) {
       const block = buffered.slice(0, boundary);
       buffered = buffered.slice(boundary + 2);
-      const usage = messageStartUsageFromSseBlock(block);
-      if (usage) {
-        finish();
-        onUsage(usage);
-        return;
-      }
+      if (Buffer.byteLength(block) > MAX_USAGE_SSE_BLOCK_BYTES) continue;
+      const usage = responseUsageFromSseBlock(block);
+      if (usage) onUsage(usage);
     }
-    if (capturedBytes >= MAX_MESSAGE_START_SSE_BYTES) finish();
+    if (Buffer.byteLength(buffered) > MAX_USAGE_SSE_BLOCK_BYTES) buffered = "";
   };
 }
-function observeMessageStartUsage(upstream, contentEncoding, onUsage) {
+function observeResponseUsage(upstream, contentEncoding, onUsage) {
   const encoding = (Array.isArray(contentEncoding) ? contentEncoding[0] : contentEncoding)?.trim().toLowerCase();
   if (!encoding || encoding === "identity") {
-    let capture2;
-    capture2 = createMessageStartUsageCapture(onUsage, () => upstream.off("data", capture2));
+    const capture2 = createResponseUsageCapture(onUsage);
     upstream.on("data", capture2);
+    upstream.once("end", () => upstream.off("data", capture2));
     return;
   }
   const decoder = encoding === "gzip" ? createGunzip() : encoding === "br" ? createBrotliDecompress() : encoding === "deflate" ? createInflate() : void 0;
@@ -7743,9 +8233,10 @@ function observeMessageStartUsage(upstream, contentEncoding, onUsage) {
     upstream.off("end", onCompressedEnd);
     decoder.destroy();
   };
-  const capture = createMessageStartUsageCapture(onUsage, cleanup);
+  const capture = createResponseUsageCapture(onUsage);
   decoder.on("data", capture);
   decoder.once("error", cleanup);
+  decoder.once("end", cleanup);
   upstream.on("data", onCompressedData);
   upstream.once("end", onCompressedEnd);
 }
@@ -7778,11 +8269,11 @@ function readRawBody(req) {
     req.on("error", reject);
   });
 }
-function copyResponse(upstream, res, onErrorResponse, onMessageStartUsage) {
+function copyResponse(upstream, res, onErrorResponse, onResponseUsage) {
   const statusCode = upstream.statusCode ?? 502;
   const contentType = upstream.headers["content-type"];
-  if (statusCode < 400 && onMessageStartUsage && typeof contentType === "string" && contentType.includes("text/event-stream")) {
-    observeMessageStartUsage(upstream, upstream.headers["content-encoding"], onMessageStartUsage);
+  if (statusCode < 400 && onResponseUsage && typeof contentType === "string" && contentType.includes("text/event-stream")) {
+    observeResponseUsage(upstream, upstream.headers["content-encoding"], onResponseUsage);
   }
   const errorChunks = [];
   let capturedBytes = 0;
@@ -7824,7 +8315,7 @@ function requestHeadersWithoutProxyHeaders(req) {
   }
   return headers;
 }
-function forwardRawAnthropicRequest(req, res, rawBody, origin, rejectUnauthorized, onErrorResponse, onMessageStartUsage) {
+function forwardRawAnthropicRequest(req, res, rawBody, origin, rejectUnauthorized, onErrorResponse, onResponseUsage) {
   return new Promise((resolve2) => {
     let settled = false;
     let clientDisconnected = false;
@@ -7843,7 +8334,7 @@ function forwardRawAnthropicRequest(req, res, rawBody, origin, rejectUnauthorize
       servername: net.isIP(origin.hostname) ? void 0 : origin.hostname,
       rejectUnauthorized
     }, (upstreamRes) => {
-      copyResponse(upstreamRes, res, onErrorResponse, onMessageStartUsage);
+      copyResponse(upstreamRes, res, onErrorResponse, onResponseUsage);
       upstreamRes.once("end", done);
       upstreamRes.once("error", done);
     });
@@ -7972,6 +8463,7 @@ function forwardToAdapter(req, res, rawBody, adapter, lifecycle) {
         "Content-Type": "application/json",
         "Content-Length": String(rawBody.length),
         "x-api-key": adapter.token,
+        ...typeof req.headers["x-claude-code-session-id"] === "string" ? { "x-claude-code-session-id": req.headers["x-claude-code-session-id"] } : {},
         ...lifecycle ? { "x-relay-request-id": lifecycle.requestId } : {}
       }
     }, (upstreamRes) => {
@@ -8744,6 +9236,7 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
     const params = translateRequest2(body, model.npm, {
       defaultEffort: anthropicEffortFromRequest(body) ? void 0 : model.defaultEffort,
       openAiOAuth: model.npm === "@ai-sdk/openai" && model.authType === "oauth",
+      claudeSessionId: Array.isArray(req.headers["x-claude-code-session-id"]) ? req.headers["x-claude-code-session-id"][0] : req.headers["x-claude-code-session-id"],
       reasoningMetadata: {
         providerId: model.providerId,
         apiBaseUrl: model.apiBaseUrl,
@@ -11961,4 +12454,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-75E7V5JE.js.map
+//# sourceMappingURL=chunk-KRG5CPVV.js.map
