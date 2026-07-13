@@ -560,6 +560,8 @@ OpenCode exposes models through different API formats. relay-ai handles them whe
 
 The SDK adapter proxy starts on a random local port for proxy-routed models and stops when Claude Code exits. Each `relay-ai claude` session gets its own port, so multiple terminals are fine. (`relay-ai server` uses fixed port `17645`. One server instance per machine.)
 
+For public-API OpenAI GPT-5.6+ routes, relay preserves Claude Code's inline system-message order and translates Anthropic `cache_control` blocks into OpenAI prompt-cache breakpoints with a 30-minute minimum lifetime. Cache reads and writes are returned through Anthropic-compatible usage fields. ChatGPT/Codex OAuth routes preserve message order and cache usage reporting but do not send the public API's cache-control options because the OAuth backend returned empty responses during compatibility testing.
+
 ### Provider notes
 
 **Mistral (free tier):** Rate limits are tight. Expect HTTP 429 during tool-heavy sessions. Claude Code retries with backoff. That's Mistral throttling, not a proxy bug.

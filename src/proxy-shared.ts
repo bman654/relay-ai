@@ -12,7 +12,7 @@ export type FullStreamPart = {
   totalUsage?: {
     inputTokens?: number;
     outputTokens?: number;
-    inputTokenDetails?: { cacheReadTokens?: number };
+    inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number };
     /** AI SDK 6 compatibility for older third-party LanguageModel implementations. */
     cachedInputTokens?: number;
   };

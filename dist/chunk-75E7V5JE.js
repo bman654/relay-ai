@@ -5315,19 +5315,37 @@ function openAiPromptCacheKey(system, tools) {
   const material = `${system ?? ""}\0${toolSig}`;
   return "relay-" + createHash2("sha256").update(material).digest("hex").slice(0, 32);
 }
+function supportsOpenAiPromptCacheBreakpoints(modelId) {
+  const match = modelId.toLowerCase().match(/^gpt-(\d+)(?:\.(\d+))?(?:-|$)/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2] ?? 0);
+  return major > 5 || major === 5 && minor >= 6;
+}
 function systemToString(system) {
   if (!system) return void 0;
   if (typeof system === "string") return system;
   return system.map((b) => typeof b === "string" ? b : b.text ?? "").join("\n");
 }
-function inlineSystemText(messages) {
-  const parts = [];
-  for (const msg of messages) {
-    if (msg.role !== "system") continue;
-    const text4 = typeof msg.content === "string" ? msg.content : msg.content.map((b) => b.text ?? "").join("\n");
-    if (text4.trim()) parts.push(text4.trim());
+function openAiCacheBreakpoint(block, enabled) {
+  if (!enabled || !block.cache_control) return void 0;
+  return { openai: { promptCacheBreakpoint: { mode: "explicit" } } };
+}
+function translateTopLevelSystemForOpenAi(system) {
+  if (!system) return [];
+  if (typeof system === "string") {
+    return system.trim() ? [{ role: "system", content: system }] : [];
   }
-  return parts;
+  return system.flatMap((block) => {
+    const text4 = typeof block === "string" ? block : block.text ?? "";
+    if (!text4.trim()) return [];
+    const cacheControl = typeof block === "string" ? void 0 : block.cache_control;
+    return [{
+      role: "system",
+      content: text4,
+      ...cacheControl ? { providerOptions: { openai: { promptCacheBreakpoint: { mode: "explicit" } } } } : {}
+    }];
+  });
 }
 function imagePart(block) {
   const src = block.source;
@@ -5378,19 +5396,38 @@ function thinkingToSdkPart(block, npm) {
   }
   return part;
 }
-function translateMessages(messages, npm) {
+function translateMessages(messages, npm, openAiPromptCacheBreakpoints = false) {
   const isGoogle = npm === "@ai-sdk/google";
   const out = [];
   for (const msg of messages) {
     const blocks = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content ?? [];
-    if (msg.role === "user") {
+    if (msg.role === "system") {
+      for (const block of blocks) {
+        if (block.type !== "text" || !block.text?.trim()) continue;
+        out.push({
+          role: "system",
+          content: block.text,
+          ...openAiCacheBreakpoint(block, openAiPromptCacheBreakpoints) ? { providerOptions: openAiCacheBreakpoint(block, openAiPromptCacheBreakpoints) } : {}
+        });
+      }
+    } else if (msg.role === "user") {
       const toolResults = blocks.filter((b) => b.type === "tool_result");
       const parts = [];
       for (const b of blocks) {
-        if (b.type === "text") parts.push({ type: "text", text: b.text ?? "" });
-        else if (b.type === "image") {
+        if (b.type === "text") {
+          parts.push({
+            type: "text",
+            text: b.text ?? "",
+            ...openAiCacheBreakpoint(b, openAiPromptCacheBreakpoints) ? { providerOptions: openAiCacheBreakpoint(b, openAiPromptCacheBreakpoints) } : {}
+          });
+        } else if (b.type === "image") {
           const p9 = imagePart(b);
-          if (p9) parts.push(p9);
+          if (p9) {
+            parts.push({
+              ...p9,
+              ...openAiCacheBreakpoint(b, openAiPromptCacheBreakpoints) ? { providerOptions: openAiCacheBreakpoint(b, openAiPromptCacheBreakpoints) } : {}
+            });
+          }
         }
       }
       if (toolResults.length) {
@@ -5400,7 +5437,8 @@ function translateMessages(messages, npm) {
             type: "tool-result",
             toolCallId: splitToolUseId(tr.tool_use_id ?? "").rawId,
             toolName: tr._name ?? "unknown",
-            output: { type: "text", value: serializeToolResultContent(tr.content) }
+            output: { type: "text", value: serializeToolResultContent(tr.content) },
+            ...openAiCacheBreakpoint(tr, openAiPromptCacheBreakpoints) ? { providerOptions: openAiCacheBreakpoint(tr, openAiPromptCacheBreakpoints) } : {}
           }))
         });
       }
@@ -5457,8 +5495,7 @@ function translateRequest2(body, npm, options) {
   const messages = body.messages ?? [];
   annotateToolNames(messages);
   const baseSystem = systemToString(body.system);
-  const inlineParts = inlineSystemText(messages);
-  const systemText = [baseSystem, ...inlineParts].filter((s) => s && s.trim()).join("\n\n") || (options?.openAiOAuth ? "You are a coding assistant." : void 0);
+  const systemText = baseSystem?.trim() || (options?.openAiOAuth ? "You are a coding assistant." : void 0);
   let upstreamTools = resolveUpstreamTools(
     body.tools,
     messages
@@ -5476,14 +5513,23 @@ function translateRequest2(body, npm, options) {
       openai: { instructions: systemText }
     });
   }
+  const upstreamModelId2 = options?.reasoningMetadata?.upstreamModelId ?? body.model;
+  const supportsExplicitOpenAiCaching = !options?.openAiOAuth && supportsOpenAiPromptCacheBreakpoints(upstreamModelId2);
   if (npm === "@ai-sdk/openai" && !options?.openAiOAuth) {
     providerOptions = deepMergeProviderOptions(providerOptions, {
-      openai: { promptCacheKey: openAiPromptCacheKey(baseSystem, upstreamTools) }
+      openai: {
+        promptCacheKey: openAiPromptCacheKey(baseSystem, upstreamTools),
+        ...supportsExplicitOpenAiCaching ? { promptCacheOptions: { mode: "implicit", ttl: "30m" } } : {}
+      }
     });
   }
   return {
-    instructions: options?.openAiOAuth ? void 0 : systemText,
-    messages: translateMessages(messages, npm),
+    instructions: options?.openAiOAuth || supportsExplicitOpenAiCaching ? void 0 : systemText,
+    messages: [
+      ...supportsExplicitOpenAiCaching ? translateTopLevelSystemForOpenAi(body.system) : [],
+      ...translateMessages(messages, npm, supportsExplicitOpenAiCaching)
+    ],
+    allowSystemInMessages: true,
     tools: translateTools3(upstreamTools.length ? upstreamTools : void 0),
     toolChoice: translateToolChoice(body.tool_choice),
     maxOutputTokens: options?.openAiOAuth ? void 0 : body.max_tokens,
@@ -5493,11 +5539,13 @@ function translateRequest2(body, npm, options) {
 }
 function toAnthropicUsage(u) {
   const total = u?.inputTokens ?? 0;
-  const cached = u?.inputTokenDetails?.cacheReadTokens ?? u?.cachedInputTokens ?? 0;
+  const cacheRead = u?.inputTokenDetails?.cacheReadTokens ?? u?.cachedInputTokens ?? 0;
+  const cacheWrite = u?.inputTokenDetails?.cacheWriteTokens ?? 0;
   return {
-    input_tokens: Math.max(0, total - cached),
+    input_tokens: Math.max(0, total - cacheRead - cacheWrite),
     output_tokens: u?.outputTokens ?? 0,
-    cache_read_input_tokens: cached
+    cache_creation_input_tokens: cacheWrite,
+    cache_read_input_tokens: cacheRead
   };
 }
 var SDK_STREAM_IDLE_TIMEOUT_MS = 12e4;
@@ -5518,7 +5566,12 @@ async function writeAnthropicStream(stream, modelId, write, log8, observer) {
   let pendingThinkingSig;
   const idToBlock = /* @__PURE__ */ new Map();
   let finishReason = "end_turn";
-  let usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 };
+  let usage = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0
+  };
   const emit = (event, data) => write(sseChunk(event, data));
   const ensureStart = () => {
     if (started) return;
@@ -11908,4 +11961,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-HRYBZ2QT.js.map
+//# sourceMappingURL=chunk-75E7V5JE.js.map

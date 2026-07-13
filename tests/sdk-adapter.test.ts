@@ -8,7 +8,18 @@ import {
   translateRequest,
   writeAnthropicStream,
   streamAnthropicResponse,
+  supportsOpenAiPromptCacheBreakpoints,
 } from '../src/sdk-adapter.js';
+
+describe('supportsOpenAiPromptCacheBreakpoints', () => {
+  it('enables GPT-5.6 and later OpenAI generations only', () => {
+    expect(supportsOpenAiPromptCacheBreakpoints('gpt-5.5')).toBe(false);
+    expect(supportsOpenAiPromptCacheBreakpoints('gpt-5.6-sol')).toBe(true);
+    expect(supportsOpenAiPromptCacheBreakpoints('gpt-5.10')).toBe(true);
+    expect(supportsOpenAiPromptCacheBreakpoints('gpt-6')).toBe(true);
+    expect(supportsOpenAiPromptCacheBreakpoints('grok-5.6')).toBe(false);
+  });
+});
 
 describe('translateTools', () => {
   it('builds client-side tools (no execute) keyed by name', () => {
@@ -243,29 +254,82 @@ describe('translateRequest', () => {
     expect(params.instructions).toBe('a\nb');
   });
 
-  it('folds inline role:system messages into the system prompt (skills list)', () => {
+  it('preserves inline role:system messages in their original position', () => {
     const params = translateRequest({
       model: 'grok-4.3',
       system: 'base prompt',
       messages: [
         { role: 'user', content: 'hi' },
-        // Claude Code injects the skills list / system-reminders as a system message
         { role: 'system', content: '<system-reminder>available skills: nlm-skill</system-reminder>' } as any,
+        { role: 'user', content: 'continue' },
       ],
     }, '@ai-sdk/xai');
-    expect(params.instructions).toContain('base prompt');
-    expect(params.instructions).toContain('nlm-skill');
-    // the system message must NOT survive as a regular message
-    expect(params.messages).toHaveLength(1);
-    expect((params.messages[0] as any).role).toBe('user');
+    expect(params.instructions).toBe('base prompt');
+    expect(params.allowSystemInMessages).toBe(true);
+    expect((params.messages as any[]).map(message => message.role)).toEqual(['user', 'system', 'user']);
+    expect((params.messages[1] as any).content).toContain('nlm-skill');
   });
 
-  it('still produces system text when there is no top-level system, only inline', () => {
+  it('keeps an inline-only system message in the message sequence', () => {
     const params = translateRequest({
       model: 'grok-4.3',
       messages: [{ role: 'system', content: 'only inline context' } as any],
     }, '@ai-sdk/xai');
-    expect(params.instructions).toBe('only inline context');
+    expect(params.instructions).toBeUndefined();
+    expect(params.allowSystemInMessages).toBe(true);
+    expect(params.messages).toEqual([{ role: 'system', content: 'only inline context' }]);
+  });
+
+  it('maps Claude cache_control blocks to GPT-5.6 explicit cache breakpoints', () => {
+    const params = translateRequest({
+      model: 'gpt-5.6',
+      system: [{ text: 'stable base', cache_control: { type: 'ephemeral' } }],
+      messages: [
+        { role: 'user', content: 'before' },
+        {
+          role: 'system',
+          content: [{
+            type: 'text',
+            text: 'stable injected context',
+            cache_control: { type: 'ephemeral' },
+          }],
+        } as any,
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: 'stable history',
+            cache_control: { type: 'ephemeral' },
+          }],
+        },
+      ],
+    }, '@ai-sdk/openai');
+
+    expect(params.instructions).toBeUndefined();
+    expect((params.messages as any[]).map(message => message.role)).toEqual(['system', 'user', 'system', 'user']);
+    expect((params.messages[0] as any).providerOptions).toEqual({
+      openai: { promptCacheBreakpoint: { mode: 'explicit' } },
+    });
+    expect((params.messages[2] as any).providerOptions).toEqual({
+      openai: { promptCacheBreakpoint: { mode: 'explicit' } },
+    });
+    expect((params.messages[3] as any).content[0].providerOptions).toEqual({
+      openai: { promptCacheBreakpoint: { mode: 'explicit' } },
+    });
+    expect(params.providerOptions?.openai?.promptCacheOptions).toEqual({ mode: 'implicit', ttl: '30m' });
+  });
+
+  it('does not emit unsupported explicit cache options before GPT-5.6', () => {
+    const params = translateRequest({
+      model: 'gpt-5.5',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } }],
+      }],
+    }, '@ai-sdk/openai');
+
+    expect(params.providerOptions?.openai?.promptCacheOptions).toBeUndefined();
+    expect((params.messages[0] as any).content[0].providerOptions).toBeUndefined();
   });
 
   it('omits defer_loading tools until referenced in messages', () => {
@@ -346,7 +410,12 @@ describe('generateAnthropicResponse', () => {
     expect(streamText).toHaveBeenCalledWith(expect.objectContaining({ abortSignal: abort.signal }));
     expect(onPart.mock.calls).toEqual([['start'], ['finish']]);
     expect((body.content as any[])[0]).toEqual({ type: 'text', text: 'hello' });
-    expect(body.usage).toEqual({ input_tokens: 3, output_tokens: 4, cache_read_input_tokens: 0 });
+    expect(body.usage).toEqual({
+      input_tokens: 3,
+      output_tokens: 4,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    });
 
     vi.doUnmock('ai');
     vi.resetModules();
@@ -459,7 +528,12 @@ describe('writeAnthropicStream', () => {
     });
     const delta = events.find(e => e.event === 'message_delta')!;
     expect(delta.data.delta.stop_reason).toBe('end_turn');
-    expect(delta.data.usage).toEqual({ input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 0 });
+    expect(delta.data.usage).toEqual({
+      input_tokens: 5,
+      output_tokens: 2,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    });
   });
 
   it('reports cache hits: inputTokenDetails.cacheReadTokens → cache_read_input_tokens', async () => {
@@ -478,7 +552,31 @@ describe('writeAnthropicStream', () => {
       },
     ]);
     expect(events.find(e => e.event === 'message_delta')!.data.usage).toEqual({
-      input_tokens: 20, output_tokens: 7, cache_read_input_tokens: 80,
+      input_tokens: 20,
+      output_tokens: 7,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 80,
+    });
+  });
+
+  it('reports GPT-5.6 cache writes as Anthropic cache creation tokens', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      {
+        type: 'finish',
+        finishReason: 'stop',
+        totalUsage: {
+          inputTokens: 120,
+          outputTokens: 3,
+          inputTokenDetails: { cacheReadTokens: 20, cacheWriteTokens: 80 },
+        },
+      },
+    ]);
+    expect(events.find(e => e.event === 'message_delta')!.data.usage).toEqual({
+      input_tokens: 20,
+      output_tokens: 3,
+      cache_creation_input_tokens: 80,
+      cache_read_input_tokens: 20,
     });
   });
 
@@ -617,8 +715,8 @@ describe('translateRequest openai promptCacheKey', () => {
   });
 
   it('keeps the key stable across volatile inline system-reminders (within-session turns)', () => {
-    // Claude Code folds role:'system' messages (fresh timestamps, injected context)
-    // into the system prompt. Those must NOT churn the cache key.
+    // Inline reminders remain in message order and must not churn the stable
+    // system+tools cache partition key.
     const withReminder = (t: string) => req({
       messages: [
         { role: 'system' as const, content: `<system-reminder>current time ${t}</system-reminder>` },
@@ -628,8 +726,16 @@ describe('translateRequest openai promptCacheKey', () => {
     expect(keyOf(withReminder('10:00:01'))).toBe(keyOf(withReminder('10:05:42')));
   });
 
-  it('omits the key on the ChatGPT/Codex OAuth path (backend manages caching)', () => {
-    expect(keyOf(req(), '@ai-sdk/openai', { openAiOAuth: true })).toBeUndefined();
+  it('omits cache controls on the ChatGPT/Codex OAuth path after the compatibility probe', () => {
+    const params = translateRequest({
+      ...req(),
+      model: 'gpt-5.6-sol',
+    }, '@ai-sdk/openai', {
+      openAiOAuth: true,
+      reasoningMetadata: { upstreamModelId: 'gpt-5.6-sol' },
+    });
+    expect(params.providerOptions?.openai?.promptCacheKey).toBeUndefined();
+    expect(params.providerOptions?.openai?.promptCacheOptions).toBeUndefined();
   });
 
   it('omits the key for non-OpenAI providers', () => {
