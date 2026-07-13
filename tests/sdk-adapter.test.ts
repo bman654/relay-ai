@@ -349,6 +349,42 @@ describe('generateAnthropicResponse', () => {
     vi.doUnmock('ai');
     vi.resetModules();
   });
+
+  it('forceStream propagates an SDK abort even when lifecycle observation is disabled', async () => {
+    vi.resetModules();
+    const abort = new AbortController();
+    const reason = new Error('Client disconnected');
+    async function* fullStream() {
+      yield { type: 'start' };
+      abort.abort(reason);
+      yield { type: 'abort' };
+    }
+    const streamText = vi.fn(() => ({
+      text: Promise.resolve(''),
+      toolCalls: Promise.resolve([]),
+      toolResults: Promise.resolve([]),
+      finishReason: Promise.resolve('stop'),
+      usage: Promise.resolve({ inputTokens: 0, outputTokens: 0 }),
+      fullStream: fullStream(),
+    }));
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
+    await expect(generateAnthropicResponse(
+      {} as never,
+      { messages: [] },
+      'gpt-5.6-sol',
+      { forceStream: true, abortSignal: abort.signal },
+    )).rejects.toBe(reason);
+
+    vi.doUnmock('ai');
+    vi.resetModules();
+  });
 });
 
 // ── streaming translation ────────────────────────────────────────────────────
@@ -426,6 +462,29 @@ describe('writeAnthropicStream', () => {
     );
 
     expect(observed).toEqual(['start', 'text-start', 'text-delta', 'finish']);
+  });
+
+  it('propagates an SDK abort without synthesizing a completed response', async () => {
+    const abort = new AbortController();
+    const reason = new Error('Client disconnected');
+    const observed: string[] = [];
+    const writes: string[] = [];
+    async function* parts() {
+      yield { type: 'start' };
+      abort.abort(reason);
+      yield { type: 'abort', reason: 'abort' };
+    }
+
+    await expect(writeAnthropicStream(
+      parts() as any,
+      'm',
+      chunk => writes.push(chunk),
+      undefined,
+      { abortSignal: abort.signal, onPart: type => observed.push(type) },
+    )).rejects.toBe(reason);
+
+    expect(observed).toEqual(['start', 'abort']);
+    expect(writes).toEqual([]);
   });
 
   it('wraps a string stream failure for the HTTP layer', async () => {

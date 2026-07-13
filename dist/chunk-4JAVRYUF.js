@@ -5482,6 +5482,14 @@ function toAnthropicUsage(u) {
     cache_read_input_tokens: cached
   };
 }
+function streamAbortError(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error(
+    typeof signal?.reason === "string" ? signal.reason : "SDK stream aborted"
+  );
+  error.name = "AbortError";
+  return error;
+}
 async function writeAnthropicStream(fullStream, modelId, write, log8, observer) {
   const messageId = "msg_" + Date.now();
   let blockIndex = -1;
@@ -5530,12 +5538,19 @@ async function writeAnthropicStream(fullStream, modelId, write, log8, observer) 
   };
   for await (const part of fullStream) {
     observer?.onPart?.(part.type);
+    if (observer?.abortSignal?.aborted) throw streamAbortError(observer.abortSignal);
     switch (part.type) {
       // The SDK emits start before it knows whether the provider accepted the
       // request. Wait for content/finish so a pre-content HTTP failure can still
       // propagate through the proxy with its real non-2xx status.
       case "start":
         break;
+      // An abort is terminal but is not an error part in the AI SDK stream. If
+      // treated like an unknown part, the loop ends and Relay synthesizes a
+      // message_start/message_delta/message_stop after the client disconnected.
+      // Throw so the HTTP layer follows its cancellation path and emits nothing.
+      case "abort":
+        throw streamAbortError(observer?.abortSignal);
       case "reasoning-start":
         openBlock("thinking", { type: "thinking", thinking: "", signature: "" });
         break;
@@ -5623,6 +5638,7 @@ async function writeAnthropicStream(fullStream, modelId, write, log8, observer) 
         break;
     }
   }
+  if (observer?.abortSignal?.aborted) throw streamAbortError(observer.abortSignal);
   closeOpen();
   ensureStart();
   emit("message_delta", { type: "message_delta", delta: { stop_reason: finishReason, stop_sequence: null }, usage });
@@ -5663,11 +5679,15 @@ async function generateAnthropicResponse(model, params, modelId, options) {
     });
     Promise.resolve(r.toolResults).catch(() => {
     });
-    const observeParts = options.onPart ? (async () => {
+    const observeParts = (async () => {
       for await (const part of r.fullStream) {
         options.onPart?.(part.type);
+        if (options.abortSignal?.aborted || part.type === "abort") {
+          throw streamAbortError(options.abortSignal);
+        }
       }
-    })() : Promise.resolve();
+      if (options.abortSignal?.aborted) throw streamAbortError(options.abortSignal);
+    })();
     [text4, toolCalls, finishReason, usage] = await Promise.all([
       r.text,
       r.toolCalls,
@@ -11739,4 +11759,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-2LOAZHAI.js.map
+//# sourceMappingURL=chunk-4JAVRYUF.js.map
