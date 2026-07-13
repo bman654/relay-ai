@@ -283,11 +283,17 @@ type WriteFn = (chunk: string) => void;
 
 type LogFn = (msg: () => string) => void;
 
+export interface AnthropicStreamObserver {
+  /** Called for every AI SDK fullStream part before Relay translates it. */
+  onPart?: (partType: string) => void;
+}
+
 export async function writeAnthropicStream(
   fullStream: AsyncIterable<FullStreamPart>,
   modelId: string,
   write: WriteFn,
   log?: LogFn,
+  observer?: AnthropicStreamObserver,
 ): Promise<void> {
   const messageId = 'msg_' + Date.now();
   let blockIndex = -1;
@@ -328,6 +334,7 @@ export async function writeAnthropicStream(
   };
 
   for await (const part of fullStream) {
+    observer?.onPart?.(part.type);
     switch (part.type) {
       // The SDK emits start before it knows whether the provider accepted the
       // request. Wait for content/finish so a pre-content HTTP failure can still
@@ -434,6 +441,7 @@ export async function streamAnthropicResponse(
   modelId: string,
   write: WriteFn,
   log?: LogFn,
+  observer?: AnthropicStreamObserver,
 ): Promise<void> {
   const result = streamText({ model, ...params, onError: () => {} } as Parameters<typeof streamText>[0]);
   // Prevent unhandled promise rejections on stream properties:
@@ -443,7 +451,7 @@ export async function streamAnthropicResponse(
   Promise.resolve(result.finishReason).catch(() => {});
   Promise.resolve(result.usage).catch(() => {});
 
-  await writeAnthropicStream(result.fullStream as AsyncIterable<FullStreamPart>, modelId, write, log);
+  await writeAnthropicStream(result.fullStream as AsyncIterable<FullStreamPart>, modelId, write, log, observer);
 }
 
 export async function generateAnthropicResponse(
