@@ -29,13 +29,19 @@ import {
 import {
   getLatestMessagePreview,
   writeInferenceRequestLog,
+  writeInferenceResponseErrorLog,
   writeSecureLogLine,
   resetTraceLog,
   type InferenceRequestLogEntry,
 } from '../trace-log.js';
 import type { LanguageModel } from 'ai';
 import { createLanguageModel, isSdkMigratedNpm, maxToolsForNpm } from '../provider-factory.js';
-import { formatUpstreamError, upstreamHttpStatus } from '../codex/upstream-error.js';
+import {
+  anthropicErrorType,
+  formatUpstreamError,
+  sdkUpstreamErrorDetails,
+  upstreamHttpStatus,
+} from '../codex/upstream-error.js';
 import {
   translateRequest as sdkTranslateRequest,
   streamAnthropicResponse,
@@ -94,6 +100,29 @@ function auditInference(options: ServerOptions, entry: InferenceRequestLogEntry)
 
 function inferenceProvider(model: ServerModelInfo): string {
   return model.providerId ?? String(model.sourceBackend);
+}
+
+function auditSdkError(
+  options: ServerOptions,
+  requestedModelId: string,
+  model: ServerModelInfo,
+  err: unknown,
+  message: string,
+): number {
+  const details = sdkUpstreamErrorDetails(err);
+  const statusCode = details?.statusCode ?? upstreamHttpStatus(err, message);
+  if (options.inferenceLogPath && statusCode >= 400) {
+    writeInferenceResponseErrorLog(options.inferenceLogPath, {
+      modelId: requestedModelId,
+      provider: inferenceProvider(model),
+      route: 'translated',
+      statusCode,
+      errorContent: details?.errorContent ?? message,
+      isRetryable: details?.isRetryable,
+      attemptCount: details?.attemptCount,
+    });
+  }
+  return statusCode;
 }
 
 function openAiEffort(body: JsonBody): string | undefined {
@@ -228,7 +257,7 @@ async function handleAnthropicMessages(
       effort: anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
       provider: inferenceProvider(model),
       route: 'passthrough',
-      requestPreview: getLatestMessagePreview(body.messages),
+      requestPreview: getLatestMessagePreview(body.messages, body.system),
     });
 
     let effectiveBeta = inboundBeta;
@@ -246,15 +275,24 @@ async function handleAnthropicMessages(
       : undefined;
 
     plog(() => `anthropic-passthrough → ${messagesUrl} oauth=${isOAuth} stream=${clientWantsStream}`);
-    await relayAnthropicMessages(
-      res, messagesUrl, forwardBody, apiKey, clientWantsStream, effectiveBeta,
-      isOAuth ? 'oauth' : 'api',
-      message => plog(message),
+    await relayAnthropicMessages(res, messagesUrl, forwardBody, apiKey, clientWantsStream, {
+      inboundBeta: effectiveBeta,
+      authType: isOAuth ? 'oauth' : 'api',
+      log: message => plog(message),
       claudeCodeSessionId,
-      model.headers,
+      extraHeaders: model.headers,
       refreshToken,
-      refreshed => { model.apiKey = refreshed; },
-    );
+      onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
+      onUpstreamError: options.inferenceLogPath
+        ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
+            modelId: body.model,
+            provider: inferenceProvider(model),
+            route: 'passthrough',
+            statusCode,
+            errorContent,
+          })
+        : undefined,
+    });
     return;
   }
 
@@ -269,7 +307,7 @@ async function handleAnthropicMessages(
       effort: anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
       provider: inferenceProvider(model),
       route: 'translated',
-      requestPreview: getLatestMessagePreview(body.messages),
+      requestPreview: getLatestMessagePreview(body.messages, body.system),
     });
     const languageModel = await getOrInitLanguageModel(modelCache, model, model.npm!, model.apiBaseUrl, apiKey, options.vertex);
     const npmMaxTools = maxToolsForNpm(model.npm);
@@ -300,12 +338,18 @@ async function handleAnthropicMessages(
 
     try {
       if (clientWantsStream) {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        });
-        await streamAnthropicResponse(languageModel, params, responseModelId, chunk => res.write(chunk));
+        const writeStreamChunk = (chunk: string) => {
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            });
+          }
+          res.write(chunk);
+        };
+        await streamAnthropicResponse(languageModel, params, responseModelId, writeStreamChunk);
+        if (!res.headersSent) writeStreamChunk('');
         res.end();
       } else {
         const anthropicResponse = await generateAnthropicResponse(languageModel, params, responseModelId);
@@ -313,11 +357,15 @@ async function handleAnthropicMessages(
       }
     } catch (err) {
       const message = formatUpstreamError(err);
+      const status = auditSdkError(options, body.model, model, err, message);
       plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
       if (!res.headersSent) {
-        const status = upstreamHttpStatus(err, message);
         sendJson(res, status === 500 ? 502 : status, { error: { message } });
-      } else res.end();
+      } else {
+        const errorType = anthropicErrorType(status);
+        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: errorType, message } })}\n\n`);
+        res.end();
+      }
     }
     return;
   }
@@ -355,9 +403,19 @@ async function handleOpenAIChatCompletions(
       effort: openAiEffort(body),
       provider: inferenceProvider(model),
       route: 'passthrough',
-      requestPreview: getLatestMessagePreview(body.messages),
+      requestPreview: getLatestMessagePreview(body.messages, body.system),
     });
-    await relayAnthropicMessages(res, completionsUrl, body, apiKey, Boolean(body.stream));
+    await relayAnthropicMessages(res, completionsUrl, body, apiKey, Boolean(body.stream), {
+      onUpstreamError: options.inferenceLogPath
+        ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
+            modelId: body.model,
+            provider: inferenceProvider(model),
+            route: 'passthrough',
+            statusCode,
+            errorContent,
+          })
+        : undefined,
+    });
     return;
   }
 
@@ -374,7 +432,7 @@ async function handleOpenAIChatCompletions(
     effort: openAiEffort(body),
     provider: inferenceProvider(model),
     route: 'translated',
-    requestPreview: getLatestMessagePreview(body.messages),
+    requestPreview: getLatestMessagePreview(body.messages, body.system),
   });
   const baseURL = model.modelFormat === 'anthropic' ? model.baseUrl : model.apiBaseUrl;
   const languageModel = await getOrInitLanguageModel(modelCache, model, npm, baseURL, apiKey, options.vertex);
@@ -386,12 +444,18 @@ async function handleOpenAIChatCompletions(
 
   try {
     if (clientWantsStream) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-      });
-      await streamOpenAiResponse(languageModel, params, responseModelId, chunk => res.write(chunk));
+      const writeStreamChunk = (chunk: string) => {
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+          });
+        }
+        res.write(chunk);
+      };
+      await streamOpenAiResponse(languageModel, params, responseModelId, writeStreamChunk);
+      if (!res.headersSent) writeStreamChunk('');
       res.end();
     } else {
       const response = await generateOpenAiResponse(languageModel, params, responseModelId);
@@ -399,11 +463,14 @@ async function handleOpenAIChatCompletions(
     }
   } catch (err) {
     const message = formatUpstreamError(err);
+    const status = auditSdkError(options, body.model, model, err, message);
     plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
     if (!res.headersSent) {
-      const status = upstreamHttpStatus(err, message);
       sendJson(res, status === 500 ? 502 : status, { error: { message } });
-    } else res.end();
+    } else {
+      res.write(`data: ${JSON.stringify({ error: { message, type: 'upstream_error', code: status } })}\n\n`);
+      res.end();
+    }
   }
 }
 

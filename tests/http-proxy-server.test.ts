@@ -138,6 +138,143 @@ describe('selective HTTP proxy', () => {
     }
   }, 20_000);
 
+  it('logs Haiku passthrough status, error body, and system fallback preview', async () => {
+    const certificates = ensureHttpProxyCertificates();
+    const inferenceLogPath = join(testHome, 'haiku-error-inference.jsonl');
+    const previousRequestPreview = process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+    process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = '1';
+    const origin = https.createServer({
+      key: certificates.serverKey,
+      cert: certificates.serverCert,
+    }, async (req, res) => {
+      const ended = once(req, 'end');
+      req.resume();
+      await ended;
+      res.writeHead(529, { 'Content-Type': 'application/json', 'Connection': 'close' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'overloaded_error', message: 'Haiku overloaded for Bearer sk-secret123456789' },
+      }));
+    });
+    const originPort = await listen(origin);
+    const proxy = await startHttpProxy({
+      routes: [],
+      inferenceLogPath,
+      anthropicOrigin: `https://127.0.0.1:${originPort}`,
+      anthropicRejectUnauthorized: false,
+    });
+
+    try {
+      const body = JSON.stringify({
+        model: 'claude-haiku-4-5',
+        system: [{ type: 'text', text: 'Generate a concise title for this Claude Code session.' }],
+        messages: [{ role: 'user', content: [{ type: 'tool_result', content: 'private tool output' }] }],
+        stream: true,
+      });
+      const secure = await connectMitm(proxy.port, certificates.caCert);
+      let response = '';
+      secure.on('data', chunk => { response += chunk.toString(); });
+      secure.write([
+        'POST /v1/messages HTTP/1.1',
+        'Host: api.anthropic.com',
+        'Authorization: Bearer subscription-oauth-token',
+        'Content-Type: application/json',
+        `Content-Length: ${Buffer.byteLength(body)}`,
+        'Connection: close',
+        '',
+        '',
+      ].join('\r\n') + body);
+      await once(secure, 'close');
+
+      expect(response).toContain('529');
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(entries[0]).toMatchObject({
+        modelId: 'claude-haiku-4-5',
+        provider: 'anthropic',
+        route: 'passthrough',
+        requestPreview: 'user: [tool_result] | system: Generate a concise title for this Claude Code session.',
+      });
+      expect(entries[1]).toMatchObject({
+        event: 'upstream_error',
+        modelId: 'claude-haiku-4-5',
+        provider: 'anthropic',
+        route: 'passthrough',
+        statusCode: 529,
+      });
+      expect(entries[1].errorContent).toContain('Haiku overloaded');
+      expect(entries[1].errorContent).toContain('[REDACTED]');
+      expect(readFileSync(inferenceLogPath, 'utf8')).not.toContain('private tool output');
+    } finally {
+      if (previousRequestPreview === undefined) delete process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+      else process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = previousRequestPreview;
+      await proxy.close();
+      await new Promise<void>(resolve => origin.close(() => resolve()));
+    }
+  }, 20_000);
+
+  it('logs a partial upstream error body when the origin resets before end', async () => {
+    const certificates = ensureHttpProxyCertificates();
+    const inferenceLogPath = join(testHome, 'partial-error-inference.jsonl');
+    const previousRequestPreview = process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+    process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = '1';
+    const origin = https.createServer({
+      key: certificates.serverKey,
+      cert: certificates.serverCert,
+    }, async (req, res) => {
+      const ended = once(req, 'end');
+      req.resume();
+      await ended;
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.flushHeaders();
+      res.write('{"error":{"message":"partial outage');
+      setImmediate(() => res.destroy(new Error('origin reset')));
+    });
+    const originPort = await listen(origin);
+    const proxy = await startHttpProxy({
+      routes: [],
+      inferenceLogPath,
+      anthropicOrigin: `https://127.0.0.1:${originPort}`,
+      anthropicRejectUnauthorized: false,
+    });
+
+    try {
+      const body = JSON.stringify({
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: 'test partial error logging' }],
+        stream: true,
+      });
+      const secure = await connectMitm(proxy.port, certificates.caCert);
+      secure.resume();
+      secure.write([
+        'POST /v1/messages HTTP/1.1',
+        'Host: api.anthropic.com',
+        'Content-Type: application/json',
+        `Content-Length: ${Buffer.byteLength(body)}`,
+        'Connection: close',
+        '',
+        '',
+      ].join('\r\n') + body);
+      await new Promise<void>(resolve => {
+        secure.once('close', () => resolve());
+        secure.once('error', () => resolve());
+      });
+
+      const entries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(entries[1]).toMatchObject({
+        event: 'upstream_error',
+        modelId: 'claude-haiku-4-5',
+        statusCode: 503,
+      });
+      expect(entries[1].errorContent).toContain('partial outage');
+      expect(entries[1].errorContent).toContain('stream error');
+    } finally {
+      if (previousRequestPreview === undefined) delete process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+      else process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = previousRequestPreview;
+      await proxy.close();
+      await new Promise<void>(resolve => origin.close(() => resolve()));
+    }
+  }, 20_000);
+
   it('routes only an exact relay model and strips Anthropic auth from the adapter hop', async () => {
     const certificates = ensureHttpProxyCertificates();
     const inferenceLogPath = join(testHome, 'relay-inference.jsonl');

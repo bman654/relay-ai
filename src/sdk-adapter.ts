@@ -329,7 +329,10 @@ export async function writeAnthropicStream(
 
   for await (const part of fullStream) {
     switch (part.type) {
-      case 'start': ensureStart(); break;
+      // The SDK emits start before it knows whether the provider accepted the
+      // request. Wait for content/finish so a pre-content HTTP failure can still
+      // propagate through the proxy with its real non-2xx status.
+      case 'start': break;
 
       case 'reasoning-start':
         openBlock('thinking', { type: 'thinking', thinking: '', signature: '' });
@@ -409,8 +412,9 @@ export async function writeAnthropicStream(
         const errorType = anthropicErrorType(upstreamHttpStatus(part.error, errMsg));
         log?.(() => `sdk stream error (${errorType}): ${errMsg}`);
         closeOpen();
-        emit('error', { type: 'error', error: { type: errorType, message: errMsg } });
-        return;
+        throw part.error instanceof Error || (part.error && typeof part.error === 'object')
+          ? part.error
+          : new Error(errMsg);
       }
 
       default: break;

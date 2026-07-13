@@ -70,41 +70,85 @@ export function getInferenceRequestLogPath(): string {
 
 const REQUEST_PREVIEW_ENV = 'RELAY_AI_LOG_REQUEST_PREVIEW';
 const REQUEST_PREVIEW_MAX = 240;
+const RESPONSE_ERROR_MAX = 2_000;
 
 function compactLogValue(value: string, max = 500): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
-export function getLatestMessagePreview(messages: unknown): string | undefined {
-  if (!Array.isArray(messages) || messages.length === 0) return undefined;
-  const message = messages[messages.length - 1];
-  if (!message || typeof message !== 'object') return undefined;
+function compactLogValueWithMarker(value: string, max: number): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (compact.length <= max) return compact;
+  const marker = ' [truncated]';
+  return compact.slice(0, max - marker.length) + marker;
+}
 
-  const record = message as Record<string, unknown>;
-  const role = typeof record.role === 'string' ? record.role : 'message';
-  const content = record.content;
-  let summary: string | undefined;
+function systemPreview(system: unknown): string | undefined {
+  if (typeof system === 'string') return compactLogValue(system, REQUEST_PREVIEW_MAX) || undefined;
+  if (!Array.isArray(system)) return undefined;
+  const text = system
+    .map(block => typeof block === 'string'
+      ? block
+      : block && typeof block === 'object' && typeof (block as Record<string, unknown>).text === 'string'
+        ? (block as Record<string, unknown>).text as string
+        : '')
+    .filter(Boolean)
+    .join(' ');
+  return compactLogValue(text, REQUEST_PREVIEW_MAX) || undefined;
+}
 
-  if (typeof content === 'string') {
-    summary = content;
-  } else if (Array.isArray(content)) {
-    const text = content
-      .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === 'object'))
-      .filter(block => block.type === 'text' && typeof block.text === 'string')
-      .map(block => block.text as string)
-      .join(' ');
-    if (text.trim()) {
-      summary = text;
-    } else {
-      const blockTypes = [...new Set(content
-        .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === 'object'))
-        .map(block => typeof block.type === 'string' ? block.type : 'unknown'))];
-      if (blockTypes.length > 0) summary = `[${blockTypes.join(', ')}]`;
+function inlineSystemPreview(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message || typeof message !== 'object') continue;
+    const record = message as Record<string, unknown>;
+    if (record.role !== 'system') continue;
+    const preview = systemPreview(record.content);
+    if (preview) return preview;
+  }
+  return undefined;
+}
+
+export function getLatestMessagePreview(messages: unknown, system?: unknown): string | undefined {
+  let blockSummary: string | undefined;
+  if (Array.isArray(messages) && messages.length > 0) {
+    const message = messages[messages.length - 1];
+    if (message && typeof message === 'object') {
+      const record = message as Record<string, unknown>;
+      const role = typeof record.role === 'string' ? record.role : 'message';
+      const content = record.content;
+      let summary: string | undefined;
+
+      if (typeof content === 'string') {
+        summary = content;
+      } else if (Array.isArray(content)) {
+        const text = content
+          .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === 'object'))
+          .filter(block => block.type === 'text' && typeof block.text === 'string')
+          .map(block => block.text as string)
+          .join(' ');
+        if (text.trim()) {
+          summary = text;
+        } else {
+          const blockTypes = [...new Set(content
+            .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === 'object'))
+            .map(block => typeof block.type === 'string' ? block.type : 'unknown'))];
+          if (blockTypes.length > 0) blockSummary = `${role}: [${blockTypes.join(', ')}]`;
+        }
+      }
+
+      const compact = summary ? compactLogValue(summary, REQUEST_PREVIEW_MAX) : '';
+      if (compact) return `${role}: ${compact}`;
     }
   }
 
-  const compact = summary ? compactLogValue(summary, REQUEST_PREVIEW_MAX) : '';
-  return compact ? `${role}: ${compact}` : undefined;
+  const systemText = systemPreview(system) ?? inlineSystemPreview(messages);
+  if (!systemText) return blockSummary;
+  const preview = blockSummary
+    ? `${blockSummary} | system: ${systemText}`
+    : `system: ${systemText}`;
+  return compactLogValue(preview, REQUEST_PREVIEW_MAX + 20);
 }
 
 export interface InferenceRequestLogEntry {
@@ -113,6 +157,16 @@ export interface InferenceRequestLogEntry {
   effort?: string;
   route: 'passthrough' | 'translated';
   requestPreview?: string;
+}
+
+export interface InferenceResponseErrorLogEntry {
+  modelId: string;
+  provider: string;
+  route: 'passthrough' | 'translated';
+  statusCode: number;
+  errorContent?: string;
+  isRetryable?: boolean;
+  attemptCount?: number;
 }
 
 /** Append privacy-minimal routing metadata, plus an explicitly enabled request preview. */
@@ -128,6 +182,25 @@ export function writeInferenceRequestLog(
     provider: compactLogValue(entry.provider, 200),
     route: entry.route,
     ...(includePreview ? { requestPreview: compactLogValue(entry.requestPreview!, REQUEST_PREVIEW_MAX + 20) } : {}),
+  }));
+}
+
+/** Append an upstream HTTP failure; response content follows the request-preview opt-in. */
+export function writeInferenceResponseErrorLog(
+  path: string,
+  entry: InferenceResponseErrorLogEntry,
+): void {
+  const includeContent = process.env[REQUEST_PREVIEW_ENV] === '1' && entry.errorContent;
+  writeSecureLogLine(path, JSON.stringify({
+    timestamp: new Date().toISOString(),
+    event: 'upstream_error',
+    modelId: compactLogValue(entry.modelId),
+    provider: compactLogValue(entry.provider, 200),
+    route: entry.route,
+    statusCode: entry.statusCode,
+    ...(entry.isRetryable !== undefined ? { isRetryable: entry.isRetryable } : {}),
+    ...(entry.attemptCount !== undefined ? { attemptCount: entry.attemptCount } : {}),
+    ...(includeContent ? { errorContent: compactLogValueWithMarker(entry.errorContent!, RESPONSE_ERROR_MAX) } : {}),
   }));
 }
 

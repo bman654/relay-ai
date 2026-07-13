@@ -7,6 +7,7 @@ import {
   redactTraceLine,
   redactTraceLog,
   writeInferenceRequestLog,
+  writeInferenceResponseErrorLog,
 } from '../src/trace-log.js';
 
 describe('trace log redaction', () => {
@@ -94,6 +95,67 @@ describe('inference request log', () => {
       expect(getLatestMessagePreview([
         { role: 'user', content: [{ type: 'tool_result', content: 'private tool result' }] },
       ])).toBe('user: [tool_result]');
+      expect(getLatestMessagePreview(
+        [{ role: 'user', content: [{ type: 'tool_result', content: 'private tool result' }] }],
+        [{ type: 'text', text: 'Generate a concise conversation title for Claude Code.' }],
+      )).toBe('user: [tool_result] | system: Generate a concise conversation title for Claude Code.');
+      expect(getLatestMessagePreview([
+        { role: 'system', content: 'Classify this request for an OpenAI-compatible client.' },
+        { role: 'user', content: [{ type: 'tool_result', content: 'private tool result' }] },
+      ])).toBe('user: [tool_result] | system: Classify this request for an OpenAI-compatible client.');
+    } finally {
+      if (previous === undefined) delete process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+      else process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('logs upstream status always and redacted error content only when previews are enabled', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'relay-ai-inference-error-'));
+    const path = join(dir, 'requests.jsonl');
+    const previous = process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+    try {
+      delete process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+      writeInferenceResponseErrorLog(path, {
+        modelId: 'relay:openai:gpt-test',
+        provider: 'openai',
+        route: 'translated',
+        statusCode: 429,
+        errorContent: 'rate limited for Bearer sk-secret123456789',
+        isRetryable: true,
+        attemptCount: 3,
+      });
+      process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = '1';
+      writeInferenceResponseErrorLog(path, {
+        modelId: 'relay:openai:gpt-test',
+        provider: 'openai',
+        route: 'translated',
+        statusCode: 429,
+        errorContent: 'rate limited for Bearer sk-secret123456789',
+        isRetryable: true,
+        attemptCount: 3,
+      });
+      writeInferenceResponseErrorLog(path, {
+        modelId: 'claude-haiku-4-5',
+        provider: 'anthropic',
+        route: 'passthrough',
+        statusCode: 529,
+        errorContent: 'x'.repeat(3_000),
+      });
+
+      const entries = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(entries[0]).toMatchObject({
+        event: 'upstream_error',
+        statusCode: 429,
+        isRetryable: true,
+        attemptCount: 3,
+      });
+      expect(entries[0]).not.toHaveProperty('errorContent');
+      expect(entries[1].errorContent).toContain('rate limited');
+      expect(entries[1].errorContent).toContain('[REDACTED]');
+      expect(entries[1].errorContent).not.toContain('secret123456789');
+      expect(entries[2].errorContent).toHaveLength(2_000);
+      expect(entries[2].errorContent).toMatch(/ \[truncated\]$/);
     } finally {
       if (previous === undefined) delete process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
       else process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = previous;

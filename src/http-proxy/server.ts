@@ -8,10 +8,15 @@ import { startProxyCatalog } from '../proxy.js';
 import { ensureHttpProxyCertificates } from './ca.js';
 import { routeLookupIds } from '../context-model-id.js';
 import { anthropicEffortFromRequest, type AnthropicRequest } from '../sdk-adapter.js';
-import { getLatestMessagePreview, writeInferenceRequestLog } from '../trace-log.js';
+import {
+  getLatestMessagePreview,
+  writeInferenceRequestLog,
+  writeInferenceResponseErrorLog,
+} from '../trace-log.js';
 
 const ANTHROPIC_HOST = 'api.anthropic.com';
 const MAX_BODY_BYTES = 50 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
 
 export interface HttpProxyOptions {
   host?: string;
@@ -69,9 +74,41 @@ function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   });
 }
 
-function copyResponse(upstream: http.IncomingMessage, res: http.ServerResponse): void {
-  res.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, upstream.rawHeaders);
-  upstream.once('error', () => res.destroy());
+function copyResponse(
+  upstream: http.IncomingMessage,
+  res: http.ServerResponse,
+  onErrorResponse?: (statusCode: number, body: string) => void,
+): void {
+  const statusCode = upstream.statusCode ?? 502;
+  const errorChunks: Buffer[] = [];
+  let capturedBytes = 0;
+  let truncated = false;
+  let errorLogged = false;
+  const logErrorResponse = (suffix = '') => {
+    if (errorLogged || statusCode < 400 || !onErrorResponse) return;
+    errorLogged = true;
+    const body = Buffer.concat(errorChunks).toString('utf8');
+    onErrorResponse(statusCode, `${body}${truncated ? ' [truncated]' : ''}${suffix}`);
+  };
+  if (statusCode >= 400 && onErrorResponse) {
+    upstream.on('data', (chunk: Buffer) => {
+      if (capturedBytes >= MAX_ERROR_BODY_BYTES) {
+        truncated = true;
+        return;
+      }
+      const available = MAX_ERROR_BODY_BYTES - capturedBytes;
+      const captured = chunk.length > available ? chunk.subarray(0, available) : chunk;
+      errorChunks.push(Buffer.from(captured));
+      capturedBytes += captured.length;
+      if (captured.length < chunk.length) truncated = true;
+    });
+    upstream.once('end', () => logErrorResponse());
+  }
+  res.writeHead(statusCode, upstream.statusMessage, upstream.rawHeaders);
+  upstream.once('error', err => {
+    logErrorResponse(` [stream error: ${err.message}]`);
+    res.destroy();
+  });
   upstream.pipe(res);
 }
 
@@ -91,6 +128,7 @@ function forwardRawAnthropicRequest(
   rawBody: Buffer,
   origin: URL,
   rejectUnauthorized: boolean,
+  onErrorResponse?: (statusCode: number, body: string) => void,
 ): Promise<void> {
   return new Promise(resolve => {
     const upstream = https.request({
@@ -103,7 +141,7 @@ function forwardRawAnthropicRequest(
       servername: net.isIP(origin.hostname) ? undefined : origin.hostname,
       rejectUnauthorized,
     }, upstreamRes => {
-      copyResponse(upstreamRes, res);
+      copyResponse(upstreamRes, res, onErrorResponse);
       upstreamRes.once('end', resolve);
       upstreamRes.once('error', resolve);
     });
@@ -181,7 +219,12 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
   const anthropicOrigin = new URL(options.anthropicOrigin ?? 'https://api.anthropic.com');
   let adapter: ProxyHandle | null = options.adapterHandle ?? null;
   if (options.routes.length > 0) {
-    adapter ??= await startProxyCatalog(options.routes, options.routes[0]!.aliasId, options.debug);
+    adapter ??= await startProxyCatalog(
+      options.routes,
+      options.routes[0]!.aliasId,
+      options.debug,
+      options.inferenceLogPath,
+    );
   }
 
   const mitmServer = https.createServer({
@@ -217,7 +260,7 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
           effort: parsed ? anthropicEffortFromRequest(parsed) : undefined,
           provider,
           route: route ? 'translated' : 'passthrough',
-          requestPreview: getLatestMessagePreview(parsed?.messages),
+          requestPreview: getLatestMessagePreview(parsed?.messages, parsed?.system),
         });
       }
 
@@ -225,6 +268,24 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
         await forwardToAdapter(req, res, rawBody, adapter);
         return;
       }
+
+      await forwardRawAnthropicRequest(
+        req,
+        res,
+        rawBody,
+        anthropicOrigin,
+        options.anthropicRejectUnauthorized ?? true,
+        options.inferenceLogPath
+          ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
+              modelId: typeof parsed?.model === 'string' ? parsed.model : 'unknown',
+              provider: 'anthropic',
+              route: 'passthrough',
+              statusCode,
+              errorContent,
+            })
+          : undefined,
+      );
+      return;
     }
 
     await forwardRawAnthropicRequest(

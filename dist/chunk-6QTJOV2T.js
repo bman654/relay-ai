@@ -3905,30 +3905,62 @@ function getInferenceRequestLogPath() {
 }
 var REQUEST_PREVIEW_ENV = "RELAY_AI_LOG_REQUEST_PREVIEW";
 var REQUEST_PREVIEW_MAX = 240;
+var RESPONSE_ERROR_MAX = 2e3;
 function compactLogValue(value, max = 500) {
   return value.replace(/\s+/g, " ").trim().slice(0, max);
 }
-function getLatestMessagePreview(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return void 0;
-  const message = messages[messages.length - 1];
-  if (!message || typeof message !== "object") return void 0;
-  const record = message;
-  const role = typeof record.role === "string" ? record.role : "message";
-  const content = record.content;
-  let summary;
-  if (typeof content === "string") {
-    summary = content;
-  } else if (Array.isArray(content)) {
-    const text4 = content.filter((block) => Boolean(block && typeof block === "object")).filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text).join(" ");
-    if (text4.trim()) {
-      summary = text4;
-    } else {
-      const blockTypes = [...new Set(content.filter((block) => Boolean(block && typeof block === "object")).map((block) => typeof block.type === "string" ? block.type : "unknown"))];
-      if (blockTypes.length > 0) summary = `[${blockTypes.join(", ")}]`;
+function compactLogValueWithMarker(value, max) {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= max) return compact;
+  const marker = " [truncated]";
+  return compact.slice(0, max - marker.length) + marker;
+}
+function systemPreview(system) {
+  if (typeof system === "string") return compactLogValue(system, REQUEST_PREVIEW_MAX) || void 0;
+  if (!Array.isArray(system)) return void 0;
+  const text4 = system.map((block) => typeof block === "string" ? block : block && typeof block === "object" && typeof block.text === "string" ? block.text : "").filter(Boolean).join(" ");
+  return compactLogValue(text4, REQUEST_PREVIEW_MAX) || void 0;
+}
+function inlineSystemPreview(messages) {
+  if (!Array.isArray(messages)) return void 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message || typeof message !== "object") continue;
+    const record = message;
+    if (record.role !== "system") continue;
+    const preview = systemPreview(record.content);
+    if (preview) return preview;
+  }
+  return void 0;
+}
+function getLatestMessagePreview(messages, system) {
+  let blockSummary;
+  if (Array.isArray(messages) && messages.length > 0) {
+    const message = messages[messages.length - 1];
+    if (message && typeof message === "object") {
+      const record = message;
+      const role = typeof record.role === "string" ? record.role : "message";
+      const content = record.content;
+      let summary;
+      if (typeof content === "string") {
+        summary = content;
+      } else if (Array.isArray(content)) {
+        const text4 = content.filter((block) => Boolean(block && typeof block === "object")).filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text).join(" ");
+        if (text4.trim()) {
+          summary = text4;
+        } else {
+          const blockTypes = [...new Set(content.filter((block) => Boolean(block && typeof block === "object")).map((block) => typeof block.type === "string" ? block.type : "unknown"))];
+          if (blockTypes.length > 0) blockSummary = `${role}: [${blockTypes.join(", ")}]`;
+        }
+      }
+      const compact = summary ? compactLogValue(summary, REQUEST_PREVIEW_MAX) : "";
+      if (compact) return `${role}: ${compact}`;
     }
   }
-  const compact = summary ? compactLogValue(summary, REQUEST_PREVIEW_MAX) : "";
-  return compact ? `${role}: ${compact}` : void 0;
+  const systemText = systemPreview(system) ?? inlineSystemPreview(messages);
+  if (!systemText) return blockSummary;
+  const preview = blockSummary ? `${blockSummary} | system: ${systemText}` : `system: ${systemText}`;
+  return compactLogValue(preview, REQUEST_PREVIEW_MAX + 20);
 }
 function writeInferenceRequestLog(path, entry) {
   const includePreview = process.env[REQUEST_PREVIEW_ENV] === "1" && entry.requestPreview;
@@ -3939,6 +3971,20 @@ function writeInferenceRequestLog(path, entry) {
     provider: compactLogValue(entry.provider, 200),
     route: entry.route,
     ...includePreview ? { requestPreview: compactLogValue(entry.requestPreview, REQUEST_PREVIEW_MAX + 20) } : {}
+  }));
+}
+function writeInferenceResponseErrorLog(path, entry) {
+  const includeContent = process.env[REQUEST_PREVIEW_ENV] === "1" && entry.errorContent;
+  writeSecureLogLine(path, JSON.stringify({
+    timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+    event: "upstream_error",
+    modelId: compactLogValue(entry.modelId),
+    provider: compactLogValue(entry.provider, 200),
+    route: entry.route,
+    statusCode: entry.statusCode,
+    ...entry.isRetryable !== void 0 ? { isRetryable: entry.isRetryable } : {},
+    ...entry.attemptCount !== void 0 ? { attemptCount: entry.attemptCount } : {},
+    ...includeContent ? { errorContent: compactLogValueWithMarker(entry.errorContent, RESPONSE_ERROR_MAX) } : {}
   }));
 }
 function makeTraceLogger(logPath) {
@@ -4234,23 +4280,31 @@ async function fetchWithOAuthRetry(apiKey, request3, refreshToken) {
   response = await request3(refreshed);
   return { response, apiKey: refreshed, refreshed: true };
 }
-async function relayAnthropicMessages(res, messagesUrl, body, apiKey, clientWantsStream, inboundBeta, authType, log8, claudeCodeSessionId, extraHeaders, refreshToken, onTokenRefreshed) {
+async function relayAnthropicMessages(res, messagesUrl, body, apiKey, clientWantsStream, options = {}) {
   const doFetch = (key) => fetch(messagesUrl, {
     method: "POST",
-    headers: anthropicUpstreamHeaders(key, clientWantsStream, inboundBeta, authType, claudeCodeSessionId, extraHeaders),
+    headers: anthropicUpstreamHeaders(
+      key,
+      clientWantsStream,
+      options.inboundBeta,
+      options.authType,
+      options.claudeCodeSessionId,
+      options.extraHeaders
+    ),
     body: JSON.stringify(body)
   });
   let upstreamRes;
   try {
-    const retryResult = await fetchWithOAuthRetry(apiKey, doFetch, refreshToken);
+    const retryResult = await fetchWithOAuthRetry(apiKey, doFetch, options.refreshToken);
     upstreamRes = retryResult.response;
-    if (retryResult.refreshed) onTokenRefreshed?.(retryResult.apiKey);
+    if (retryResult.refreshed) options.onTokenRefreshed?.(retryResult.apiKey);
   } catch (err) {
     throw new UpstreamUnreachableError(err);
   }
   if (!upstreamRes.ok) {
     const errBody = await upstreamRes.text();
-    log8?.(`anthropic upstream ${upstreamRes.status}: ${errBody}`);
+    options.log?.(`anthropic upstream ${upstreamRes.status}: ${errBody}`);
+    options.onUpstreamError?.(upstreamRes.status, errBody);
     res.writeHead(upstreamRes.status, { "Content-Type": upstreamRes.headers.get("content-type") || "application/json" });
     res.end(errBody);
     return;
@@ -5108,6 +5162,25 @@ function resolveUpstreamTools(tools, messages) {
 }
 
 // src/codex/upstream-error.ts
+import { APICallError, RetryError } from "ai";
+function sdkUpstreamErrorDetails(err) {
+  const retry = RetryError.isInstance(err) ? err : void 0;
+  const inner = retry?.lastError ?? err;
+  if (!APICallError.isInstance(inner)) return void 0;
+  let errorContent = inner.responseBody;
+  if (!errorContent && inner.data !== void 0) {
+    try {
+      errorContent = JSON.stringify(inner.data);
+    } catch {
+    }
+  }
+  return {
+    statusCode: inner.statusCode,
+    errorContent: errorContent || inner.message,
+    isRetryable: inner.isRetryable,
+    attemptCount: retry?.errors.length ?? 1
+  };
+}
 function formatUpstreamError(err) {
   if (!err || typeof err !== "object") return "Upstream model request failed.";
   const rec = err;
@@ -5147,7 +5220,7 @@ function formatUpstreamError(err) {
 function upstreamHttpStatus(err, message) {
   if (err && typeof err === "object" && "statusCode" in err) {
     const code = err.statusCode;
-    if (code === 400 || code === 401 || code === 403 || code === 404 || code === 429) return code;
+    if (typeof code === "number" && code >= 400 && code <= 599) return code;
   }
   if (message.includes("HTTP 429") || message.includes("429")) return 429;
   if (message.includes("HTTP 400")) return 400;
@@ -5394,8 +5467,10 @@ async function writeAnthropicStream(fullStream, modelId, write, log8) {
   };
   for await (const part of fullStream) {
     switch (part.type) {
+      // The SDK emits start before it knows whether the provider accepted the
+      // request. Wait for content/finish so a pre-content HTTP failure can still
+      // propagate through the proxy with its real non-2xx status.
       case "start":
-        ensureStart();
         break;
       case "reasoning-start":
         openBlock("thinking", { type: "thinking", thinking: "", signature: "" });
@@ -5481,8 +5556,7 @@ async function writeAnthropicStream(fullStream, modelId, write, log8) {
         const errorType = anthropicErrorType(upstreamHttpStatus(part.error, errMsg));
         log8?.(() => `sdk stream error (${errorType}): ${errMsg}`);
         closeOpen();
-        emit("error", { type: "error", error: { type: errorType, message: errMsg } });
-        return;
+        throw part.error instanceof Error || part.error && typeof part.error === "object" ? part.error : new Error(errMsg);
       }
       default:
         break;
@@ -5589,7 +5663,7 @@ function lookupRoute(byAlias, id) {
   }
   return void 0;
 }
-function startProxyCatalog(routes, defaultAliasId, debug = false) {
+function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPath) {
   const proxyToken = randomUUID5();
   silenceSdkWarnings();
   if (routes.length === 0) {
@@ -5683,22 +5757,24 @@ function startProxyCatalog(routes, defaultAliasId, debug = false) {
           plog(() => `anthropic-passthrough: model=${route.realModelId}, stream=${clientWantsStream}`);
         }
         try {
-          await relayAnthropicMessages(
-            res,
-            targetUrl,
-            forwardBody,
-            apiKey,
-            clientWantsStream,
-            effectiveBeta,
-            isOAuth ? "oauth" : "api",
-            (message) => plog(message),
+          await relayAnthropicMessages(res, targetUrl, forwardBody, apiKey, clientWantsStream, {
+            inboundBeta: effectiveBeta,
+            authType: isOAuth ? "oauth" : "api",
+            log: (message) => plog(message),
             claudeCodeSessionId,
-            route.headers,
-            route.refreshToken,
-            (refreshed) => {
+            extraHeaders: route.headers,
+            refreshToken: route.refreshToken,
+            onTokenRefreshed: (refreshed) => {
               route.apiKey = refreshed;
-            }
-          );
+            },
+            onUpstreamError: inferenceLogPath ? (statusCode, errorContent) => writeInferenceResponseErrorLog(inferenceLogPath, {
+              modelId: originalModel,
+              provider: route.providerId ?? route.aliasId.split(":")[1] ?? "unknown",
+              route: "passthrough",
+              statusCode,
+              errorContent
+            }) : void 0
+          });
         } catch (err) {
           const message = err instanceof UpstreamUnreachableError ? err.message : String(err);
           plog(() => `anthropic-passthrough error: ${message}`);
@@ -5739,12 +5815,18 @@ function startProxyCatalog(routes, defaultAliasId, debug = false) {
             onDebug: (msg) => plog(() => msg)
           });
           if (clientWantsStream) {
-            res.writeHead(200, {
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-              "Connection": "keep-alive"
-            });
-            await streamAnthropicResponse(model, params, originalModel, (c) => res.write(c), plog);
+            const writeStreamChunk = (chunk) => {
+              if (!res.headersSent) {
+                res.writeHead(200, {
+                  "Content-Type": "text/event-stream",
+                  "Cache-Control": "no-cache",
+                  "Connection": "keep-alive"
+                });
+              }
+              res.write(chunk);
+            };
+            await streamAnthropicResponse(model, params, originalModel, writeStreamChunk, plog);
+            if (!res.headersSent) writeStreamChunk("");
             res.end();
           } else {
             const anthropicResponse = await generateAnthropicResponse(
@@ -5756,14 +5838,25 @@ function startProxyCatalog(routes, defaultAliasId, debug = false) {
             sendJson(res, 200, anthropicResponse);
           }
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          const body = err && typeof err === "object" && "responseBody" in err ? err.responseBody : void 0;
-          plog(() => `sdk error: ${message}${body ? ` \u2014 body: ${body}` : ""}`);
+          const message = formatUpstreamError(err);
+          const details = sdkUpstreamErrorDetails(err);
+          const upstreamStatus = details?.statusCode ?? upstreamHttpStatus(err, message);
+          plog(() => `sdk error: ${message}${details?.errorContent ? ` \u2014 body: ${details.errorContent}` : ""}`);
+          if (inferenceLogPath && upstreamStatus >= 400) {
+            writeInferenceResponseErrorLog(inferenceLogPath, {
+              modelId: originalModel,
+              provider: route.providerId ?? route.aliasId.split(":")[1] ?? "unknown",
+              route: "translated",
+              statusCode: upstreamStatus,
+              errorContent: details?.errorContent ?? message,
+              isRetryable: details?.isRetryable,
+              attemptCount: details?.attemptCount
+            });
+          }
           if (!res.headersSent) {
-            const status = upstreamHttpStatus(err, message);
-            anthropicError(res, status === 500 ? 502 : status, message);
+            anthropicError(res, upstreamStatus === 500 ? 502 : upstreamStatus, message);
           } else {
-            const errorType = anthropicErrorType(upstreamHttpStatus(err, message));
+            const errorType = anthropicErrorType(upstreamStatus);
             res.write(`event: error
 data: ${JSON.stringify({ type: "error", error: { type: errorType, message } })}
 
@@ -7162,6 +7255,7 @@ ${additionalCa}
 // src/http-proxy/server.ts
 var ANTHROPIC_HOST = "api.anthropic.com";
 var MAX_BODY_BYTES = 50 * 1024 * 1024;
+var MAX_ERROR_BODY_BYTES = 64 * 1024;
 function authorityParts(authority) {
   try {
     const parsed = new URL2(`http://${authority}`);
@@ -7191,9 +7285,37 @@ function readRawBody(req) {
     req.on("error", reject);
   });
 }
-function copyResponse(upstream, res) {
-  res.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, upstream.rawHeaders);
-  upstream.once("error", () => res.destroy());
+function copyResponse(upstream, res, onErrorResponse) {
+  const statusCode = upstream.statusCode ?? 502;
+  const errorChunks = [];
+  let capturedBytes = 0;
+  let truncated = false;
+  let errorLogged = false;
+  const logErrorResponse = (suffix = "") => {
+    if (errorLogged || statusCode < 400 || !onErrorResponse) return;
+    errorLogged = true;
+    const body = Buffer.concat(errorChunks).toString("utf8");
+    onErrorResponse(statusCode, `${body}${truncated ? " [truncated]" : ""}${suffix}`);
+  };
+  if (statusCode >= 400 && onErrorResponse) {
+    upstream.on("data", (chunk) => {
+      if (capturedBytes >= MAX_ERROR_BODY_BYTES) {
+        truncated = true;
+        return;
+      }
+      const available = MAX_ERROR_BODY_BYTES - capturedBytes;
+      const captured = chunk.length > available ? chunk.subarray(0, available) : chunk;
+      errorChunks.push(Buffer.from(captured));
+      capturedBytes += captured.length;
+      if (captured.length < chunk.length) truncated = true;
+    });
+    upstream.once("end", () => logErrorResponse());
+  }
+  res.writeHead(statusCode, upstream.statusMessage, upstream.rawHeaders);
+  upstream.once("error", (err) => {
+    logErrorResponse(` [stream error: ${err.message}]`);
+    res.destroy();
+  });
   upstream.pipe(res);
 }
 function requestHeadersWithoutProxyHeaders(req) {
@@ -7205,7 +7327,7 @@ function requestHeadersWithoutProxyHeaders(req) {
   }
   return headers;
 }
-function forwardRawAnthropicRequest(req, res, rawBody, origin, rejectUnauthorized) {
+function forwardRawAnthropicRequest(req, res, rawBody, origin, rejectUnauthorized, onErrorResponse) {
   return new Promise((resolve2) => {
     const upstream = https.request({
       protocol: "https:",
@@ -7217,7 +7339,7 @@ function forwardRawAnthropicRequest(req, res, rawBody, origin, rejectUnauthorize
       servername: net.isIP(origin.hostname) ? void 0 : origin.hostname,
       rejectUnauthorized
     }, (upstreamRes) => {
-      copyResponse(upstreamRes, res);
+      copyResponse(upstreamRes, res, onErrorResponse);
       upstreamRes.once("end", resolve2);
       upstreamRes.once("error", resolve2);
     });
@@ -7287,7 +7409,12 @@ async function startHttpProxy(options) {
   const anthropicOrigin = new URL2(options.anthropicOrigin ?? "https://api.anthropic.com");
   let adapter = options.adapterHandle ?? null;
   if (options.routes.length > 0) {
-    adapter ??= await startProxyCatalog(options.routes, options.routes[0].aliasId, options.debug);
+    adapter ??= await startProxyCatalog(
+      options.routes,
+      options.routes[0].aliasId,
+      options.debug,
+      options.inferenceLogPath
+    );
   }
   const mitmServer = https.createServer({
     key: certificates.serverKey,
@@ -7317,13 +7444,28 @@ async function startHttpProxy(options) {
           effort: parsed ? anthropicEffortFromRequest(parsed) : void 0,
           provider,
           route: route ? "translated" : "passthrough",
-          requestPreview: getLatestMessagePreview(parsed?.messages)
+          requestPreview: getLatestMessagePreview(parsed?.messages, parsed?.system)
         });
       }
       if (route && adapter) {
         await forwardToAdapter(req, res, rawBody, adapter);
         return;
       }
+      await forwardRawAnthropicRequest(
+        req,
+        res,
+        rawBody,
+        anthropicOrigin,
+        options.anthropicRejectUnauthorized ?? true,
+        options.inferenceLogPath ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath, {
+          modelId: typeof parsed?.model === "string" ? parsed.model : "unknown",
+          provider: "anthropic",
+          route: "passthrough",
+          statusCode,
+          errorContent
+        }) : void 0
+      );
+      return;
     }
     await forwardRawAnthropicRequest(
       req,
@@ -7729,6 +7871,8 @@ async function streamOpenAiResponse(model, params, responseModelId, onChunk) {
       case "finish":
         send({}, p9.finishReason || "stop");
         break;
+      case "error":
+        throw p9.error instanceof Error || p9.error && typeof p9.error === "object" ? p9.error : new Error(typeof p9.error === "string" ? p9.error : "Upstream stream failed");
     }
   }
   onChunk("data: [DONE]\n\n");
@@ -7746,6 +7890,22 @@ function auditInference(options, entry) {
 }
 function inferenceProvider(model) {
   return model.providerId ?? String(model.sourceBackend);
+}
+function auditSdkError(options, requestedModelId, model, err, message) {
+  const details = sdkUpstreamErrorDetails(err);
+  const statusCode = details?.statusCode ?? upstreamHttpStatus(err, message);
+  if (options.inferenceLogPath && statusCode >= 400) {
+    writeInferenceResponseErrorLog(options.inferenceLogPath, {
+      modelId: requestedModelId,
+      provider: inferenceProvider(model),
+      route: "translated",
+      statusCode,
+      errorContent: details?.errorContent ?? message,
+      isRetryable: details?.isRetryable,
+      attemptCount: details?.attemptCount
+    });
+  }
+  return statusCode;
 }
 function openAiEffort(body) {
   if (typeof body.reasoning_effort === "string" && body.reasoning_effort.trim()) {
@@ -7852,7 +8012,7 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
       effort: anthropicEffortFromRequest(body) ?? model.defaultEffort,
       provider: inferenceProvider(model),
       route: "passthrough",
-      requestPreview: getLatestMessagePreview(body.messages)
+      requestPreview: getLatestMessagePreview(body.messages, body.system)
     });
     let effectiveBeta = inboundBeta;
     let claudeCodeSessionId;
@@ -7865,22 +8025,24 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
     }
     const refreshToken = isOAuth && model.providerId ? () => resolveProviderCredential(model.providerId, oauthAuthRef(model.providerId)) : void 0;
     plog(() => `anthropic-passthrough \u2192 ${messagesUrl} oauth=${isOAuth} stream=${clientWantsStream}`);
-    await relayAnthropicMessages(
-      res,
-      messagesUrl,
-      forwardBody,
-      apiKey,
-      clientWantsStream,
-      effectiveBeta,
-      isOAuth ? "oauth" : "api",
-      (message) => plog(message),
+    await relayAnthropicMessages(res, messagesUrl, forwardBody, apiKey, clientWantsStream, {
+      inboundBeta: effectiveBeta,
+      authType: isOAuth ? "oauth" : "api",
+      log: (message) => plog(message),
       claudeCodeSessionId,
-      model.headers,
+      extraHeaders: model.headers,
       refreshToken,
-      (refreshed) => {
+      onTokenRefreshed: (refreshed) => {
         model.apiKey = refreshed;
-      }
-    );
+      },
+      onUpstreamError: options.inferenceLogPath ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath, {
+        modelId: body.model,
+        provider: inferenceProvider(model),
+        route: "passthrough",
+        statusCode,
+        errorContent
+      }) : void 0
+    });
     return;
   }
   if (model.modelFormat === "openai") {
@@ -7894,7 +8056,7 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
       effort: anthropicEffortFromRequest(body) ?? model.defaultEffort,
       provider: inferenceProvider(model),
       route: "translated",
-      requestPreview: getLatestMessagePreview(body.messages)
+      requestPreview: getLatestMessagePreview(body.messages, body.system)
     });
     const languageModel = await getOrInitLanguageModel(modelCache, model, model.npm, model.apiBaseUrl, apiKey, options.vertex);
     const npmMaxTools = maxToolsForNpm(model.npm);
@@ -7920,12 +8082,18 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
     plog(() => `sdk npm=${model.npm} upstream=${upstreamModelId(model)} responseModel=${responseModelId} stream=${clientWantsStream}`);
     try {
       if (clientWantsStream) {
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive"
-        });
-        await streamAnthropicResponse(languageModel, params, responseModelId, (chunk) => res.write(chunk));
+        const writeStreamChunk = (chunk) => {
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Connection": "keep-alive"
+            });
+          }
+          res.write(chunk);
+        };
+        await streamAnthropicResponse(languageModel, params, responseModelId, writeStreamChunk);
+        if (!res.headersSent) writeStreamChunk("");
         res.end();
       } else {
         const anthropicResponse = await generateAnthropicResponse(languageModel, params, responseModelId);
@@ -7933,11 +8101,18 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
       }
     } catch (err) {
       const message = formatUpstreamError(err);
+      const status = auditSdkError(options, body.model, model, err, message);
       plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
       if (!res.headersSent) {
-        const status = upstreamHttpStatus(err, message);
         sendJson(res, status === 500 ? 502 : status, { error: { message } });
-      } else res.end();
+      } else {
+        const errorType = anthropicErrorType(status);
+        res.write(`event: error
+data: ${JSON.stringify({ type: "error", error: { type: errorType, message } })}
+
+`);
+        res.end();
+      }
     }
     return;
   }
@@ -7963,9 +8138,17 @@ async function handleOpenAIChatCompletions(req, res, options, modelCache, plog) 
       effort: openAiEffort(body),
       provider: inferenceProvider(model),
       route: "passthrough",
-      requestPreview: getLatestMessagePreview(body.messages)
+      requestPreview: getLatestMessagePreview(body.messages, body.system)
     });
-    await relayAnthropicMessages(res, completionsUrl, body, apiKey2, Boolean(body.stream));
+    await relayAnthropicMessages(res, completionsUrl, body, apiKey2, Boolean(body.stream), {
+      onUpstreamError: options.inferenceLogPath ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath, {
+        modelId: body.model,
+        provider: inferenceProvider(model),
+        route: "passthrough",
+        statusCode,
+        errorContent
+      }) : void 0
+    });
     return;
   }
   const npm = model.npm || (model.modelFormat === "anthropic" ? "@ai-sdk/anthropic" : void 0);
@@ -7979,7 +8162,7 @@ async function handleOpenAIChatCompletions(req, res, options, modelCache, plog) 
     effort: openAiEffort(body),
     provider: inferenceProvider(model),
     route: "translated",
-    requestPreview: getLatestMessagePreview(body.messages)
+    requestPreview: getLatestMessagePreview(body.messages, body.system)
   });
   const baseURL = model.modelFormat === "anthropic" ? model.baseUrl : model.apiBaseUrl;
   const languageModel = await getOrInitLanguageModel(modelCache, model, npm, baseURL, apiKey, options.vertex);
@@ -7989,12 +8172,18 @@ async function handleOpenAIChatCompletions(req, res, options, modelCache, plog) 
   plog(() => `sdk-openai npm=${npm} upstream=${upstreamModelId(model)} responseModel=${responseModelId} stream=${clientWantsStream}`);
   try {
     if (clientWantsStream) {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
-      });
-      await streamOpenAiResponse(languageModel, params, responseModelId, (chunk) => res.write(chunk));
+      const writeStreamChunk = (chunk) => {
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+          });
+        }
+        res.write(chunk);
+      };
+      await streamOpenAiResponse(languageModel, params, responseModelId, writeStreamChunk);
+      if (!res.headersSent) writeStreamChunk("");
       res.end();
     } else {
       const response = await generateOpenAiResponse(languageModel, params, responseModelId);
@@ -8002,11 +8191,16 @@ async function handleOpenAIChatCompletions(req, res, options, modelCache, plog) 
     }
   } catch (err) {
     const message = formatUpstreamError(err);
+    const status = auditSdkError(options, body.model, model, err, message);
     plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
     if (!res.headersSent) {
-      const status = upstreamHttpStatus(err, message);
       sendJson(res, status === 500 ? 502 : status, { error: { message } });
-    } else res.end();
+    } else {
+      res.write(`data: ${JSON.stringify({ error: { message, type: "upstream_error", code: status } })}
+
+`);
+      res.end();
+    }
   }
 }
 function lookupModel(res, catalog, modelId) {
@@ -11088,4 +11282,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-6A7U2MG6.js.map
+//# sourceMappingURL=chunk-6QTJOV2T.js.map

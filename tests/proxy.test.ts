@@ -1,7 +1,9 @@
 // tests/proxy.test.ts
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import http from 'node:http';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { aliasModelId, startProxyCatalog, type ProxyRoute } from '../src/proxy.js';
 import { getProxyDebugLogPath } from '../src/trace-log.js';
 
@@ -158,6 +160,68 @@ describe('SDK anonymous route handling', () => {
     expect(res.status).toBe(502);
     expect(res.body).not.toContain('Missing API key');
   });
+});
+
+describe('SDK translated error logging', () => {
+  it('preserves a pre-stream HTTP failure and logs the AI SDK response body', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'relay-ai-sdk-error-'));
+    const inferenceLogPath = join(dir, 'inference.jsonl');
+    const previousRequestPreview = process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+    process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = '1';
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Connection': 'close' });
+      res.end(JSON.stringify({ error: { message: 'translated request rejected', type: 'invalid_request_error' } }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstream.once('error', reject);
+      upstream.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = upstream.address();
+    if (!address || typeof address === 'string') throw new Error('test upstream did not bind');
+
+    const route: ProxyRoute = {
+      aliasId: 'relay:test:translated-model',
+      realModelId: 'translated-model',
+      displayName: 'Translated Model',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      providerId: 'test-provider',
+    };
+    const handle = await startProxyCatalog([route], route.aliasId, false, inferenceLogPath);
+
+    try {
+      const res = await postToProxy(handle.port, handle.token, {
+        model: route.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.body).toContain('translated request rejected');
+      const errorEntry = JSON.parse(readFileSync(inferenceLogPath, 'utf8').trim());
+      expect(errorEntry).toMatchObject({
+        event: 'upstream_error',
+        modelId: route.aliasId,
+        provider: 'test-provider',
+        route: 'translated',
+        statusCode: 400,
+        isRetryable: false,
+        attemptCount: 1,
+      });
+      expect(errorEntry.errorContent).toContain('translated request rejected');
+    } finally {
+      if (previousRequestPreview === undefined) delete process.env['RELAY_AI_LOG_REQUEST_PREVIEW'];
+      else process.env['RELAY_AI_LOG_REQUEST_PREVIEW'] = previousRequestPreview;
+      handle.close();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 describe('anthropic passthrough debug logging', () => {
