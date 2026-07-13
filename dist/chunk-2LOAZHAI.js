@@ -4333,7 +4333,8 @@ async function relayAnthropicMessages(res, messagesUrl, body, apiKey, clientWant
       options.claudeCodeSessionId,
       options.extraHeaders
     ),
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal: options.signal
   });
   let upstreamRes;
   try {
@@ -5628,8 +5629,13 @@ async function writeAnthropicStream(fullStream, modelId, write, log8, observer) 
   emit("message_stop", { type: "message_stop" });
 }
 async function streamAnthropicResponse(model, params, modelId, write, log8, observer) {
-  const result = streamText({ model, ...params, onError: () => {
-  } });
+  const result = streamText({
+    model,
+    ...params,
+    abortSignal: observer?.abortSignal,
+    onError: () => {
+    }
+  });
   Promise.resolve(result.text).catch(() => {
   });
   Promise.resolve(result.toolCalls).catch(() => {
@@ -5648,13 +5654,33 @@ async function generateAnthropicResponse(model, params, modelId, options) {
   let finishReason;
   let usage;
   if (options?.forceStream) {
-    const r = streamText({ model, ...params, onError: () => {
-    } });
+    const r = streamText({
+      model,
+      ...params,
+      abortSignal: options.abortSignal,
+      onError: () => {
+      }
+    });
     Promise.resolve(r.toolResults).catch(() => {
     });
-    [text4, toolCalls, finishReason, usage] = await Promise.all([r.text, r.toolCalls, r.finishReason, r.usage]);
+    const observeParts = options.onPart ? (async () => {
+      for await (const part of r.fullStream) {
+        options.onPart?.(part.type);
+      }
+    })() : Promise.resolve();
+    [text4, toolCalls, finishReason, usage] = await Promise.all([
+      r.text,
+      r.toolCalls,
+      r.finishReason,
+      r.usage,
+      observeParts
+    ]);
   } else {
-    const r = await generateText({ model, ...params });
+    const r = await generateText({
+      model,
+      ...params,
+      abortSignal: options?.abortSignal
+    });
     ({ text: text4, toolCalls, finishReason, usage } = r);
   }
   return {
@@ -5674,6 +5700,40 @@ async function generateAnthropicResponse(model, params, modelId, options) {
     stop_reason: finishReason === "tool-calls" ? "tool_use" : "end_turn",
     usage: toAnthropicUsage(usage)
   };
+}
+
+// src/anthropic-endpoints.ts
+var MESSAGE_PATH = "/v1/messages";
+var COUNT_TOKENS_PATH = "/v1/messages/count_tokens";
+function anthropicMessagesEndpoint(url) {
+  if (!url) return null;
+  let pathname;
+  try {
+    pathname = new URL(url, "http://relay.local").pathname;
+  } catch {
+    return null;
+  }
+  if (pathname === MESSAGE_PATH) return "messages";
+  if (pathname === COUNT_TOKENS_PATH) return "count_tokens";
+  return null;
+}
+var NON_CONTEXT_FIELDS = /* @__PURE__ */ new Set([
+  "model",
+  "stream",
+  "max_tokens",
+  "temperature",
+  "top_p",
+  "top_k",
+  "stop_sequences",
+  "metadata"
+]);
+function estimateAnthropicInputTokens(body) {
+  const contextBody = Object.fromEntries(
+    Object.entries(body).filter(([key]) => !NON_CONTEXT_FIELDS.has(key))
+  );
+  const serialized = JSON.stringify(contextBody);
+  if (!serialized || serialized === "{}") return 0;
+  return Math.max(1, Math.ceil(Buffer.byteLength(serialized, "utf8") / 4));
 }
 
 // src/proxy.ts
@@ -5741,6 +5801,12 @@ function createTranslationLifecycle(logPath, requestId, modelId, provider) {
       stopped = true;
       clearInterval(timer);
       write("translation_completed", snapshot(Date.now()));
+    },
+    cancel() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      write("translation_cancelled", snapshot(Date.now()));
     },
     fail(errorType) {
       if (stopped) return;
@@ -5843,12 +5909,21 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
       }
       return;
     }
-    if (req.method === "POST" && req.url?.startsWith("/v1/messages")) {
+    const messagesEndpoint = anthropicMessagesEndpoint(req.url);
+    if (req.method === "POST" && messagesEndpoint) {
       const inboundKey = extractApiKey(req);
       if (inboundKey !== proxyToken) {
         anthropicError(res, 401, "Invalid proxy token");
         return;
       }
+      const clientAbort = new AbortController();
+      const abortForClientDisconnect = () => {
+        if (!clientAbort.signal.aborted) clientAbort.abort(new Error("Client disconnected"));
+      };
+      req.once("aborted", abortForClientDisconnect);
+      res.once("close", () => {
+        if (!res.writableFinished) abortForClientDisconnect();
+      });
       let anthropicBody;
       try {
         const raw = await readBody(req);
@@ -5868,6 +5943,43 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
         () => `POST /v1/messages - alias=${originalModel} route=${route.realModelId} format=${route.modelFormat} key=${apiKey ? `len:${apiKey.length}` : "MISSING"}`
       );
       const usesSdkAdapter = isSdkMigratedNpm(route.npm);
+      if (messagesEndpoint === "count_tokens") {
+        if (route.modelFormat !== "anthropic") {
+          const inputTokens = estimateAnthropicInputTokens(anthropicBody);
+          plog(() => `token-count: local estimate model=${originalModel} input_tokens=${inputTokens}`);
+          res.setHeader("x-relay-token-count-source", "local-estimate");
+          sendJson(res, 200, { input_tokens: inputTokens });
+          return;
+        }
+        if (!apiKey) {
+          anthropicError(res, 401, "Missing API key");
+          return;
+        }
+        const betaHeaderRaw = req.headers["anthropic-beta"];
+        const inboundBeta = Array.isArray(betaHeaderRaw) ? betaHeaderRaw.join(",") : betaHeaderRaw;
+        const forwardBody = { ...anthropicBody, model: route.realModelId };
+        const targetUrl = `${upstreamUrl}/v1/messages/count_tokens`;
+        const isOAuth = route.authType === "oauth";
+        try {
+          await relayAnthropicMessages(res, targetUrl, forwardBody, apiKey, false, {
+            inboundBeta,
+            authType: isOAuth ? "oauth" : "api",
+            log: (message) => plog(message),
+            extraHeaders: route.headers,
+            refreshToken: route.refreshToken,
+            onTokenRefreshed: (refreshed) => {
+              route.apiKey = refreshed;
+            },
+            signal: clientAbort.signal
+          });
+        } catch (err) {
+          if (clientAbort.signal.aborted) return;
+          const message = err instanceof UpstreamUnreachableError ? err.message : String(err);
+          plog(() => `anthropic token-count error: ${message}`);
+          anthropicError(res, 502, message);
+        }
+        return;
+      }
       if (!apiKey && !usesSdkAdapter) {
         anthropicError(res, 401, "Missing API key");
         return;
@@ -5902,6 +6014,7 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
             onTokenRefreshed: (refreshed) => {
               route.apiKey = refreshed;
             },
+            signal: clientAbort.signal,
             onUpstreamError: inferenceLogPath ? (statusCode, errorContent) => writeInferenceResponseErrorLog(inferenceLogPath, {
               modelId: originalModel,
               provider: route.providerId ?? route.aliasId.split(":")[1] ?? "unknown",
@@ -5911,6 +6024,7 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
             }) : void 0
           });
         } catch (err) {
+          if (clientAbort.signal.aborted) return;
           const message = err instanceof UpstreamUnreachableError ? err.message : String(err);
           plog(() => `anthropic-passthrough error: ${message}`);
           anthropicError(res, 502, message);
@@ -5919,12 +6033,12 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
       }
       if (usesSdkAdapter) {
         const openAiOAuth = route.npm === "@ai-sdk/openai" && route.authType === "oauth";
-        const translationLifecycle = clientWantsStream ? createTranslationLifecycle(
+        const translationLifecycle = createTranslationLifecycle(
           inferenceLogPath,
           relayRequestId,
           originalModel,
           route.providerId ?? route.aliasId.split(":")[1] ?? "unknown"
-        ) : void 0;
+        );
         try {
           const params = translateRequest2(anthropicBody, route.npm, {
             openAiOAuth,
@@ -5955,8 +6069,8 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
             preferWebSockets: route.preferWebSockets,
             onDebug: (msg) => plog(() => msg)
           });
+          translationLifecycle?.dispatched();
           if (clientWantsStream) {
-            translationLifecycle?.dispatched();
             const writeStreamChunk = (chunk) => {
               translationLifecycle?.onOutput(chunk);
               if (!res.headersSent) {
@@ -5974,7 +6088,10 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
               originalModel,
               writeStreamChunk,
               plog,
-              { onPart: (partType) => translationLifecycle?.onPart(partType) }
+              {
+                onPart: (partType) => translationLifecycle?.onPart(partType),
+                abortSignal: clientAbort.signal
+              }
             );
             translationLifecycle?.complete();
             if (!res.headersSent) writeStreamChunk("");
@@ -5984,11 +6101,21 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
               model,
               params,
               originalModel,
-              { forceStream: openAiOAuth }
+              {
+                forceStream: openAiOAuth,
+                abortSignal: clientAbort.signal,
+                onPart: (partType) => translationLifecycle?.onPart(partType)
+              }
             );
+            translationLifecycle?.onOutput(JSON.stringify(anthropicResponse));
+            translationLifecycle?.complete();
             sendJson(res, 200, anthropicResponse);
           }
         } catch (err) {
+          if (clientAbort.signal.aborted) {
+            translationLifecycle?.cancel();
+            return;
+          }
           translationLifecycle?.fail(err instanceof Error ? err.name : "UpstreamError");
           const message = formatUpstreamError(err);
           const details = sdkUpstreamErrorDetails(err);
@@ -6041,7 +6168,8 @@ data: ${JSON.stringify({ type: "error", error: { type: errorType, message } })}
             Authorization: `Bearer ${token}`,
             "User-Agent": "vscode/1.X.X (Antigravity/4.2.0)"
           },
-          body: JSON.stringify(envelope)
+          body: JSON.stringify(envelope),
+          signal: clientAbort.signal
         });
         try {
           const retryResult = await fetchWithOAuthRetry(apiKey, fetchCloudCode, route.refreshToken);
@@ -6060,6 +6188,7 @@ data: ${JSON.stringify({ type: "error", error: { type: errorType, message } })}
             sendJson(res, 200, response);
           }
         } catch (err) {
+          if (clientAbort.signal.aborted) return;
           const message = err instanceof Error ? err.message : String(err);
           plog(() => `cloud-code fetch error: ${message}`);
           if (!res.headersSent) anthropicError(res, 502, message);
@@ -7483,6 +7612,13 @@ function requestHeadersWithoutProxyHeaders(req) {
 }
 function forwardRawAnthropicRequest(req, res, rawBody, origin, rejectUnauthorized, onErrorResponse) {
   return new Promise((resolve2) => {
+    let settled = false;
+    let clientDisconnected = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      resolve2();
+    };
     const upstream = https.request({
       protocol: "https:",
       hostname: origin.hostname,
@@ -7494,13 +7630,23 @@ function forwardRawAnthropicRequest(req, res, rawBody, origin, rejectUnauthorize
       rejectUnauthorized
     }, (upstreamRes) => {
       copyResponse(upstreamRes, res, onErrorResponse);
-      upstreamRes.once("end", resolve2);
-      upstreamRes.once("error", resolve2);
+      upstreamRes.once("end", done);
+      upstreamRes.once("error", done);
+    });
+    res.once("close", () => {
+      if (res.writableFinished) return;
+      clientDisconnected = true;
+      upstream.destroy(new Error("Client disconnected"));
+      done();
     });
     upstream.once("error", (err) => {
+      if (clientDisconnected) {
+        done();
+        return;
+      }
       if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
       res.end(`Anthropic upstream unreachable: ${err.message}`);
-      resolve2();
+      done();
     });
     upstream.end(rawBody);
   });
@@ -7517,6 +7663,8 @@ function forwardToAdapter(req, res, rawBody, adapter, lifecycle) {
     let adapterEnded = false;
     let failed = false;
     let clientDisconnected = false;
+    let adapterResponse;
+    let upstream;
     const writeLifecycle = (event, extra = {}) => {
       if (!lifecycle) return;
       writeInferenceResponseLifecycleLog(lifecycle.logPath, {
@@ -7575,8 +7723,15 @@ function forwardToAdapter(req, res, rawBody, adapter, lifecycle) {
         bytes,
         chunks
       });
+      adapterResponse?.destroy(new Error("Client disconnected"));
+      upstream?.destroy(new Error("Client disconnected"));
+      resolve2();
     });
     const failAdapterRequest = (err) => {
+      if (clientDisconnected) {
+        resolve2();
+        return;
+      }
       if (headersReceived || failed) return;
       failed = true;
       stopProgress();
@@ -7594,7 +7749,7 @@ function forwardToAdapter(req, res, rawBody, adapter, lifecycle) {
       res.end(`Relay adapter unreachable: ${err.message}`);
       resolve2();
     };
-    const upstream = http2.request({
+    upstream = http2.request({
       hostname: "127.0.0.1",
       port: adapter.port,
       method: "POST",
@@ -7606,6 +7761,7 @@ function forwardToAdapter(req, res, rawBody, adapter, lifecycle) {
         ...lifecycle ? { "x-relay-request-id": lifecycle.requestId } : {}
       }
     }, (upstreamRes) => {
+      adapterResponse = upstreamRes;
       headersReceived = true;
       statusCode = upstreamRes.statusCode ?? 502;
       lastActivityAt = Date.now();
@@ -7625,6 +7781,10 @@ function forwardToAdapter(req, res, rawBody, adapter, lifecycle) {
       });
       copyResponse(upstreamRes, res);
       const failAdapterResponse = (err) => {
+        if (clientDisconnected) {
+          resolve2();
+          return;
+        }
         if (adapterEnded || failed) return;
         failed = true;
         stopProgress();
@@ -7715,7 +7875,8 @@ async function startHttpProxy(options) {
       res.end(err instanceof Error ? err.message : String(err));
       return;
     }
-    if (req.method === "POST" && req.url?.startsWith("/v1/messages")) {
+    const messagesEndpoint = anthropicMessagesEndpoint(req.url);
+    if (req.method === "POST" && messagesEndpoint) {
       const requestId = randomUUID6();
       let parsed = null;
       let route;
@@ -7724,7 +7885,7 @@ async function startHttpProxy(options) {
         if (typeof parsed.model === "string") route = routesById.get(parsed.model);
       } catch {
       }
-      if (options.inferenceLogPath) {
+      if (messagesEndpoint === "messages" && options.inferenceLogPath) {
         const provider = route ? route.providerId ?? route.aliasId.split(":")[1] ?? "unknown" : "anthropic";
         writeInferenceRequestLog(options.inferenceLogPath, {
           requestId,
@@ -7737,7 +7898,7 @@ async function startHttpProxy(options) {
         });
       }
       if (route && adapter) {
-        await forwardToAdapter(req, res, rawBody, adapter, options.inferenceLogPath ? {
+        await forwardToAdapter(req, res, rawBody, adapter, messagesEndpoint === "messages" && options.inferenceLogPath ? {
           logPath: options.inferenceLogPath,
           requestId,
           modelId: typeof parsed?.model === "string" ? parsed.model : "unknown",
@@ -7752,7 +7913,7 @@ async function startHttpProxy(options) {
         rawBody,
         anthropicOrigin,
         options.anthropicRejectUnauthorized ?? true,
-        options.inferenceLogPath ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath, {
+        messagesEndpoint === "messages" && options.inferenceLogPath ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath, {
           requestId,
           modelId: typeof parsed?.model === "string" ? parsed.model : "unknown",
           provider: "anthropic",
@@ -11578,4 +11739,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-CRUKD7DN.js.map
+//# sourceMappingURL=chunk-2LOAZHAI.js.map
