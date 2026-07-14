@@ -25,6 +25,7 @@ import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } 
 import { BACKENDS, VERSION } from './constants.js';
 import type { ParsedArgs, ModelInfo, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
 import { addFavorite, removeFavorite, isFavorite } from './favorites.js';
+import { isValidModelAlias, modelAliasTarget, parseModelAliasAssignment } from './model-aliases.js';
 import {
   browseByProviderChoice,
   buildGlobalFavoriteIndex,
@@ -218,11 +219,24 @@ export function parseArgs(args: string[]): ParsedArgs {
 
   if (first === 'models' || first === 'favorites') {
     const parsed = emptyParsed('models');
-    for (const arg of rest) {
+    for (let i = 0; i < rest.length; i += 1) {
+      const arg = rest[i]!;
       if (arg === '--help' || arg === '-h') parsed.showHelp = true;
       else if (arg === '--version' || arg === '-v') parsed.showVersion = true;
       else if (arg === '--agy') parsed.favoritesAgy = true;
       else if (arg === '--list') parsed.favoritesList = true;
+      else if (arg === '--alias' || arg.startsWith('--alias=')) {
+        const consumed = consumeServerOptionValue(arg, rest, i, '--alias', parsed);
+        if (!consumed) return parsed;
+        parsed.favoritesAlias = consumed.value;
+        i = consumed.next;
+      }
+      else if (arg === '--unalias' || arg.startsWith('--unalias=')) {
+        const consumed = consumeServerOptionValue(arg, rest, i, '--unalias', parsed);
+        if (!consumed) return parsed;
+        parsed.favoritesUnalias = consumed.value;
+        i = consumed.next;
+      }
       else if (!parsed.error) parsed.error = `Unknown models option: ${arg}`;
     }
     return parsed;
@@ -551,7 +565,7 @@ ${pc.bold('HTTP proxy mode:')}
   relay-ai claude --http-proxy leaves ANTHROPIC_BASE_URL unset and launches
   Claude Code with its normal Anthropic login. Favorite non-Anthropic AI SDK
   models are available by typing /model relay:<provider-id>:<model-id>.
-  Run relay-ai models --list to print the exact names.
+  Save short names with relay-ai models --alias, and run --list to print them.
 
 ${pc.bold('Note:')}
   Claude Code may save the launched model to ~/.claude/settings.json.
@@ -630,6 +644,8 @@ ${pc.bold('Usage:')}
   relay-ai favorites
   relay-ai models --list
   relay-ai favorites --agy
+  relay-ai models --alias luna=relay:openai-oauth:gpt-5.6-luna
+  relay-ai models --unalias luna
   relay-ai models
   relay-ai favorites --help
   relay-ai favorites --version
@@ -642,6 +658,9 @@ ${pc.bold('Behavior:')}
   --agy manages Antigravity CLI favorites only (max 6).
   --list prints the exact relay:<provider-id>:<model-id> names available in
   HTTP proxy mode, without opening the interactive manager.
+  --alias <name=target> saves a short name for an HTTP-proxy favorite. The
+  target is relay:<provider-id>:<model-id> (the relay: prefix is optional).
+  --unalias <name> removes a saved short name.
 
 ${pc.bold('How it works:')}
   Claude/Codex/Gemini/server use the global favorites list.
@@ -653,6 +672,7 @@ ${pc.bold('How it works:')}
 ${pc.bold('Examples:')}
   relay-ai favorites
   relay-ai favorites --agy
+  relay-ai models --alias luna=relay:openai-oauth:gpt-5.6-luna
   relay-ai claude    # switch menu active when favorites are set`;
 }
 
@@ -849,10 +869,55 @@ const AGY_CLI_FAVORITES_CAP = 6;
 interface FavoritesCommandOptions {
   scope?: 'global' | 'agy';
   list?: boolean;
+  alias?: string;
+  unalias?: string;
 }
 
 export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Promise<number> {
   const scope = opts.scope ?? 'global';
+  const changesAlias = opts.alias !== undefined || opts.unalias !== undefined;
+  if (changesAlias && (scope === 'agy' || opts.list || (opts.alias !== undefined && opts.unalias !== undefined))) {
+    p.log.error('--alias/--unalias apply one at a time to global HTTP-proxy favorites.');
+    return 1;
+  }
+  if (opts.alias !== undefined) {
+    const parsed = parseModelAliasAssignment(opts.alias);
+    if ('error' in parsed) {
+      p.log.error(parsed.error);
+      return 1;
+    }
+    const prefs = loadPreferences();
+    const isSavedFavorite = (prefs.favoriteModels ?? []).some(
+      favorite => favorite.providerId === parsed.providerId && favorite.modelId === parsed.modelId,
+    );
+    if (!isSavedFavorite) {
+      p.log.error(`${modelAliasTarget(parsed)} is not a saved favorite.`);
+      p.log.info('Add it with `relay-ai models`, then save the alias.');
+      return 1;
+    }
+    const modelAliases = (prefs.modelAliases ?? []).filter(alias => alias.name !== parsed.name);
+    modelAliases.push(parsed);
+    savePreferences({ modelAliases });
+    p.log.success(`Saved model alias ${parsed.name} → ${modelAliasTarget(parsed)}.`);
+    return 0;
+  }
+  if (opts.unalias !== undefined) {
+    const name = opts.unalias.trim();
+    if (!isValidModelAlias(name)) {
+      p.log.error('Alias names must be 1-64 letters, numbers, dots, underscores, or hyphens.');
+      return 1;
+    }
+    const prefs = loadPreferences();
+    const aliases = prefs.modelAliases ?? [];
+    const modelAliases = aliases.filter(alias => alias.name !== name);
+    if (modelAliases.length === aliases.length) {
+      p.log.error(`No model alias named ${name} is saved.`);
+      return 1;
+    }
+    savePreferences({ modelAliases });
+    p.log.success(`Removed model alias ${name}.`);
+    return 0;
+  }
   if (opts.list) {
     if (scope === 'agy') {
       p.log.error('--list shows global favorites used by HTTP proxy mode; remove --agy.');
@@ -860,7 +925,7 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
     }
     try {
       const loaded = await loadHttpProxyRoutes();
-      printHttpProxyModels(loaded.routes);
+      printHttpProxyModels(loaded.routes, loaded.aliases);
       reportSkippedHttpProxyFavorites(loaded);
       return 0;
     } catch (err) {
@@ -1125,7 +1190,7 @@ async function runClaudeHttpProxyCommand(
       console.log('  HTTPS_PROXY/HTTP_PROXY=http://127.0.0.1:<random-port>');
       console.log('  NODE_EXTRA_CA_CERTS=~/.relay-ai/http-proxy/relay-ai-ca.pem');
       console.log('');
-      printHttpProxyModels(loaded.routes);
+      printHttpProxyModels(loaded.routes, loaded.aliases);
       reportSkippedHttpProxyFavorites(loaded);
       console.log('');
       return 0;
@@ -1147,10 +1212,10 @@ async function runClaudeHttpProxyCommand(
   if (!agentStdout) {
     p.log.info(`HTTP proxy started on port ${handle.port}; Claude Code's Anthropic auth remains active.`);
     p.log.info(`Inference request log: ${handle.inferenceLogPath}`);
-    printHttpProxyModels(loaded.routes);
+    printHttpProxyModels(loaded.routes, loaded.aliases);
     reportSkippedHttpProxyFavorites(loaded);
     if (loaded.routes.length > 0) {
-      p.log.info('Switch with `/model relay:<provider-id>:<model-id>`.');
+      p.log.info('Switch with `/model <listed-name>`.');
     }
   }
 
@@ -1613,6 +1678,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     return runModelsCommand({
       scope: parsed.favoritesAgy ? 'agy' : 'global',
       list: parsed.favoritesList,
+      alias: parsed.favoritesAlias,
+      unalias: parsed.favoritesUnalias,
     });
   }
 

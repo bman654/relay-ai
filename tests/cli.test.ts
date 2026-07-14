@@ -254,6 +254,17 @@ describe('parseArgs', () => {
     });
   });
 
+  it('parses HTTP proxy model alias changes', () => {
+    expect(parseArgs(['models', '--alias', 'luna=relay:openai-oauth:gpt-5.6-luna'])).toMatchObject({
+      command: 'models',
+      favoritesAlias: 'luna=relay:openai-oauth:gpt-5.6-luna',
+    });
+    expect(parseArgs(['models', '--unalias=luna'])).toMatchObject({
+      command: 'models',
+      favoritesUnalias: 'luna',
+    });
+  });
+
   it('parses favorites --agy command', () => {
     expect(parseArgs(['favorites', '--agy'])).toMatchObject({
       command: 'models',

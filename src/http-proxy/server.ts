@@ -9,6 +9,7 @@ import type { ProxyHandle, ProxyRoute } from '../proxy.js';
 import { startProxyCatalog } from '../proxy.js';
 import { ensureHttpProxyCertificates } from './ca.js';
 import { routeLookupIds } from '../context-model-id.js';
+import type { ResolvedHttpProxyAlias } from './routes.js';
 import { anthropicEffortFromRequest, type AnthropicRequest } from '../sdk-adapter.js';
 import { anthropicMessagesEndpoint } from '../anthropic-endpoints.js';
 import {
@@ -138,6 +139,8 @@ export interface HttpProxyOptions {
   host?: string;
   port?: number;
   routes: ProxyRoute[];
+  /** Short incoming model names mapped to canonical adapter route ids. */
+  modelAliases?: ResolvedHttpProxyAlias[];
   debug?: boolean;
   /** Append privacy-minimal inference routing records as JSONL. */
   inferenceLogPath?: string;
@@ -524,6 +527,11 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
   for (const route of options.routes) {
     for (const id of routeLookupIds(route.aliasId)) routesById.set(id, route);
   }
+  for (const alias of options.modelAliases ?? []) {
+    const route = routesById.get(alias.routeId);
+    if (!route) continue;
+    for (const id of routeLookupIds(alias.name)) routesById.set(id, route);
+  }
   const anthropicOrigin = new URL(options.anthropicOrigin ?? 'https://api.anthropic.com');
   let adapter: ProxyHandle | null = options.adapterHandle ?? null;
   if (options.routes.length > 0) {
@@ -577,7 +585,10 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
       }
 
       if (route && adapter) {
-        await forwardToAdapter(req, res, rawBody, adapter, messagesEndpoint === 'messages' && options.inferenceLogPath
+        const adapterBody = parsed?.model === route.aliasId
+          ? rawBody
+          : Buffer.from(JSON.stringify({ ...parsed, model: route.aliasId }));
+        await forwardToAdapter(req, res, adapterBody, adapter, messagesEndpoint === 'messages' && options.inferenceLogPath
           ? {
               logPath: options.inferenceLogPath,
               requestId,
@@ -684,7 +695,10 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
     host: options.host ?? '127.0.0.1',
     port: address.port,
     caCertPath: certificates.caCertPath,
-    modelIds: options.routes.map(route => route.aliasId),
+    modelIds: [
+      ...(options.modelAliases ?? []).map(alias => alias.name),
+      ...options.routes.map(route => route.aliasId),
+    ],
     inferenceLogPath: options.inferenceLogPath,
     close: async () => {
       for (const socket of sockets) socket.destroy();

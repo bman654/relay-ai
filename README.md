@@ -320,6 +320,14 @@ relay:groq:llama-3.3-70b-versatile
 
 Run `relay-ai models --list` or read the list printed when the proxy starts, then type `/model relay:<provider-id>:<model-id>` in Claude Code. These names cannot be injected into Claude Code's built-in OAuth model picker, but `/model` accepts the exact freeform name.
 
+For a shorter name, save an alias for an existing favorite:
+
+```bash
+relay-ai models --alias luna=relay:openai-oauth:gpt-5.6-luna
+```
+
+Then `/model luna` routes to that favorite. `relay-ai models --list` prints aliases before their canonical `relay:` names. Remove one with `relay-ai models --unalias luna`. Alias names may contain letters, numbers, dots, underscores, and hyphens.
+
 The proxy decrypts only TLS connections to `api.anthropic.com`; every other HTTPS host is blind-tunneled. On `/v1/messages`, an exact configured `relay:` model goes through the existing AI SDK adapter with that provider's credential. Every other model and every other Anthropic path goes to Anthropic with the original request body bytes and authorization header. Anthropic credentials are never persisted, reused, or forwarded to a model provider. The generated CA and private key live under `~/.relay-ai/http-proxy/`; the private files are mode `0600`. Session mode also preserves an existing `NODE_EXTRA_CA_CERTS` bundle by combining it with Relay's CA.
 
 ### Registry gateway (`relay-ai server`)
@@ -604,7 +612,7 @@ If the native module fails to load, credential store options are skipped and you
 
 Manage with `relay-ai providers`. API keys are stored in the OS keychain (`keyring:provider:<id>`).
 
-**App preferences** — favorites, last provider/model, server settings, optional server password:
+**App preferences** — favorites, HTTP-proxy model aliases, last provider/model, server settings, optional server password:
 
 ```text
 ~/.relay-ai/config.json

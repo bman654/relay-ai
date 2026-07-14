@@ -317,7 +317,7 @@ describe('selective HTTP proxy', () => {
     }
   }, 20_000);
 
-  it('routes only an exact relay model and strips Anthropic auth from the adapter hop', async () => {
+  it('routes exact relay models and short aliases while stripping Anthropic auth from the adapter hop', async () => {
     const certificates = ensureHttpProxyCertificates();
     const inferenceLogPath = join(testHome, 'relay-inference.jsonl');
     let adapterAuth: string | undefined;
@@ -372,6 +372,11 @@ describe('selective HTTP proxy', () => {
         modelFormat: 'openai',
         npm: '@ai-sdk/groq',
         providerId: 'groq',
+      }],
+      modelAliases: [{
+        name: 'llama',
+        routeId: 'relay:groq:llama-3.3-70b',
+        displayName: 'Llama 3.3 70B (Groq)',
       }],
       adapterHandle: {
         port: adapterPort,
@@ -453,6 +458,32 @@ describe('selective HTTP proxy', () => {
         requestId: requestEntry.requestId,
         statusCode: 200,
       }));
+
+      const aliasBody = JSON.stringify({ model: 'llama', messages: [], stream: true });
+      const aliasSocket = await connectMitm(proxy.port, certificates.caCert);
+      aliasSocket.resume();
+      aliasSocket.write([
+        'POST /v1/messages HTTP/1.1',
+        'Host: api.anthropic.com',
+        'Authorization: Bearer subscription-oauth-token',
+        'Content-Type: application/json',
+        `Content-Length: ${Buffer.byteLength(aliasBody)}`,
+        'Connection: close',
+        '',
+        '',
+      ].join('\r\n') + aliasBody);
+      await once(aliasSocket, 'close');
+
+      expect(anthropicRequests).toBe(0);
+      expect(JSON.parse(adapterBody)).toMatchObject({
+        model: 'relay:groq:llama-3.3-70b',
+        messages: [],
+      });
+      const aliasEntries = readFileSync(inferenceLogPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(aliasEntries.find(entry => !entry.event && entry.modelId === 'llama')).toMatchObject({
+        provider: 'groq',
+        route: 'translated',
+      });
 
       const typoBody = JSON.stringify({ model: 'relay:groq:typo', messages: [] });
       const typoSocket = await connectMitm(proxy.port, certificates.caCert);

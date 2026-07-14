@@ -2150,6 +2150,7 @@ function loadPreferences() {
     lastAntigravityModel: config.lastAntigravityModel,
     recentModelsByProvider: config.recentModelsByProvider,
     favoriteModels: config.favoriteModels,
+    modelAliases: config.modelAliases,
     antigravityCliFavoriteModels: config.antigravityCliFavoriteModels,
     antigravityCliFavoritesHintShown: config.antigravityCliFavoritesHintShown,
     appPathOverrides: config.appPathOverrides,
@@ -2170,6 +2171,7 @@ function savePreferences(prefs) {
   if (prefs.lastAntigravityModel !== void 0) config.lastAntigravityModel = prefs.lastAntigravityModel;
   if (prefs.recentModelsByProvider !== void 0) config.recentModelsByProvider = prefs.recentModelsByProvider;
   if (prefs.favoriteModels !== void 0) config.favoriteModels = prefs.favoriteModels;
+  if (prefs.modelAliases !== void 0) config.modelAliases = prefs.modelAliases;
   if (prefs.antigravityCliFavoriteModels !== void 0) config.antigravityCliFavoriteModels = prefs.antigravityCliFavoriteModels;
   if (prefs.antigravityCliFavoritesHintShown !== void 0) config.antigravityCliFavoritesHintShown = prefs.antigravityCliFavoritesHintShown;
   if (prefs.appPathOverrides !== void 0) config.appPathOverrides = prefs.appPathOverrides;
@@ -7999,6 +8001,38 @@ function providersForTarget(providers, target) {
   return providers.map((provider) => providerForTarget(provider, target)).filter((provider) => provider.models.length > 0);
 }
 
+// src/model-aliases.ts
+var MODEL_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+function isValidModelAlias(name) {
+  return MODEL_ALIAS_PATTERN.test(name);
+}
+function parseModelAliasAssignment(value) {
+  const separator = value.indexOf("=");
+  if (separator < 1 || separator === value.length - 1) {
+    return { error: "Alias must use name=relay:<provider-id>:<model-id>." };
+  }
+  const name = value.slice(0, separator).trim();
+  if (!isValidModelAlias(name)) {
+    return { error: "Alias names must be 1-64 letters, numbers, dots, underscores, or hyphens." };
+  }
+  const rawTarget = value.slice(separator + 1).trim();
+  const target = rawTarget.startsWith("relay:") ? rawTarget.slice("relay:".length) : rawTarget;
+  const targetSeparator = target.indexOf(":");
+  if (targetSeparator < 1 || targetSeparator === target.length - 1) {
+    return { error: "Alias target must use relay:<provider-id>:<model-id>." };
+  }
+  return {
+    name,
+    providerId: target.slice(0, targetSeparator),
+    // `models --list` prints Claude's synthetic context suffix. It is a client
+    // routing hint, not part of the provider catalog id stored in favorites.
+    modelId: stripOneMContextSuffix(target.slice(targetSeparator + 1))
+  };
+}
+function modelAliasTarget(alias) {
+  return `relay:${alias.providerId}:${alias.modelId}`;
+}
+
 // src/http-proxy/index.ts
 import pc3 from "picocolors";
 import * as p2 from "@clack/prompts";
@@ -8008,11 +8042,12 @@ var HTTP_PROXY_MODEL_PREFIX = "relay:";
 function httpProxyModelId(providerId, modelId) {
   return `${HTTP_PROXY_MODEL_PREFIX}${providerId}:${modelId}`;
 }
-function buildHttpProxyRoutes(providers, favorites, max = MAX_MODEL_CATALOG) {
+function buildHttpProxyRoutes(providers, favorites, modelAliases = [], max = MAX_MODEL_CATALOG) {
   const routes = [];
   const unavailable = [];
   const unsupported = [];
   const seen = /* @__PURE__ */ new Set();
+  const routesByFavorite = /* @__PURE__ */ new Map();
   for (const favorite of favorites) {
     if (routes.length >= max) break;
     const provider = providers.find((item) => item.id === favorite.providerId);
@@ -8036,13 +8071,27 @@ function buildHttpProxyRoutes(providers, favorites, max = MAX_MODEL_CATALOG) {
     );
     if (seen.has(aliasId)) continue;
     seen.add(aliasId);
-    routes.push({
+    const proxyRoute = {
       ...route,
       aliasId,
       displayName: `${model.name || model.id} (${provider.name})`
-    });
+    };
+    routes.push(proxyRoute);
+    routesByFavorite.set(`${favorite.providerId}:${favorite.modelId}`, proxyRoute);
   }
-  return { routes, unavailable, unsupported };
+  const aliases = [];
+  const unavailableAliases = [];
+  const seenAliases = /* @__PURE__ */ new Set();
+  for (const alias of modelAliases) {
+    const route = routesByFavorite.get(`${alias.providerId}:${alias.modelId}`);
+    if (!isValidModelAlias(alias.name) || seenAliases.has(alias.name) || !route) {
+      unavailableAliases.push(alias);
+      continue;
+    }
+    seenAliases.add(alias.name);
+    aliases.push({ name: alias.name, routeId: route.aliasId, displayName: route.displayName });
+  }
+  return { routes, unavailable, unsupported, aliases, unavailableAliases };
 }
 
 // src/http-proxy/server.ts
@@ -8562,6 +8611,11 @@ async function startHttpProxy(options) {
   for (const route of options.routes) {
     for (const id of routeLookupIds(route.aliasId)) routesById.set(id, route);
   }
+  for (const alias of options.modelAliases ?? []) {
+    const route = routesById.get(alias.routeId);
+    if (!route) continue;
+    for (const id of routeLookupIds(alias.name)) routesById.set(id, route);
+  }
   const anthropicOrigin = new URL2(options.anthropicOrigin ?? "https://api.anthropic.com");
   let adapter = options.adapterHandle ?? null;
   if (options.routes.length > 0) {
@@ -8608,7 +8662,8 @@ async function startHttpProxy(options) {
         });
       }
       if (route && adapter) {
-        await forwardToAdapter(req, res, rawBody, adapter, messagesEndpoint === "messages" && options.inferenceLogPath ? {
+        const adapterBody = parsed?.model === route.aliasId ? rawBody : Buffer.from(JSON.stringify({ ...parsed, model: route.aliasId }));
+        await forwardToAdapter(req, res, adapterBody, adapter, messagesEndpoint === "messages" && options.inferenceLogPath ? {
           logPath: options.inferenceLogPath,
           requestId,
           modelId: typeof parsed?.model === "string" ? parsed.model : "unknown",
@@ -8702,7 +8757,10 @@ async function startHttpProxy(options) {
     host: options.host ?? "127.0.0.1",
     port: address.port,
     caCertPath: certificates.caCertPath,
-    modelIds: options.routes.map((route) => route.aliasId),
+    modelIds: [
+      ...(options.modelAliases ?? []).map((alias) => alias.name),
+      ...options.routes.map((route) => route.aliasId)
+    ],
     inferenceLogPath: options.inferenceLogPath,
     close: async () => {
       for (const socket of sockets) socket.destroy();
@@ -8715,24 +8773,38 @@ async function startHttpProxy(options) {
 
 // src/http-proxy/index.ts
 async function loadHttpProxyRoutes() {
-  const favorites = loadPreferences().favoriteModels ?? [];
+  const prefs = loadPreferences();
+  const favorites = prefs.favoriteModels ?? [];
   if (favorites.length === 0) {
-    return { routes: [], unavailable: [], unsupported: [], favoriteCount: 0 };
+    return {
+      routes: [],
+      unavailable: [],
+      unsupported: [],
+      aliases: [],
+      unavailableAliases: prefs.modelAliases ?? [],
+      favoriteCount: 0
+    };
   }
   const rawCatalog = providersForTarget(await fetchProviderCatalog({ agent: "claude" }), "claude");
   const catalog = await Promise.all(rawCatalog.map(async (provider) => ({
     ...provider,
     apiKey: await resolveLocalProviderApiKey(provider) ?? ""
   })));
-  return { ...buildHttpProxyRoutes(catalog, favorites), favoriteCount: favorites.length };
+  return {
+    ...buildHttpProxyRoutes(catalog, favorites, prefs.modelAliases ?? []),
+    favoriteCount: favorites.length
+  };
 }
-function formatHttpProxyModelLines(routes) {
+function formatHttpProxyModelLines(routes, aliases = []) {
   if (routes.length === 0) return ["  (no compatible favorite models)"];
-  return routes.map((route) => `  ${route.aliasId}  ${pc3.dim(route.displayName)}`);
+  return [
+    ...aliases.map((alias) => `  ${alias.name}  ${pc3.dim(`${alias.displayName} \u2192 ${alias.routeId}`)}`),
+    ...routes.map((route) => `  ${route.aliasId}  ${pc3.dim(route.displayName)}`)
+  ];
 }
-function printHttpProxyModels(routes) {
+function printHttpProxyModels(routes, aliases = []) {
   console.log(pc3.bold("HTTP proxy model names:"));
-  for (const line of formatHttpProxyModelLines(routes)) console.log(line);
+  for (const line of formatHttpProxyModelLines(routes, aliases)) console.log(line);
 }
 function reportSkippedHttpProxyFavorites(loaded) {
   if (loaded.unavailable.length > 0) {
@@ -8743,6 +8815,11 @@ function reportSkippedHttpProxyFavorites(loaded) {
       `${loaded.unsupported.length} favorite${loaded.unsupported.length === 1 ? "" : "s"} skipped \u2014 HTTP proxy mode supports non-Anthropic AI SDK routes only.`
     );
   }
+  if (loaded.unavailableAliases.length > 0) {
+    p2.log.warn(
+      `${loaded.unavailableAliases.length} model alias${loaded.unavailableAliases.length === 1 ? "" : "es"} skipped \u2014 its target must be an available HTTP-proxy favorite.`
+    );
+  }
 }
 async function startConfiguredHttpProxy(port, debug = false) {
   const loaded = await loadHttpProxyRoutes();
@@ -8751,6 +8828,7 @@ async function startConfiguredHttpProxy(port, debug = false) {
     host: "127.0.0.1",
     port,
     routes: loaded.routes,
+    modelAliases: loaded.aliases,
     debug,
     inferenceLogPath
   });
@@ -8787,11 +8865,11 @@ async function runHttpProxyServerCommand(debug = false) {
   console.log(`  NODE_EXTRA_CA_CERTS=${handle.caCertPath}`);
   console.log(`  Request log: ${handle.inferenceLogPath}`);
   console.log("");
-  printHttpProxyModels(loaded.routes);
+  printHttpProxyModels(loaded.routes, loaded.aliases);
   reportSkippedHttpProxyFavorites(loaded);
   console.log("");
   console.log(pc3.dim("Anthropic requests keep Claude Code auth and pass through unchanged."));
-  console.log(pc3.dim("Use `/model relay:<provider-id>:<model-id>` for a listed favorite."));
+  console.log(pc3.dim("Use `/model <listed-name>` for a favorite or saved alias."));
   console.log(pc3.dim("Press Ctrl+C to stop."));
   await waitForShutdown();
   await handle.close();
@@ -12426,6 +12504,9 @@ export {
   summarizeServerProviders,
   hasApplicationDefaultCredentials,
   buildVertexRuntimeConfig,
+  isValidModelAlias,
+  parseModelAliasAssignment,
+  modelAliasTarget,
   loadHttpProxyRoutes,
   printHttpProxyModels,
   reportSkippedHttpProxyFavorites,
@@ -12458,4 +12539,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-3QCBYBDJ.js.map
+//# sourceMappingURL=chunk-ESF5TVL7.js.map

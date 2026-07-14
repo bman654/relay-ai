@@ -77,17 +77,20 @@ describe('dotfolder config', () => {
   it('saves Antigravity CLI favorites separately from global favorites', () => {
     savePreferences({
       favoriteModels: [{ providerId: 'global', modelId: 'claude' }],
+      modelAliases: [{ name: 'luna', providerId: 'openai-oauth', modelId: 'gpt-5.6-luna' }],
       antigravityCliFavoriteModels: [{ providerId: 'xai-oauth', modelId: 'grok-4.3' }],
       antigravityCliFavoritesHintShown: true,
     });
 
     expect(loadPreferences()).toMatchObject({
       favoriteModels: [{ providerId: 'global', modelId: 'claude' }],
+      modelAliases: [{ name: 'luna', providerId: 'openai-oauth', modelId: 'gpt-5.6-luna' }],
       antigravityCliFavoriteModels: [{ providerId: 'xai-oauth', modelId: 'grok-4.3' }],
       antigravityCliFavoritesHintShown: true,
     });
     expect(JSON.parse(readFileSync(getConfigPath(), 'utf8'))).toMatchObject({
       favoriteModels: [{ providerId: 'global', modelId: 'claude' }],
+      modelAliases: [{ name: 'luna', providerId: 'openai-oauth', modelId: 'gpt-5.6-luna' }],
       antigravityCliFavoriteModels: [{ providerId: 'xai-oauth', modelId: 'grok-4.3' }],
       antigravityCliFavoritesHintShown: true,
     });

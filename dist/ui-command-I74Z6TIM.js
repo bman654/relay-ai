@@ -66,7 +66,7 @@ import {
   summarizeServerProviders,
   validateCustomEndpointUrl,
   writeSecureLogLine
-} from "./chunk-3QCBYBDJ.js";
+} from "./chunk-ESF5TVL7.js";
 import {
   __toCommonJS,
   init_provider_templates,
@@ -528,10 +528,16 @@ async function doStartGatewayServer(req) {
   return { ok: true, status: await getServerStatus() };
 }
 function proxyModelRows(loaded) {
-  return loaded.routes.map((route) => ({
-    id: route.aliasId,
-    displayName: route.displayName
-  }));
+  return [
+    ...loaded.aliases.map((alias) => ({
+      id: alias.name,
+      displayName: `${alias.displayName} \u2192 ${alias.routeId}`
+    })),
+    ...loaded.routes.map((route) => ({
+      id: route.aliasId,
+      displayName: route.displayName
+    }))
+  ];
 }
 async function doStartHttpProxyServer() {
   let started;
@@ -1471,4 +1477,4 @@ export {
   resolveUiShutdownDecision,
   runUiCommand
 };
-//# sourceMappingURL=ui-command-3MN5OC3S.js.map
+//# sourceMappingURL=ui-command-I74Z6TIM.js.map

@@ -14,26 +14,46 @@ export interface LoadedHttpProxyRoutes extends HttpProxyRouteResult {
 }
 
 export async function loadHttpProxyRoutes(): Promise<LoadedHttpProxyRoutes> {
-  const favorites = loadPreferences().favoriteModels ?? [];
+  const prefs = loadPreferences();
+  const favorites = prefs.favoriteModels ?? [];
   if (favorites.length === 0) {
-    return { routes: [], unavailable: [], unsupported: [], favoriteCount: 0 };
+    return {
+      routes: [],
+      unavailable: [],
+      unsupported: [],
+      aliases: [],
+      unavailableAliases: prefs.modelAliases ?? [],
+      favoriteCount: 0,
+    };
   }
   const rawCatalog = providersForTarget(await fetchProviderCatalog({ agent: 'claude' }), 'claude');
   const catalog = await Promise.all(rawCatalog.map(async provider => ({
     ...provider,
     apiKey: (await resolveLocalProviderApiKey(provider)) ?? '',
   })));
-  return { ...buildHttpProxyRoutes(catalog, favorites), favoriteCount: favorites.length };
+  return {
+    ...buildHttpProxyRoutes(catalog, favorites, prefs.modelAliases ?? []),
+    favoriteCount: favorites.length,
+  };
 }
 
-export function formatHttpProxyModelLines(routes: ProxyRoute[]): string[] {
+export function formatHttpProxyModelLines(
+  routes: ProxyRoute[],
+  aliases: LoadedHttpProxyRoutes['aliases'] = [],
+): string[] {
   if (routes.length === 0) return ['  (no compatible favorite models)'];
-  return routes.map(route => `  ${route.aliasId}  ${pc.dim(route.displayName)}`);
+  return [
+    ...aliases.map(alias => `  ${alias.name}  ${pc.dim(`${alias.displayName} → ${alias.routeId}`)}`),
+    ...routes.map(route => `  ${route.aliasId}  ${pc.dim(route.displayName)}`),
+  ];
 }
 
-export function printHttpProxyModels(routes: ProxyRoute[]): void {
+export function printHttpProxyModels(
+  routes: ProxyRoute[],
+  aliases: LoadedHttpProxyRoutes['aliases'] = [],
+): void {
   console.log(pc.bold('HTTP proxy model names:'));
-  for (const line of formatHttpProxyModelLines(routes)) console.log(line);
+  for (const line of formatHttpProxyModelLines(routes, aliases)) console.log(line);
 }
 
 export function reportSkippedHttpProxyFavorites(loaded: LoadedHttpProxyRoutes): void {
@@ -44,6 +64,12 @@ export function reportSkippedHttpProxyFavorites(loaded: LoadedHttpProxyRoutes): 
     p.log.warn(
       `${loaded.unsupported.length} favorite${loaded.unsupported.length === 1 ? '' : 's'} skipped — `
       + 'HTTP proxy mode supports non-Anthropic AI SDK routes only.',
+    );
+  }
+  if (loaded.unavailableAliases.length > 0) {
+    p.log.warn(
+      `${loaded.unavailableAliases.length} model alias${loaded.unavailableAliases.length === 1 ? '' : 'es'} skipped — `
+      + 'its target must be an available HTTP-proxy favorite.',
     );
   }
 }
@@ -58,6 +84,7 @@ export async function startConfiguredHttpProxy(
     host: '127.0.0.1',
     port,
     routes: loaded.routes,
+    modelAliases: loaded.aliases,
     debug,
     inferenceLogPath,
   });
@@ -97,11 +124,11 @@ export async function runHttpProxyServerCommand(debug = false): Promise<number> 
   console.log(`  NODE_EXTRA_CA_CERTS=${handle.caCertPath}`);
   console.log(`  Request log: ${handle.inferenceLogPath}`);
   console.log('');
-  printHttpProxyModels(loaded.routes);
+  printHttpProxyModels(loaded.routes, loaded.aliases);
   reportSkippedHttpProxyFavorites(loaded);
   console.log('');
   console.log(pc.dim('Anthropic requests keep Claude Code auth and pass through unchanged.'));
-  console.log(pc.dim('Use `/model relay:<provider-id>:<model-id>` for a listed favorite.'));
+  console.log(pc.dim('Use `/model <listed-name>` for a favorite or saved alias.'));
   console.log(pc.dim('Press Ctrl+C to stop.'));
 
   await waitForShutdown();

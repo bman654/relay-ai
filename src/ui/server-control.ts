@@ -355,10 +355,16 @@ async function doStartGatewayServer(
 }
 
 function proxyModelRows(loaded: LoadedHttpProxyRoutes): HttpProxyModelRow[] {
-  return loaded.routes.map(route => ({
-    id: route.aliasId,
-    displayName: route.displayName,
-  }));
+  return [
+    ...loaded.aliases.map(alias => ({
+      id: alias.name,
+      displayName: `${alias.displayName} → ${alias.routeId}`,
+    })),
+    ...loaded.routes.map(route => ({
+      id: route.aliasId,
+      displayName: route.displayName,
+    })),
+  ];
 }
 
 async function doStartHttpProxyServer(): Promise<

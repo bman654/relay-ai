@@ -82,6 +82,11 @@ export interface FavoriteModel {
   modelId: string;
 }
 
+/** Short model name accepted by Claude HTTP-proxy mode for a saved favorite. */
+export interface ModelAlias extends FavoriteModel {
+  name: string;
+}
+
 export interface UserPreferences {
   lastBackend?: 'zen' | 'go';
   lastModel?: string;
@@ -94,6 +99,7 @@ export interface UserPreferences {
   lastAntigravityModel?: string;
   recentModelsByProvider?: Record<string, string[]>;
   favoriteModels?: FavoriteModel[];
+  modelAliases?: ModelAlias[];
   antigravityCliFavoriteModels?: FavoriteModel[];
   antigravityCliFavoritesHintShown?: boolean;
   appPathOverrides?: Record<string, string>;
@@ -152,6 +158,10 @@ export interface ParsedArgs {
   httpProxy?: boolean;
   /** Print saved HTTP-proxy model names without opening the favorites manager. */
   favoritesList?: boolean;
+  /** Save a short HTTP-proxy model alias (`name=relay:provider:model`). */
+  favoritesAlias?: string;
+  /** Remove a saved short HTTP-proxy model alias. */
+  favoritesUnalias?: string;
   error?: string;
 }
 

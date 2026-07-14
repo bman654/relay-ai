@@ -63,6 +63,12 @@ vi.mock('../src/http-proxy/index.js', () => ({
         }],
         unavailable: [{ providerId: 'missing', modelId: 'gone' }],
         unsupported: [],
+        aliases: [{
+          name: 'test',
+          routeId: 'relay:openai:gpt-test[1m]',
+          displayName: 'GPT Test (OpenAI)',
+        }],
+        unavailableAliases: [],
       },
     };
   }),
@@ -237,7 +243,10 @@ describe('UI API Server endpoints', () => {
       requestLogPath: '/tmp/relay-ai/logs/inference-requests.jsonl',
       unavailableFavorites: 1,
       unsupportedFavorites: 0,
-      proxyModels: [{ id: 'relay:openai:gpt-test[1m]', displayName: 'GPT Test (OpenAI)' }],
+      proxyModels: [
+        { id: 'test', displayName: 'GPT Test (OpenAI) → relay:openai:gpt-test[1m]' },
+        { id: 'relay:openai:gpt-test[1m]', displayName: 'GPT Test (OpenAI)' },
+      ],
     });
     expect(started.body.status.anthropicUrl).toBeUndefined();
     expect(started.body.status.apiKey).toBeUndefined();

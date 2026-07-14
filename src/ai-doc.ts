@@ -84,6 +84,12 @@ function buildLiveStateSection(): string {
       prefLines.push(`    ${f.providerId} / ${f.modelId}`);
     }
   }
+  if (prefs.modelAliases?.length) {
+    prefLines.push('  Claude HTTP-proxy aliases:');
+    for (const alias of prefs.modelAliases) {
+      prefLines.push(`    ${alias.name} -> relay:${alias.providerId}:${alias.modelId}`);
+    }
+  }
 
   const providerBlocks = enabled.length === 0
     ? ['  No registry providers configured. Built-in cloud: zen, go (OpenCode Zen/Go).']
@@ -351,6 +357,8 @@ PROVIDERS REGISTRY
 
 MODELS / FAVORITES
   relay-ai models                 manage favoriteModels in config (alias: favorites)
+  relay-ai models --alias <name=relay:provider:model>
+                                  save a short Claude HTTP-proxy model name
   Used for mid-session /model switching in interactive Claude/Codex/Gemini sessions.
 
 API GATEWAY (for tools that speak Anthropic/OpenAI HTTP)
