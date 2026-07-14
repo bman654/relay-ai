@@ -37,6 +37,7 @@ describe('inference request log', () => {
     try {
       writeWebSocketDiagnosticRequestLog(path, {
         requestId: 'req-1',
+        claudeSessionId: '927b8642-15d2-4535-ab27-1430ae54c4aa',
         provider: 'openai-oauth',
         route: 'translated',
         headers: {
@@ -61,6 +62,7 @@ describe('inference request log', () => {
       expect(entry).toMatchObject({
         event: 'request_diagnostic',
         requestId: 'req-1',
+        claudeSessionId: '927b8642-15d2-4535-ab27-1430ae54c4aa',
         headers: {
           authorization: '[REDACTED]',
           'x-api-key': '[REDACTED]',
@@ -129,6 +131,7 @@ describe('inference request log', () => {
     const path = join(dir, 'requests.jsonl');
     try {
       writeInferenceRequestLog(path, {
+        claudeSessionId: '927b8642-15d2-4535-ab27-1430ae54c4aa',
         modelId: 'relay:openai:gpt-test[1m]',
         effort: 'high',
         provider: 'openai',
@@ -137,12 +140,15 @@ describe('inference request log', () => {
       const entry = JSON.parse(readFileSync(path, 'utf8').trim());
       expect(entry).toMatchObject({
         modelId: 'relay:openai:gpt-test[1m]',
+        claudeSessionId: '927b8642-15d2-4535-ab27-1430ae54c4aa',
         effort: 'high',
         provider: 'openai',
         route: 'translated',
       });
       expect(entry.timestamp).toEqual(expect.any(String));
-      expect(Object.keys(entry).sort()).toEqual(['effort', 'modelId', 'provider', 'route', 'timestamp']);
+      expect(Object.keys(entry).sort()).toEqual([
+        'claudeSessionId', 'effort', 'modelId', 'provider', 'route', 'timestamp',
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

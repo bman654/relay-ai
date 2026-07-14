@@ -30,6 +30,7 @@ import {
   translateRequest as sdkTranslateRequest,
   streamAnthropicResponse,
   generateAnthropicResponse,
+  extractClaudeSessionId,
   sdkTranslationErrorSignature,
   silenceSdkWarnings,
 } from './sdk-adapter.js';
@@ -455,11 +456,13 @@ export function startProxyCatalog(
           route.providerId ?? route.aliasId.split(':')[1] ?? 'unknown',
         );
         try {
+          const claudeSessionIdHeader = Array.isArray(req.headers['x-claude-code-session-id'])
+            ? req.headers['x-claude-code-session-id'][0]
+            : req.headers['x-claude-code-session-id'];
+          const claudeSessionId = extractClaudeSessionId(anthropicBody, claudeSessionIdHeader);
           const params = sdkTranslateRequest(anthropicBody, route.npm!, {
             openAiOAuth,
-            claudeSessionId: Array.isArray(req.headers['x-claude-code-session-id'])
-              ? req.headers['x-claude-code-session-id'][0]
-              : req.headers['x-claude-code-session-id'],
+            claudeSessionId,
             maxTools: maxToolsForNpm(route.npm),
             reasoningMetadata: {
               providerId: route.providerId,
@@ -505,7 +508,7 @@ export function startProxyCatalog(
               res.write(chunk);
             };
             await withResponsesWebSocketDiagnosticContext(
-              { requestId: relayRequestId },
+              { requestId: relayRequestId, claudeSessionId },
               () => streamAnthropicResponse(
                 model,
                 params,
@@ -527,7 +530,7 @@ export function startProxyCatalog(
             // outright ("Stream must be set to true"), so always stream internally
             // for it and collect the result, regardless of what the client asked for.
             const anthropicResponse = await withResponsesWebSocketDiagnosticContext(
-              { requestId: relayRequestId },
+              { requestId: relayRequestId, claudeSessionId },
               () => generateAnthropicResponse(
                 model,
                 params,

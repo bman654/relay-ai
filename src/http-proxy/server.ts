@@ -10,7 +10,7 @@ import { startProxyCatalog } from '../proxy.js';
 import { ensureHttpProxyCertificates } from './ca.js';
 import { routeLookupIds } from '../context-model-id.js';
 import type { ResolvedHttpProxyAlias } from './routes.js';
-import { anthropicEffortFromRequest, type AnthropicRequest } from '../sdk-adapter.js';
+import { anthropicEffortFromRequest, extractClaudeSessionId, type AnthropicRequest } from '../sdk-adapter.js';
 import { anthropicMessagesEndpoint } from '../anthropic-endpoints.js';
 import {
   getLatestMessagePreview,
@@ -706,6 +706,12 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
       } catch {
         // Fail safe: an unreadable body is Anthropic traffic, never a relay route.
       }
+      const claudeSessionIdHeader = Array.isArray(req.headers['x-claude-code-session-id'])
+        ? req.headers['x-claude-code-session-id'][0]
+        : req.headers['x-claude-code-session-id'];
+      const claudeSessionId = parsed
+        ? extractClaudeSessionId(parsed, claudeSessionIdHeader)
+        : undefined;
 
       if (messagesEndpoint === 'messages' && options.inferenceLogPath) {
         const provider = route
@@ -713,6 +719,7 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
           : 'anthropic';
         writeInferenceRequestLog(options.inferenceLogPath, {
           requestId,
+          claudeSessionId,
           modelId: typeof parsed?.model === 'string' ? parsed.model : 'unknown',
           effort: parsed ? anthropicEffortFromRequest(parsed) : undefined,
           provider,
@@ -728,6 +735,7 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
           : 'anthropic';
         writeWebSocketDiagnosticRequestLog(options.webSocketDiagnosticsLogPath, {
           requestId,
+          claudeSessionId,
           provider,
           route: route ? 'translated' : 'passthrough',
           headers: req.headers,

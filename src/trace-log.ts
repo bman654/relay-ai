@@ -26,6 +26,13 @@ export const INFERENCE_REQUEST_LOG = 'inference-requests.jsonl';
 export const INFERENCE_PROGRESS_INTERVAL_MS = 30_000;
 const INFERENCE_SESSION_DIR = 'sessions';
 let inferenceSessionSequence = 0;
+const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function safeClaudeSessionId(value: unknown): string | undefined {
+  return typeof value === 'string' && CLAUDE_SESSION_ID_RE.test(value.trim())
+    ? value.trim().toLowerCase()
+    : undefined;
+}
 
 export function ensureLogsDir(): string {
   const dir = getLogsPath();
@@ -177,6 +184,7 @@ export function getLatestMessagePreview(messages: unknown, system?: unknown): st
 
 export interface InferenceRequestLogEntry {
   requestId?: string;
+  claudeSessionId?: string;
   modelId: string;
   provider: string;
   effort?: string;
@@ -267,6 +275,7 @@ export interface ProxyLifecycleLogEntry {
 
 export interface WebSocketDiagnosticRequestLogEntry {
   requestId: string;
+  claudeSessionId?: string;
   provider?: string;
   route?: 'passthrough' | 'translated';
   headers: Record<string, string | string[] | undefined>;
@@ -375,9 +384,11 @@ export function writeInferenceRequestLog(
   entry: InferenceRequestLogEntry,
 ): void {
   const includePreview = process.env[REQUEST_PREVIEW_ENV] === '1' && entry.requestPreview;
+  const claudeSessionId = safeClaudeSessionId(entry.claudeSessionId);
   writeSecureLogLine(path, JSON.stringify({
     timestamp: new Date().toISOString(),
     ...(entry.requestId ? { requestId: compactLogValue(entry.requestId, 100) } : {}),
+    ...(claudeSessionId ? { claudeSessionId } : {}),
     modelId: compactLogValue(entry.modelId),
     ...(entry.effort ? { effort: compactLogValue(entry.effort, 100) } : {}),
     provider: compactLogValue(entry.provider, 200),
@@ -464,10 +475,12 @@ export function writeWebSocketDiagnosticRequestLog(
   path: string,
   entry: WebSocketDiagnosticRequestLogEntry,
 ): void {
+  const claudeSessionId = safeClaudeSessionId(entry.claudeSessionId);
   writeSecureLogLine(path, JSON.stringify({
     timestamp: new Date().toISOString(),
     event: 'request_diagnostic',
     requestId: compactLogValue(entry.requestId, 100),
+    ...(claudeSessionId ? { claudeSessionId } : {}),
     ...(entry.provider ? { provider: compactLogValue(entry.provider, 200) } : {}),
     ...(entry.route ? { route: entry.route } : {}),
     headers: sanitizeDiagnosticHeaders(entry.headers),

@@ -43,6 +43,7 @@ export interface ResponsesWebSocketDiagnosticEvent extends Record<string, unknow
 
 export interface ResponsesWebSocketDiagnosticContext {
   requestId?: string;
+  claudeSessionId?: string;
 }
 
 const diagnosticContext = new AsyncLocalStorage<ResponsesWebSocketDiagnosticContext>();
@@ -163,11 +164,15 @@ function debugKey(key: string | undefined): string {
 function emitDiagnostic(
   options: ResponsesWebSocketFetchOptions,
   event: { event: string } & Record<string, unknown>,
-  correlatedRequestId = diagnosticContext.getStore()?.requestId,
+  correlation = diagnosticContext.getStore(),
 ): void {
   if (!options.onDiagnostic) return;
   try {
-    options.onDiagnostic({ ...event, ...(correlatedRequestId ? { requestId: correlatedRequestId } : {}) });
+    options.onDiagnostic({
+      ...event,
+      ...(correlation?.requestId ? { requestId: correlation.requestId } : {}),
+      ...(correlation?.claudeSessionId ? { claudeSessionId: correlation.claudeSessionId } : {}),
+    });
   } catch {
     // Diagnostics must never alter inference behavior.
   }
@@ -1106,7 +1111,7 @@ export function createResponsesWebSocketFetch(
     const promptFingerprint = responsesWebSocketPromptFingerprint(payload);
     const promptFieldHashes = responsesWebSocketPromptFieldHashes(payload);
     const instructionsSnapshot = instructionsFromPayload(payload);
-    const diagnosticRequestId = diagnosticContext.getStore()?.requestId;
+    const diagnosticCorrelation = diagnosticContext.getStore();
     const now = resolvedOptions.now();
     const evictions = cleanupExpiredConnections(now);
 
@@ -1237,7 +1242,7 @@ export function createResponsesWebSocketFetch(
         mismatch: continuationMismatchDetails(entry, payload),
       })),
       evictions,
-    }, diagnosticRequestId);
+    }, diagnosticCorrelation);
 
     let activeContext: RequestContext | undefined;
     const stream = new ReadableStream<Uint8Array>({
@@ -1261,7 +1266,7 @@ export function createResponsesWebSocketFetch(
           recentUpstreamEventTypes: [],
           emittedProtocolAnomalies: new Set(),
           emitDiagnostic: options.onDiagnostic
-            ? event => emitDiagnostic(options, event, diagnosticRequestId)
+            ? event => emitDiagnostic(options, event, diagnosticCorrelation)
             : undefined,
           createReplacement: () => createConnection(
             WebSocket as unknown as WebSocketConstructor,

@@ -52,6 +52,7 @@ import {
   generateAnthropicResponse,
   silenceSdkWarnings,
   anthropicEffortFromRequest,
+  extractClaudeSessionId,
   type AnthropicRequest,
 } from '../sdk-adapter.js';
 import { withResponsesWebSocketDiagnosticContext } from '../oauth/responses-websocket.js';
@@ -242,9 +243,14 @@ async function handleAnthropicMessages(
     return;
   }
   const requestId = randomUUID();
+  const claudeSessionIdHeader = Array.isArray(req.headers['x-claude-code-session-id'])
+    ? req.headers['x-claude-code-session-id'][0]
+    : req.headers['x-claude-code-session-id'];
+  const claudeSessionId = extractClaudeSessionId(body as AnthropicRequest, claudeSessionIdHeader);
   if (options.webSocketDiagnosticsLogPath) {
     writeWebSocketDiagnosticRequestLog(options.webSocketDiagnosticsLogPath, {
       requestId,
+      claudeSessionId,
       provider: inferenceProvider(model),
       route: model.modelFormat === 'anthropic' ? 'passthrough' : 'translated',
       headers: req.headers,
@@ -273,6 +279,7 @@ async function handleAnthropicMessages(
       requestId,
       modelId: body.model,
       effort: anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
+      claudeSessionId,
       provider: inferenceProvider(model),
       route: 'passthrough',
       requestPreview: getLatestMessagePreview(body.messages, body.system),
@@ -325,6 +332,7 @@ async function handleAnthropicMessages(
       requestId,
       modelId: body.model,
       effort: anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
+      claudeSessionId,
       provider: inferenceProvider(model),
       route: 'translated',
       requestPreview: getLatestMessagePreview(body.messages, body.system),
@@ -346,9 +354,7 @@ async function handleAnthropicMessages(
     const params = sdkTranslateRequest(body as unknown as AnthropicRequest, model.npm!, {
       defaultEffort: anthropicEffortFromRequest(body as AnthropicRequest) ? undefined : model.defaultEffort,
       openAiOAuth: model.npm === '@ai-sdk/openai' && model.authType === 'oauth',
-      claudeSessionId: Array.isArray(req.headers['x-claude-code-session-id'])
-        ? req.headers['x-claude-code-session-id'][0]
-        : req.headers['x-claude-code-session-id'],
+      claudeSessionId,
       reasoningMetadata: {
         providerId: model.providerId,
         apiBaseUrl: model.apiBaseUrl,
@@ -380,7 +386,7 @@ async function handleAnthropicMessages(
           res.write(chunk);
         };
         await withResponsesWebSocketDiagnosticContext(
-          { requestId },
+          { requestId, claudeSessionId },
           () => streamAnthropicResponse(languageModel, params, responseModelId, writeStreamChunk, undefined, {
             initialInputTokens: estimateAnthropicInputTokens(body),
           }),
@@ -389,7 +395,7 @@ async function handleAnthropicMessages(
         res.end();
       } else {
         const anthropicResponse = await withResponsesWebSocketDiagnosticContext(
-          { requestId },
+          { requestId, claudeSessionId },
           () => generateAnthropicResponse(languageModel, params, responseModelId),
         );
         sendJson(res, 200, anthropicResponse);

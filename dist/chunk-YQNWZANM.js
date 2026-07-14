@@ -367,10 +367,14 @@ function unregisterEntry(entry) {
 function debugKey(key) {
   return key ? key.slice(0, 12) : "none";
 }
-function emitDiagnostic(options, event, correlatedRequestId = diagnosticContext.getStore()?.requestId) {
+function emitDiagnostic(options, event, correlation = diagnosticContext.getStore()) {
   if (!options.onDiagnostic) return;
   try {
-    options.onDiagnostic({ ...event, ...correlatedRequestId ? { requestId: correlatedRequestId } : {} });
+    options.onDiagnostic({
+      ...event,
+      ...correlation?.requestId ? { requestId: correlation.requestId } : {},
+      ...correlation?.claudeSessionId ? { claudeSessionId: correlation.claudeSessionId } : {}
+    });
   } catch {
   }
 }
@@ -1094,7 +1098,7 @@ function createResponsesWebSocketFetch(wsUrl, log8, options = {}) {
     const promptFingerprint = responsesWebSocketPromptFingerprint(payload);
     const promptFieldHashes = responsesWebSocketPromptFieldHashes(payload);
     const instructionsSnapshot = instructionsFromPayload(payload);
-    const diagnosticRequestId = diagnosticContext.getStore()?.requestId;
+    const diagnosticCorrelation = diagnosticContext.getStore();
     const now = resolvedOptions.now();
     const evictions = cleanupExpiredConnections(now);
     const candidates = partitionKey ? connectionEntries(partitionKey) : [];
@@ -1204,7 +1208,7 @@ function createResponsesWebSocketFetch(wsUrl, log8, options = {}) {
         mismatch: continuationMismatchDetails(entry, payload)
       })),
       evictions
-    }, diagnosticRequestId);
+    }, diagnosticCorrelation);
     let activeContext;
     const stream = new ReadableStream({
       start(controller) {
@@ -1226,7 +1230,7 @@ function createResponsesWebSocketFetch(wsUrl, log8, options = {}) {
           reasoningPartsByItemId: /* @__PURE__ */ new Map(),
           recentUpstreamEventTypes: [],
           emittedProtocolAnomalies: /* @__PURE__ */ new Set(),
-          emitDiagnostic: options.onDiagnostic ? (event) => emitDiagnostic(options, event, diagnosticRequestId) : void 0,
+          emitDiagnostic: options.onDiagnostic ? (event) => emitDiagnostic(options, event, diagnosticCorrelation) : void 0,
           createReplacement: () => createConnection(
             WebSocket,
             wsUrl,
@@ -4689,6 +4693,10 @@ var INFERENCE_REQUEST_LOG = "inference-requests.jsonl";
 var INFERENCE_PROGRESS_INTERVAL_MS = 3e4;
 var INFERENCE_SESSION_DIR = "sessions";
 var inferenceSessionSequence = 0;
+var CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function safeClaudeSessionId(value) {
+  return typeof value === "string" && CLAUDE_SESSION_ID_RE.test(value.trim()) ? value.trim().toLowerCase() : void 0;
+}
 function ensureLogsDir() {
   const dir = getLogsPath();
   mkdirSync5(dir, { recursive: true, mode: DIR_MODE2 });
@@ -4873,9 +4881,11 @@ function summarizeDiagnosticRequestBody(body) {
 }
 function writeInferenceRequestLog(path, entry) {
   const includePreview = process.env[REQUEST_PREVIEW_ENV] === "1" && entry.requestPreview;
+  const claudeSessionId = safeClaudeSessionId(entry.claudeSessionId);
   writeSecureLogLine(path, JSON.stringify({
     timestamp: (/* @__PURE__ */ new Date()).toISOString(),
     ...entry.requestId ? { requestId: compactLogValue(entry.requestId, 100) } : {},
+    ...claudeSessionId ? { claudeSessionId } : {},
     modelId: compactLogValue(entry.modelId),
     ...entry.effort ? { effort: compactLogValue(entry.effort, 100) } : {},
     provider: compactLogValue(entry.provider, 200),
@@ -4947,10 +4957,12 @@ function writeProxyLifecycleLog(path, entry) {
   }));
 }
 function writeWebSocketDiagnosticRequestLog(path, entry) {
+  const claudeSessionId = safeClaudeSessionId(entry.claudeSessionId);
   writeSecureLogLine(path, JSON.stringify({
     timestamp: (/* @__PURE__ */ new Date()).toISOString(),
     event: "request_diagnostic",
     requestId: compactLogValue(entry.requestId, 100),
+    ...claudeSessionId ? { claudeSessionId } : {},
     ...entry.provider ? { provider: compactLogValue(entry.provider, 200) } : {},
     ...entry.route ? { route: entry.route } : {},
     headers: sanitizeDiagnosticHeaders(entry.headers),
@@ -6251,11 +6263,11 @@ function sdkTranslationErrorSignature(error) {
   if (/\btext part \S+ not found\b/i.test(message)) return "text_part_not_found";
   return void 0;
 }
-var CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+var CLAUDE_SESSION_ID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function validClaudeSessionId(value) {
   if (typeof value !== "string") return void 0;
   const trimmed = value.trim();
-  return CLAUDE_SESSION_ID_RE.test(trimmed) ? trimmed.toLowerCase() : void 0;
+  return CLAUDE_SESSION_ID_RE2.test(trimmed) ? trimmed.toLowerCase() : void 0;
 }
 function extractClaudeSessionId(body, headerFallback) {
   const userId = body.metadata?.user_id;
@@ -7145,9 +7157,11 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
           route.providerId ?? route.aliasId.split(":")[1] ?? "unknown"
         );
         try {
+          const claudeSessionIdHeader = Array.isArray(req.headers["x-claude-code-session-id"]) ? req.headers["x-claude-code-session-id"][0] : req.headers["x-claude-code-session-id"];
+          const claudeSessionId = extractClaudeSessionId(anthropicBody, claudeSessionIdHeader);
           const params = translateRequest2(anthropicBody, route.npm, {
             openAiOAuth,
-            claudeSessionId: Array.isArray(req.headers["x-claude-code-session-id"]) ? req.headers["x-claude-code-session-id"][0] : req.headers["x-claude-code-session-id"],
+            claudeSessionId,
             maxTools: maxToolsForNpm(route.npm),
             reasoningMetadata: {
               providerId: route.providerId,
@@ -7190,7 +7204,7 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
               res.write(chunk);
             };
             await withResponsesWebSocketDiagnosticContext(
-              { requestId: relayRequestId },
+              { requestId: relayRequestId, claudeSessionId },
               () => streamAnthropicResponse(
                 model,
                 params,
@@ -7209,7 +7223,7 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
             res.end();
           } else {
             const anthropicResponse = await withResponsesWebSocketDiagnosticContext(
-              { requestId: relayRequestId },
+              { requestId: relayRequestId, claudeSessionId },
               () => generateAnthropicResponse(
                 model,
                 params,
@@ -9251,10 +9265,13 @@ async function startHttpProxy(options) {
         if (typeof parsed.model === "string") route = routesById.get(parsed.model);
       } catch {
       }
+      const claudeSessionIdHeader = Array.isArray(req.headers["x-claude-code-session-id"]) ? req.headers["x-claude-code-session-id"][0] : req.headers["x-claude-code-session-id"];
+      const claudeSessionId = parsed ? extractClaudeSessionId(parsed, claudeSessionIdHeader) : void 0;
       if (messagesEndpoint === "messages" && options.inferenceLogPath) {
         const provider = route ? route.providerId ?? route.aliasId.split(":")[1] ?? "unknown" : "anthropic";
         writeInferenceRequestLog(options.inferenceLogPath, {
           requestId,
+          claudeSessionId,
           modelId: typeof parsed?.model === "string" ? parsed.model : "unknown",
           effort: parsed ? anthropicEffortFromRequest(parsed) : void 0,
           provider,
@@ -9267,6 +9284,7 @@ async function startHttpProxy(options) {
         const provider = route ? route.providerId ?? route.aliasId.split(":")[1] ?? "unknown" : "anthropic";
         writeWebSocketDiagnosticRequestLog(options.webSocketDiagnosticsLogPath, {
           requestId,
+          claudeSessionId,
           provider,
           route: route ? "translated" : "passthrough",
           headers: req.headers,
@@ -9879,9 +9897,12 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
     return;
   }
   const requestId = randomUUID7();
+  const claudeSessionIdHeader = Array.isArray(req.headers["x-claude-code-session-id"]) ? req.headers["x-claude-code-session-id"][0] : req.headers["x-claude-code-session-id"];
+  const claudeSessionId = extractClaudeSessionId(body, claudeSessionIdHeader);
   if (options.webSocketDiagnosticsLogPath) {
     writeWebSocketDiagnosticRequestLog(options.webSocketDiagnosticsLogPath, {
       requestId,
+      claudeSessionId,
       provider: inferenceProvider(model),
       route: model.modelFormat === "anthropic" ? "passthrough" : "translated",
       headers: req.headers,
@@ -9905,6 +9926,7 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
       requestId,
       modelId: body.model,
       effort: anthropicEffortFromRequest(body) ?? model.defaultEffort,
+      claudeSessionId,
       provider: inferenceProvider(model),
       route: "passthrough",
       requestPreview: getLatestMessagePreview(body.messages, body.system)
@@ -9951,6 +9973,7 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
       requestId,
       modelId: body.model,
       effort: anthropicEffortFromRequest(body) ?? model.defaultEffort,
+      claudeSessionId,
       provider: inferenceProvider(model),
       route: "translated",
       requestPreview: getLatestMessagePreview(body.messages, body.system)
@@ -9972,7 +9995,7 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
     const params = translateRequest2(body, model.npm, {
       defaultEffort: anthropicEffortFromRequest(body) ? void 0 : model.defaultEffort,
       openAiOAuth: model.npm === "@ai-sdk/openai" && model.authType === "oauth",
-      claudeSessionId: Array.isArray(req.headers["x-claude-code-session-id"]) ? req.headers["x-claude-code-session-id"][0] : req.headers["x-claude-code-session-id"],
+      claudeSessionId,
       reasoningMetadata: {
         providerId: model.providerId,
         apiBaseUrl: model.apiBaseUrl,
@@ -9999,7 +10022,7 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
           res.write(chunk);
         };
         await withResponsesWebSocketDiagnosticContext(
-          { requestId },
+          { requestId, claudeSessionId },
           () => streamAnthropicResponse(languageModel, params, responseModelId, writeStreamChunk, void 0, {
             initialInputTokens: estimateAnthropicInputTokens(body)
           })
@@ -10008,7 +10031,7 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
         res.end();
       } else {
         const anthropicResponse = await withResponsesWebSocketDiagnosticContext(
-          { requestId },
+          { requestId, claudeSessionId },
           () => generateAnthropicResponse(languageModel, params, responseModelId)
         );
         sendJson(res, 200, anthropicResponse);
@@ -13209,4 +13232,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-7VONQ4M6.js.map
+//# sourceMappingURL=chunk-YQNWZANM.js.map

@@ -167,7 +167,10 @@ describe('createResponsesWebSocketFetch', () => {
       onDiagnostic: event => diagnostics.push(event),
     });
     const res = await withResponsesWebSocketDiagnosticContext(
-      { requestId: 'req-usage' },
+      {
+        requestId: 'req-usage',
+        claudeSessionId: '927b8642-15d2-4535-ab27-1430ae54c4aa',
+      },
       () => wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' }),
     );
     const socket = lastSocket();
@@ -191,6 +194,7 @@ describe('createResponsesWebSocketFetch', () => {
     expect(diagnostics).toContainEqual(expect.objectContaining({
       event: 'ws_response_usage',
       requestId: 'req-usage',
+      claudeSessionId: '927b8642-15d2-4535-ab27-1430ae54c4aa',
       connectionId: 1,
       generation: 'isolated',
       continued: false,
