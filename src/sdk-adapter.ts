@@ -731,12 +731,6 @@ export async function streamAnthropicResponse(
     timeout: { totalMs: SDK_TOTAL_TIMEOUT_MS, chunkMs: idleTimeoutMs },
     onError: () => {},
   } as Parameters<typeof streamText>[0]);
-  // Prevent unhandled promise rejections on stream properties:
-  Promise.resolve(result.text).catch(() => {});
-  Promise.resolve(result.toolCalls).catch(() => {});
-  Promise.resolve(result.toolResults).catch(() => {});
-  Promise.resolve(result.finishReason).catch(() => {});
-  Promise.resolve(result.usage).catch(() => {});
 
   const watchedStream = (async function* () {
     try {

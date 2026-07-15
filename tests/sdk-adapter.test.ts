@@ -504,6 +504,34 @@ describe('generateAnthropicResponse', () => {
 });
 
 describe('streamAnthropicResponse idle timeout', () => {
+  it('consumes only the stream without touching lazy aggregate getters', async () => {
+    vi.resetModules();
+    async function* stream() {
+      yield { type: 'start' };
+      yield { type: 'finish', finishReason: 'stop' };
+    }
+    const result: Record<string, unknown> = { stream: stream() };
+    for (const property of ['text', 'toolCalls', 'toolResults', 'finishReason', 'usage']) {
+      Object.defineProperty(result, property, {
+        get() { throw new Error(`unexpected ${property} getter access`); },
+      });
+    }
+    const streamText = vi.fn(() => result);
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    const { streamAnthropicResponse } = await import('../src/sdk-adapter.js');
+    await streamAnthropicResponse({} as never, { messages: [] }, 'test-model', () => {});
+    expect(streamText).toHaveBeenCalledOnce();
+
+    vi.doUnmock('ai');
+    vi.resetModules();
+  });
+
   it('aborts an upstream that never produces its first stream event', async () => {
     const hangingModel = {
       specificationVersion: 'v3' as const,

@@ -174,7 +174,7 @@ import {
   writeProxyLifecycleLog,
   writeSecureLogLine,
   zenRegistryStub
-} from "./chunk-YQNWZANM.js";
+} from "./chunk-VT5YWSMH.js";
 import {
   filterTemplates,
   init_provider_templates,
@@ -2448,18 +2448,6 @@ async function streamResponsesResponse(model, params, modelId, write, onDone, on
   );
   const result = streamText({ model, ...params, abortSignal: abort.signal, onError: () => {
   } });
-  Promise.resolve(result.text).catch(() => {
-  });
-  Promise.resolve(result.toolCalls).catch(() => {
-  });
-  Promise.resolve(result.toolResults).catch(() => {
-  });
-  Promise.resolve(result.finishReason).catch(() => {
-  });
-  Promise.resolve(result.usage).catch(() => {
-  });
-  Promise.resolve(result.response).catch(() => {
-  });
   const watchedStream = (async function* () {
     try {
       for await (const part of result.stream) {
@@ -12531,7 +12519,7 @@ Error: ${parsed.error}
       console.log("Usage: relay-ai ui [--trace]\n\nOpen the settings UI in your browser.");
       return 0;
     }
-    const { runUiCommand } = await import("./ui-command-JG7V4U2Y.js");
+    const { runUiCommand } = await import("./ui-command-RJGBE5VC.js");
     return runUiCommand({ trace: parsed.trace });
   }
   if (parsed.command === "models") {

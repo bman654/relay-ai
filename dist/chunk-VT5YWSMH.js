@@ -6730,16 +6730,6 @@ async function streamAnthropicResponse(model, params, modelId, write, log8, obse
     onError: () => {
     }
   });
-  Promise.resolve(result.text).catch(() => {
-  });
-  Promise.resolve(result.toolCalls).catch(() => {
-  });
-  Promise.resolve(result.toolResults).catch(() => {
-  });
-  Promise.resolve(result.finishReason).catch(() => {
-  });
-  Promise.resolve(result.usage).catch(() => {
-  });
   const watchedStream = (async function* () {
     try {
       for await (const part of result.stream) {
@@ -13232,4 +13222,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-YQNWZANM.js.map
+//# sourceMappingURL=chunk-VT5YWSMH.js.map

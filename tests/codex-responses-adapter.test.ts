@@ -494,6 +494,34 @@ describe('writeResponsesStream', () => {
 });
 
 describe('streamResponsesResponse idle timeout', () => {
+  it('consumes only the stream without touching lazy aggregate getters', async () => {
+    vi.resetModules();
+    async function* stream() {
+      yield { type: 'start' };
+      yield { type: 'finish', finishReason: 'stop' };
+    }
+    const result: Record<string, unknown> = { stream: stream() };
+    for (const property of ['text', 'toolCalls', 'toolResults', 'finishReason', 'usage', 'response']) {
+      Object.defineProperty(result, property, {
+        get() { throw new Error(`unexpected ${property} getter access`); },
+      });
+    }
+    const streamText = vi.fn(() => result);
+    vi.doMock('ai', () => ({
+      generateText: vi.fn(),
+      streamText,
+      tool: vi.fn((spec: unknown) => spec),
+      jsonSchema: vi.fn((schema: unknown) => schema),
+    }));
+
+    const { streamResponsesResponse } = await import('../src/codex-responses-adapter.js');
+    await streamResponsesResponse({} as never, { messages: [] }, 'test-model', () => {});
+    expect(streamText).toHaveBeenCalledOnce();
+
+    vi.doUnmock('ai');
+    vi.resetModules();
+  });
+
   it('aborts a stream whose upstream never sends a single part', async () => {
     const { streamResponsesResponse } = await import('../src/codex-responses-adapter.js');
     const chunks: string[] = [];
