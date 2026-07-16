@@ -42,3 +42,14 @@ export function estimateAnthropicInputTokens(body: object): number {
   if (!serialized || serialized === '{}') return 0;
   return Math.max(1, Math.ceil(Buffer.byteLength(serialized, 'utf8') / 4));
 }
+
+/** Anthropic-compatible message for an upstream context-length rejection. */
+export function anthropicPromptTooLongMessage(body: object, contextWindow: number): string {
+  const maximum = Math.max(1, Math.floor(contextWindow));
+  // The translated providers do not expose an exact token-count endpoint. Keep the
+  // message structurally compatible with Anthropic while ensuring the rejected
+  // prompt count is represented as larger than the advertised maximum.
+  const estimatedPromptTokens = estimateAnthropicInputTokens(body);
+  const promptTokens = Math.max(estimatedPromptTokens, maximum + 1);
+  return `prompt is too long: ${promptTokens} tokens > ${maximum} maximum`;
+}

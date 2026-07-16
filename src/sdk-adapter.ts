@@ -541,6 +541,24 @@ function streamAbortError(signal?: AbortSignal): Error {
   return error;
 }
 
+/**
+ * Forward caller cancellation into a Relay-owned controller without creating
+ * an AbortSignal.any() composite. Node 24 retains source-aborted composite
+ * signals in its internal gcPersistentSignals set when listeners remain.
+ */
+function forwardAbortSignal(source: AbortSignal | undefined, target: AbortController): () => void {
+  if (!source) return () => {};
+  const forward = () => {
+    if (!target.signal.aborted) target.abort(source.reason);
+  };
+  if (source.aborted) {
+    forward();
+    return () => {};
+  }
+  source.addEventListener('abort', forward, { once: true });
+  return () => source.removeEventListener('abort', forward);
+}
+
 export async function writeAnthropicStream(
   stream: AsyncIterable<FullStreamPart>,
   modelId: string,
@@ -717,18 +735,23 @@ export async function streamAnthropicResponse(
 ): Promise<void> {
   const idleTimeoutMs = observer?.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS;
   const idleAbort = new AbortController();
-  const abortSignal = observer?.abortSignal
-    ? AbortSignal.any([observer.abortSignal, idleAbort.signal])
-    : idleAbort.signal;
+  const stopForwardingAbort = forwardAbortSignal(observer?.abortSignal, idleAbort);
+  const abortSignal = idleAbort.signal;
   let idleTimer = setTimeout(
     () => idleAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
     idleTimeoutMs,
   );
+  const totalTimer = setTimeout(
+    () => idleAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
+    SDK_TOTAL_TIMEOUT_MS,
+  );
+  // Do not combine streamText's total/chunk timeout signals here. In AI SDK
+  // 7.0.22 that composition retains completed StreamTextResult graphs. Relay
+  // owns the timers and explicitly settles its controller after consumption.
   const result = streamText({
     model,
     ...params,
     abortSignal,
-    timeout: { totalMs: SDK_TOTAL_TIMEOUT_MS, chunkMs: idleTimeoutMs },
     onError: () => {},
   } as Parameters<typeof streamText>[0]);
 
@@ -747,7 +770,17 @@ export async function streamAnthropicResponse(
     }
   })();
 
-  await writeAnthropicStream(watchedStream, modelId, write, log, { ...observer, abortSignal });
+  try {
+    await writeAnthropicStream(watchedStream, modelId, write, log, { ...observer, abortSignal });
+  } finally {
+    stopForwardingAbort();
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    // Settle the direct Relay-owned signal only after stream consumption. Do not
+    // replace this with AbortSignal.any(): source-driven abort leaves Node's
+    // dependent composite rooted in gcPersistentSignals on Node 24.
+    if (!idleAbort.signal.aborted) idleAbort.abort();
+  }
 }
 
 export async function generateAnthropicResponse(
@@ -770,41 +803,85 @@ export async function generateAnthropicResponse(
     // Some upstreams (e.g. ChatGPT's Codex backend) reject non-streaming requests
     // outright. Request a real stream from the SDK and collect it into one
     // response instead of forwarding the client's non-streaming request upstream.
+    const forceAbort = new AbortController();
+    const stopForwardingAbort = forwardAbortSignal(options.abortSignal, forceAbort);
+    const abortSignal = forceAbort.signal;
+    const idleTimeoutMs = options.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS;
+    let idleTimer = setTimeout(
+      () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
+      idleTimeoutMs,
+    );
+    const totalTimer = setTimeout(
+      () => forceAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
+      SDK_TOTAL_TIMEOUT_MS,
+    );
+    // See the streaming path above: Relay owns these timers and explicitly
+    // settles its controller when the stream has been fully reduced.
     const r = streamText({
       model,
       ...params,
-      abortSignal: options.abortSignal,
-      timeout: {
-        totalMs: SDK_TOTAL_TIMEOUT_MS,
-        chunkMs: options.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS,
-      },
+      abortSignal,
       onError: () => {},
     } as Parameters<typeof streamText>[0]);
-    Promise.resolve(r.toolResults).catch(() => {});
-    const observeParts = (async () => {
+    const streamedText: string[] = [];
+    const streamedToolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }> = [];
+    let streamedFinishReason = 'stop';
+    let streamedUsage: SdkUsage | undefined;
+    try {
       for await (const part of r.stream as AsyncIterable<FullStreamPart>) {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(
+          () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
+          idleTimeoutMs,
+        );
         options.onPart?.(part.type);
-        if (options.abortSignal?.aborted || part.type === 'abort') {
-          throw streamAbortError(options.abortSignal);
+        if (abortSignal.aborted || part.type === 'abort') {
+          throw streamAbortError(abortSignal);
+        }
+        if (part.type === 'text-delta') streamedText.push(part.text ?? '');
+        else if (part.type === 'tool-call') {
+          streamedToolCalls.push({
+            toolCallId: part.toolCallId ?? '',
+            toolName: part.toolName ?? '',
+            input: part.input,
+          });
+        } else if (part.type === 'finish') {
+          streamedFinishReason = part.finishReason ?? streamedFinishReason;
+          streamedUsage = part.totalUsage;
         }
       }
-      if (options.abortSignal?.aborted) throw streamAbortError(options.abortSignal);
-    })();
-    [text, toolCalls, finishReason, usage] = await Promise.all([
-      r.text,
-      r.toolCalls,
-      r.finishReason,
-      r.usage,
-      observeParts,
-    ]);
+      if (abortSignal.aborted) throw streamAbortError(abortSignal);
+    } finally {
+      stopForwardingAbort();
+      clearTimeout(idleTimer);
+      clearTimeout(totalTimer);
+      // See the streaming path above: settle the Relay-owned signal after the
+      // result is fully reduced so Node can release AI SDK's listener graph.
+      if (!forceAbort.signal.aborted) forceAbort.abort();
+    }
+    text = streamedText.join('');
+    toolCalls = streamedToolCalls;
+    finishReason = streamedFinishReason;
+    usage = streamedUsage;
   } else {
-    const r = await generateText({
-      model,
-      ...params,
-      abortSignal: options?.abortSignal,
-      timeout: { totalMs: SDK_TOTAL_TIMEOUT_MS },
-    } as Parameters<typeof generateText>[0]);
-    ({ text, toolCalls, finishReason, usage } = r);
+    const generateAbort = new AbortController();
+    const stopForwardingAbort = forwardAbortSignal(options?.abortSignal, generateAbort);
+    const totalTimer = setTimeout(
+      () => generateAbort.abort(new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
+      SDK_TOTAL_TIMEOUT_MS,
+    );
+    try {
+      const r = await generateText({
+        model,
+        ...params,
+        abortSignal: generateAbort.signal,
+      } as Parameters<typeof generateText>[0]);
+      ({ text, toolCalls, finishReason, usage } = r);
+    } finally {
+      stopForwardingAbort();
+      clearTimeout(totalTimer);
+      if (!generateAbort.signal.aborted) generateAbort.abort();
+    }
   }
 
   return {

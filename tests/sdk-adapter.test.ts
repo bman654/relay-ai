@@ -393,18 +393,19 @@ describe('translateRequest', () => {
 describe('generateAnthropicResponse', () => {
   it('encodes non-streaming tool-call provider signatures for Gemini round-trip', async () => {
     vi.resetModules();
+    const generateText = vi.fn(async () => ({
+      text: '',
+      toolCalls: [{
+        toolCallId: 'call_1',
+        toolName: 'Read',
+        input: { path: 'a' },
+        providerMetadata: { google: { thoughtSignature: 'SIG' } },
+      }],
+      finishReason: 'tool-calls',
+      usage: { inputTokens: 1, outputTokens: 2 },
+    }));
     vi.doMock('ai', () => ({
-      generateText: vi.fn(async () => ({
-        text: '',
-        toolCalls: [{
-          toolCallId: 'call_1',
-          toolName: 'Read',
-          input: { path: 'a' },
-          providerMetadata: { google: { thoughtSignature: 'SIG' } },
-        }],
-        finishReason: 'tool-calls',
-        usage: { inputTokens: 1, outputTokens: 2 },
-      })),
+      generateText,
       streamText: vi.fn(),
       tool: vi.fn((spec: unknown) => spec),
       jsonSchema: vi.fn((schema: unknown) => schema),
@@ -414,6 +415,8 @@ describe('generateAnthropicResponse', () => {
     const body = await generateAnthropicResponse({} as never, { messages: [] }, 'gemini-2.5-pro');
     const toolUse = (body.content as any[]).find(item => item.type === 'tool_use');
     expect(toolUse.id).toBe('call_1__ts__U0lH');
+    expect(generateText.mock.calls[0]![0]).not.toHaveProperty('timeout');
+    expect(generateText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
 
     vi.doUnmock('ai');
     vi.resetModules();
@@ -424,16 +427,16 @@ describe('generateAnthropicResponse', () => {
     const generateText = vi.fn();
     async function* stream() {
       yield { type: 'start' };
-      yield { type: 'finish' };
+      yield { type: 'text-delta', text: 'hello' };
+      yield { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 3, outputTokens: 4 } };
     }
-    const streamText = vi.fn(() => ({
-      text: Promise.resolve('hello'),
-      toolCalls: Promise.resolve([]),
-      toolResults: Promise.resolve([]),
-      finishReason: Promise.resolve('stop'),
-      usage: Promise.resolve({ inputTokens: 3, outputTokens: 4 }),
-      stream: stream(),
-    }));
+    const result: Record<string, unknown> = { stream: stream() };
+    for (const property of ['text', 'toolCalls', 'toolResults', 'finishReason', 'usage']) {
+      Object.defineProperty(result, property, {
+        get() { throw new Error(`unexpected ${property} getter access`); },
+      });
+    }
+    const streamText = vi.fn(() => result);
     vi.doMock('ai', () => ({
       generateText,
       streamText,
@@ -443,6 +446,7 @@ describe('generateAnthropicResponse', () => {
 
     const { generateAnthropicResponse } = await import('../src/sdk-adapter.js');
     const abort = new AbortController();
+    const abortSignalAny = vi.spyOn(AbortSignal, 'any');
     const onPart = vi.fn();
     const body = await generateAnthropicResponse(
       {} as never,
@@ -452,8 +456,13 @@ describe('generateAnthropicResponse', () => {
     );
 
     expect(generateText).not.toHaveBeenCalled();
-    expect(streamText).toHaveBeenCalledWith(expect.objectContaining({ abortSignal: abort.signal }));
-    expect(onPart.mock.calls).toEqual([['start'], ['finish']]);
+    expect(streamText).toHaveBeenCalledOnce();
+    expect(streamText.mock.calls[0]![0].abortSignal).toBeInstanceOf(AbortSignal);
+    expect(streamText.mock.calls[0]![0]).not.toHaveProperty('timeout');
+    expect(abortSignalAny).not.toHaveBeenCalled();
+    expect(streamText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
+    expect(abort.signal.aborted).toBe(false);
+    expect(onPart.mock.calls).toEqual([['start'], ['text-delta'], ['finish']]);
     expect((body.content as any[])[0]).toEqual({ type: 'text', text: 'hello' });
     expect(body.usage).toEqual({
       input_tokens: 3,
@@ -461,6 +470,7 @@ describe('generateAnthropicResponse', () => {
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
     });
+    abortSignalAny.mockRestore();
 
     vi.doUnmock('ai');
     vi.resetModules();
@@ -527,6 +537,8 @@ describe('streamAnthropicResponse idle timeout', () => {
     const { streamAnthropicResponse } = await import('../src/sdk-adapter.js');
     await streamAnthropicResponse({} as never, { messages: [] }, 'test-model', () => {});
     expect(streamText).toHaveBeenCalledOnce();
+    expect(streamText.mock.calls[0]![0]).not.toHaveProperty('timeout');
+    expect(streamText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
 
     vi.doUnmock('ai');
     vi.resetModules();

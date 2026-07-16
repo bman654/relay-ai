@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { APICallError, RetryError } from 'ai';
 import {
   formatUpstreamError,
+  isContextLengthExceededError,
   sdkUpstreamErrorDetails,
   upstreamHttpStatus,
   anthropicErrorType,
@@ -36,6 +37,16 @@ describe('formatUpstreamError', () => {
     });
     expect(msg).toContain('API usage limits');
     expect(msg).toContain('HTTP 400');
+  });
+});
+
+describe('isContextLengthExceededError', () => {
+  it('recognizes OpenAI context overflow codes and messages', () => {
+    expect(isContextLengthExceededError({
+      statusCode: 400,
+      data: { error: { code: 'context_length_exceeded', message: 'Your input exceeds the context window of this model.' } },
+    })).toBe(true);
+    expect(isContextLengthExceededError({}, 'ordinary invalid request')).toBe(false);
   });
 });
 

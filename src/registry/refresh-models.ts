@@ -246,14 +246,15 @@ function parseOpenAiModelEntries(body: unknown): OpenAiModelEntry[] {
 
 /**
  * Build a CachedModel for a discovered OpenAI OAuth model. The live backend is
- * authoritative for capability flags: when the model is also seeded, live flags
- * are merged over the seed (seed acts as fallback if the backend omits a flag).
+ * authoritative for context and capability flags: when the model is also seeded,
+ * live values are merged over the seed (the seed is only a fallback).
  */
 function buildDynamicOAuthModel(entry: OpenAiModelEntry, seedById: Map<string, CachedModel>): CachedModel {
   const seed = seedById.get(entry.id);
   if (seed) {
     return {
       ...seed,
+      contextWindow: entry.context_window ?? seed.contextWindow,
       useResponsesLite: entry.useResponsesLite ?? seed.useResponsesLite,
       preferWebSockets: entry.preferWebSockets ?? seed.preferWebSockets,
     };

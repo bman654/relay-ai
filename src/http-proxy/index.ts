@@ -42,9 +42,22 @@ export function formatHttpProxyModelLines(
   aliases: LoadedHttpProxyRoutes['aliases'] = [],
 ): string[] {
   if (routes.length === 0) return ['  (no compatible favorite models)'];
+  const routesById = new Map(routes.map(route => [route.aliasId, route]));
+  const contextLabel = (contextWindow: number | undefined): string => {
+    if (!contextWindow || contextWindow <= 0) return '';
+    const scaled = contextWindow >= 1_000_000
+      ? `${Number((contextWindow / 1_000_000).toFixed(2))}M`
+      : contextWindow >= 1_000
+        ? `${Number((contextWindow / 1_000).toFixed(1))}K`
+        : String(contextWindow);
+    return ` (${scaled} context)`;
+  };
   return [
-    ...aliases.map(alias => `  ${alias.name}  ${pc.dim(`${alias.displayName} → ${alias.routeId}`)}`),
-    ...routes.map(route => `  ${route.aliasId}  ${pc.dim(route.displayName)}`),
+    ...aliases.map(alias => {
+      const route = routesById.get(alias.routeId);
+      return `  ${alias.name}  ${pc.dim(`${alias.displayName}${contextLabel(route?.contextWindow)} → ${alias.routeId}`)}`;
+    }),
+    ...routes.map(route => `  ${route.aliasId}  ${pc.dim(`${route.displayName}${contextLabel(route.contextWindow)}`)}`),
   ];
 }
 

@@ -174,7 +174,7 @@ describe('buildChildEnv', () => {
     expect(env['ANTHROPIC_MODEL']).toBe('claude-sonnet-4-6[1m]');
   });
 
-  it('appends [1m] for third-party models with >200K context', () => {
+  it('appends [1m] for third-party models with a 1M context', () => {
     const env = buildChildEnv(BACKENDS.zen.baseUrl, 'gemini-3.5-flash', 'my-key', 12345, 1_000_000);
     expect(env['ANTHROPIC_MODEL']).toBe('gemini-3.5-flash[1m]');
     expect(env['CLAUDE_CODE_MAX_CONTEXT_TOKENS']).toBe('1000000');

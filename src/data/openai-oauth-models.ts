@@ -21,6 +21,8 @@ import { deriveBrand } from '../models.js';
 interface OAuthModelSeed {
   id: string;
   name: string;
+  /** ChatGPT Codex client input window, which may differ from the public API model. */
+  contextWindow?: number;
   reasoning?: boolean;
   /** Backend capability seed — mirrors the live use_responses_lite/prefer_websockets flags. */
   useResponsesLite?: boolean;
@@ -40,16 +42,16 @@ export const CHATGPT_CODEX_UNSUPPORTED_MODELS = new Set<string>([
 // Ordered from newest to oldest within each tier.
 const OPENAI_OAUTH_MODEL_SEEDS: OAuthModelSeed[] = [
   // GPT-5.6 family (Sol / Terra / Luna)
-  { id: 'gpt-5.6-sol',          name: 'GPT-5.6 Sol',       reasoning: true },
-  { id: 'gpt-5.6-terra',        name: 'GPT-5.6 Terra',     reasoning: true },
-  { id: 'gpt-5.6-luna',         name: 'GPT-5.6 Luna',      reasoning: true, useResponsesLite: true, preferWebSockets: true },
+  { id: 'gpt-5.6-sol',          name: 'GPT-5.6 Sol',       contextWindow: 272_000, reasoning: true },
+  { id: 'gpt-5.6-terra',        name: 'GPT-5.6 Terra',     contextWindow: 272_000, reasoning: true },
+  { id: 'gpt-5.6-luna',         name: 'GPT-5.6 Luna',      contextWindow: 272_000, reasoning: true, useResponsesLite: true, preferWebSockets: true },
   // GPT-5.5 family (Pro)
-  { id: 'gpt-5.5',              name: 'GPT-5.5',           reasoning: true },
+  { id: 'gpt-5.5',              name: 'GPT-5.5',           contextWindow: 272_000, reasoning: true },
   // GPT-5.4 family
-  { id: 'gpt-5.4',              name: 'GPT-5.4' },
-  { id: 'gpt-5.4-mini',         name: 'GPT-5.4 Mini' },
+  { id: 'gpt-5.4',              name: 'GPT-5.4',           contextWindow: 272_000 },
+  { id: 'gpt-5.4-mini',         name: 'GPT-5.4 Mini',      contextWindow: 272_000 },
   // GPT-5 base (Pro / Plus)
-  { id: 'gpt-5',                name: 'GPT-5',             reasoning: true },
+  { id: 'gpt-5',                name: 'GPT-5',             contextWindow: 272_000, reasoning: true },
   // o-series reasoning (Plus+)
   { id: 'o4-mini',              name: 'o4 Mini',           reasoning: true },
   { id: 'o3',                   name: 'o3',                reasoning: true },
@@ -67,7 +69,7 @@ export function buildOpenAiOAuthModels(): CachedModel[] {
       upstreamModelId: seed.id,
       family: prefix,
       brand: deriveBrand(prefix),
-      contextWindow: resolveContextWindow(seed.id),
+      contextWindow: resolveContextWindow(seed.id, seed.contextWindow),
       modelFormat: 'openai' as const,
       npm: '@ai-sdk/openai',
       reasoning: seed.reasoning,

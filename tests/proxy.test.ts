@@ -456,6 +456,65 @@ describe('SDK translated error logging', () => {
     }
   }, 20_000);
 
+  it('translates an OpenAI context overflow into an Anthropic prompt-too-long error', async () => {
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Connection': 'close' });
+      res.end(JSON.stringify({
+        error: {
+          message: 'Your input exceeds the context window of this model. Please adjust your input and try again.',
+          type: 'invalid_request_error',
+          code: 'context_length_exceeded',
+        },
+      }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstream.once('error', reject);
+      upstream.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = upstream.address();
+    if (!address || typeof address === 'string') throw new Error('test upstream did not bind');
+
+    const route: ProxyRoute = {
+      aliasId: 'relay:test:small-context',
+      realModelId: 'small-context',
+      displayName: 'Small Context Model',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      providerId: 'test-provider',
+      contextWindow: 10,
+    };
+    const handle = await startProxyCatalog([route], route.aliasId, false);
+
+    try {
+      const res = await postToProxy(handle.port, handle.token, {
+        model: route.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'This prompt is too long.' }],
+        stream: true,
+      }, 'req-context-overflow');
+
+      expect(res.status).toBe(400);
+      const body = JSON.parse(res.body) as {
+        type: string;
+        error: { type: string; message: string };
+        request_id: string;
+      };
+      expect(body).toMatchObject({
+        type: 'error',
+        error: { type: 'invalid_request_error' },
+        request_id: 'req-context-overflow',
+      });
+      expect(body.error.message).toMatch(/^prompt is too long: \d+ tokens > 10 maximum$/);
+    } finally {
+      handle.close();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+  }, 20_000);
+
   it('logs SDK input and translated output through successful stream completion', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'relay-ai-sdk-success-'));
     const inferenceLogPath = join(dir, 'inference.jsonl');

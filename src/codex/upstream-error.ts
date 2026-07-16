@@ -6,7 +6,7 @@ interface ApiCallLike {
   message?: string;
   statusCode?: number;
   responseBody?: string;
-  data?: { error?: { message?: string; type?: string } };
+  data?: { error?: { message?: string; type?: string; code?: string } };
   lastError?: { message?: string; statusCode?: number };
   errors?: Array<{ message?: string; statusCode?: number }>;
 }
@@ -39,6 +39,29 @@ export function sdkUpstreamErrorDetails(err: unknown): SdkUpstreamErrorDetails |
     isRetryable: inner.isRetryable,
     attemptCount: retry?.errors.length ?? 1,
   };
+}
+
+/** True when an upstream SDK/provider error says the model context was exceeded. */
+export function isContextLengthExceededError(err: unknown, formattedMessage = ''): boolean {
+  const details = sdkUpstreamErrorDetails(err);
+  const rec = err && typeof err === 'object' ? err as ApiCallLike : undefined;
+  const candidates = [
+    formattedMessage,
+    details?.errorContent,
+    rec?.message,
+    rec?.responseBody,
+    rec?.data?.error?.code,
+    rec?.data?.error?.type,
+    rec?.data?.error?.message,
+    rec?.lastError?.message,
+    ...(rec?.errors?.map(error => error.message) ?? []),
+  ].filter((value): value is string => typeof value === 'string');
+  return candidates.some(value => (
+    /context_length_exceeded/i.test(value)
+    || /context window/i.test(value)
+    || /maximum context length/i.test(value)
+    || /prompt is too long/i.test(value)
+  ));
 }
 
 export function formatUpstreamError(err: unknown): string {

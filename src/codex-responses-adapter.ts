@@ -879,9 +879,17 @@ export async function streamResponsesResponse(
     }
   })();
 
-  await writeResponsesStream(watchedStream, modelId, write, onDone, onProgress, {
-    onForceStop: reason => abort.abort(new Error(reason)),
-  });
+  try {
+    await writeResponsesStream(watchedStream, modelId, write, onDone, onProgress, {
+      onForceStop: reason => abort.abort(new Error(reason)),
+    });
+  } finally {
+    clearTimeout(idleTimer);
+    // AI SDK attaches cleanup listeners to the supplied signal. Node roots live
+    // signals with listeners in `gcPersistentSignals`, so settle our internal
+    // controller after consumption instead of leaving completed requests pinned.
+    if (!abort.signal.aborted) abort.abort();
+  }
 }
 
 export async function generateResponsesResponse(

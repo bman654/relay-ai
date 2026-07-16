@@ -2882,13 +2882,14 @@ function resolveContextWindow(modelId, explicit) {
 
 // src/context-model-id.ts
 var ONE_M_CONTEXT_SUFFIX = "[1m]";
+var ONE_M_CONTEXT_WINDOW = 1e6;
 function stripOneMContextSuffix(modelId) {
   return modelId.replace(/\[1m\]$/i, "");
 }
 function claudeCodeClientModelId(modelId, contextWindow) {
   const bare = stripOneMContextSuffix(modelId);
   const window = resolveContextWindow(bare, contextWindow);
-  if (window > DEFAULT_CONTEXT_WINDOW) {
+  if (window >= ONE_M_CONTEXT_WINDOW) {
     return `${bare}${ONE_M_CONTEXT_SUFFIX}`;
   }
   return bare;
@@ -6186,6 +6187,22 @@ function sdkUpstreamErrorDetails(err) {
     attemptCount: retry?.errors.length ?? 1
   };
 }
+function isContextLengthExceededError(err, formattedMessage = "") {
+  const details = sdkUpstreamErrorDetails(err);
+  const rec = err && typeof err === "object" ? err : void 0;
+  const candidates = [
+    formattedMessage,
+    details?.errorContent,
+    rec?.message,
+    rec?.responseBody,
+    rec?.data?.error?.code,
+    rec?.data?.error?.type,
+    rec?.data?.error?.message,
+    rec?.lastError?.message,
+    ...rec?.errors?.map((error) => error.message) ?? []
+  ].filter((value) => typeof value === "string");
+  return candidates.some((value) => /context_length_exceeded/i.test(value) || /context window/i.test(value) || /maximum context length/i.test(value) || /prompt is too long/i.test(value));
+}
 function formatUpstreamError(err) {
   if (!err || typeof err !== "object") return "Upstream model request failed.";
   const rec = err;
@@ -6550,6 +6567,20 @@ function streamAbortError(signal) {
   error.name = "AbortError";
   return error;
 }
+function forwardAbortSignal(source, target) {
+  if (!source) return () => {
+  };
+  const forward = () => {
+    if (!target.signal.aborted) target.abort(source.reason);
+  };
+  if (source.aborted) {
+    forward();
+    return () => {
+    };
+  }
+  source.addEventListener("abort", forward, { once: true });
+  return () => source.removeEventListener("abort", forward);
+}
 async function writeAnthropicStream(stream, modelId, write, log8, observer) {
   const messageId = "msg_" + Date.now();
   let blockIndex = -1;
@@ -6717,16 +6748,20 @@ async function writeAnthropicStream(stream, modelId, write, log8, observer) {
 async function streamAnthropicResponse(model, params, modelId, write, log8, observer) {
   const idleTimeoutMs = observer?.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS;
   const idleAbort = new AbortController();
-  const abortSignal = observer?.abortSignal ? AbortSignal.any([observer.abortSignal, idleAbort.signal]) : idleAbort.signal;
+  const stopForwardingAbort = forwardAbortSignal(observer?.abortSignal, idleAbort);
+  const abortSignal = idleAbort.signal;
   let idleTimer = setTimeout(
     () => idleAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1e3)}s`)),
     idleTimeoutMs
+  );
+  const totalTimer = setTimeout(
+    () => idleAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1e3)}s`)),
+    SDK_TOTAL_TIMEOUT_MS
   );
   const result = streamText({
     model,
     ...params,
     abortSignal,
-    timeout: { totalMs: SDK_TOTAL_TIMEOUT_MS, chunkMs: idleTimeoutMs },
     onError: () => {
     }
   });
@@ -6744,7 +6779,14 @@ async function streamAnthropicResponse(model, params, modelId, write, log8, obse
       clearTimeout(idleTimer);
     }
   })();
-  await writeAnthropicStream(watchedStream, modelId, write, log8, { ...observer, abortSignal });
+  try {
+    await writeAnthropicStream(watchedStream, modelId, write, log8, { ...observer, abortSignal });
+  } finally {
+    stopForwardingAbort();
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    if (!idleAbort.signal.aborted) idleAbort.abort();
+  }
 }
 async function generateAnthropicResponse(model, params, modelId, options) {
   let text4;
@@ -6752,43 +6794,82 @@ async function generateAnthropicResponse(model, params, modelId, options) {
   let finishReason;
   let usage;
   if (options?.forceStream) {
+    const forceAbort = new AbortController();
+    const stopForwardingAbort = forwardAbortSignal(options.abortSignal, forceAbort);
+    const abortSignal = forceAbort.signal;
+    const idleTimeoutMs = options.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS;
+    let idleTimer = setTimeout(
+      () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1e3)}s`)),
+      idleTimeoutMs
+    );
+    const totalTimer = setTimeout(
+      () => forceAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1e3)}s`)),
+      SDK_TOTAL_TIMEOUT_MS
+    );
     const r = streamText({
       model,
       ...params,
-      abortSignal: options.abortSignal,
-      timeout: {
-        totalMs: SDK_TOTAL_TIMEOUT_MS,
-        chunkMs: options.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS
-      },
+      abortSignal,
       onError: () => {
       }
     });
-    Promise.resolve(r.toolResults).catch(() => {
-    });
-    const observeParts = (async () => {
+    const streamedText = [];
+    const streamedToolCalls = [];
+    let streamedFinishReason = "stop";
+    let streamedUsage;
+    try {
       for await (const part of r.stream) {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(
+          () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1e3)}s`)),
+          idleTimeoutMs
+        );
         options.onPart?.(part.type);
-        if (options.abortSignal?.aborted || part.type === "abort") {
-          throw streamAbortError(options.abortSignal);
+        if (abortSignal.aborted || part.type === "abort") {
+          throw streamAbortError(abortSignal);
+        }
+        if (part.type === "text-delta") streamedText.push(part.text ?? "");
+        else if (part.type === "tool-call") {
+          streamedToolCalls.push({
+            toolCallId: part.toolCallId ?? "",
+            toolName: part.toolName ?? "",
+            input: part.input
+          });
+        } else if (part.type === "finish") {
+          streamedFinishReason = part.finishReason ?? streamedFinishReason;
+          streamedUsage = part.totalUsage;
         }
       }
-      if (options.abortSignal?.aborted) throw streamAbortError(options.abortSignal);
-    })();
-    [text4, toolCalls, finishReason, usage] = await Promise.all([
-      r.text,
-      r.toolCalls,
-      r.finishReason,
-      r.usage,
-      observeParts
-    ]);
+      if (abortSignal.aborted) throw streamAbortError(abortSignal);
+    } finally {
+      stopForwardingAbort();
+      clearTimeout(idleTimer);
+      clearTimeout(totalTimer);
+      if (!forceAbort.signal.aborted) forceAbort.abort();
+    }
+    text4 = streamedText.join("");
+    toolCalls = streamedToolCalls;
+    finishReason = streamedFinishReason;
+    usage = streamedUsage;
   } else {
-    const r = await generateText({
-      model,
-      ...params,
-      abortSignal: options?.abortSignal,
-      timeout: { totalMs: SDK_TOTAL_TIMEOUT_MS }
-    });
-    ({ text: text4, toolCalls, finishReason, usage } = r);
+    const generateAbort = new AbortController();
+    const stopForwardingAbort = forwardAbortSignal(options?.abortSignal, generateAbort);
+    const totalTimer = setTimeout(
+      () => generateAbort.abort(new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1e3)}s`)),
+      SDK_TOTAL_TIMEOUT_MS
+    );
+    try {
+      const r = await generateText({
+        model,
+        ...params,
+        abortSignal: generateAbort.signal
+      });
+      ({ text: text4, toolCalls, finishReason, usage } = r);
+    } finally {
+      stopForwardingAbort();
+      clearTimeout(totalTimer);
+      if (!generateAbort.signal.aborted) generateAbort.abort();
+    }
   }
   return {
     id: "msg_" + Date.now(),
@@ -6841,6 +6922,12 @@ function estimateAnthropicInputTokens(body) {
   const serialized = JSON.stringify(contextBody);
   if (!serialized || serialized === "{}") return 0;
   return Math.max(1, Math.ceil(Buffer.byteLength(serialized, "utf8") / 4));
+}
+function anthropicPromptTooLongMessage(body, contextWindow) {
+  const maximum = Math.max(1, Math.floor(contextWindow));
+  const estimatedPromptTokens = estimateAnthropicInputTokens(body);
+  const promptTokens = Math.max(estimatedPromptTokens, maximum + 1);
+  return `prompt is too long: ${promptTokens} tokens > ${maximum} maximum`;
 }
 
 // src/proxy.ts
@@ -6951,10 +7038,11 @@ function makeProxyLog(debug, logPath) {
     appendSecureLog(path, line);
   };
 }
-function anthropicError(res, status, message) {
+function anthropicError(res, status, message, requestId) {
   sendJson(res, status, {
     type: "error",
-    error: { type: anthropicErrorType(status), message }
+    error: { type: anthropicErrorType(status), message },
+    ...requestId ? { request_id: requestId } : {}
   });
 }
 function aliasModelId(realId, providerId) {
@@ -7241,6 +7329,11 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
           const message = formatUpstreamError(err);
           const details = sdkUpstreamErrorDetails(err);
           const upstreamStatus = details?.statusCode ?? upstreamHttpStatus(err, message);
+          const contextLengthExceeded = upstreamStatus === 400 && isContextLengthExceededError(err, message);
+          const clientMessage = contextLengthExceeded ? anthropicPromptTooLongMessage(
+            anthropicBody,
+            resolveContextWindow(route.realModelId, route.contextWindow)
+          ) : message;
           plog(() => `sdk error: ${message}${details?.errorContent ? ` \u2014 body: ${details.errorContent}` : ""}`);
           if (inferenceLogPath && upstreamStatus >= 400) {
             writeInferenceResponseErrorLog(inferenceLogPath, {
@@ -7255,11 +7348,20 @@ function startProxyCatalog(routes, defaultAliasId, debug = false, inferenceLogPa
             });
           }
           if (!res.headersSent) {
-            anthropicError(res, upstreamStatus === 500 ? 502 : upstreamStatus, message);
+            anthropicError(
+              res,
+              upstreamStatus === 500 ? 502 : upstreamStatus,
+              clientMessage,
+              contextLengthExceeded ? relayRequestId ?? randomUUID5() : void 0
+            );
           } else {
             const errorType = anthropicErrorType(upstreamStatus);
             res.write(`event: error
-data: ${JSON.stringify({ type: "error", error: { type: errorType, message } })}
+data: ${JSON.stringify({
+              type: "error",
+              error: { type: errorType, message: clientMessage },
+              ...contextLengthExceeded ? { request_id: relayRequestId ?? randomUUID5() } : {}
+            })}
 
 `);
             res.end();
@@ -9351,16 +9453,29 @@ async function startHttpProxy(options) {
       return;
     }
     const upstream = net.connect(target.port, target.host);
+    let tunnelEstablished = false;
     sockets.add(upstream);
-    upstream.once("close", () => sockets.delete(upstream));
+    clientSocket.once("close", () => {
+      if (!upstream.destroyed) upstream.destroy();
+    });
+    upstream.once("close", () => {
+      sockets.delete(upstream);
+      if (tunnelEstablished && !clientSocket.destroyed) clientSocket.destroy();
+    });
     upstream.once("connect", () => {
+      tunnelEstablished = true;
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) upstream.write(head);
       clientSocket.pipe(upstream);
       upstream.pipe(clientSocket);
     });
     upstream.once("error", () => {
-      if (!clientSocket.destroyed) clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      if (clientSocket.destroyed) return;
+      if (tunnelEstablished) {
+        clientSocket.destroy();
+        return;
+      }
+      clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n", () => clientSocket.destroy());
     });
   });
   try {
@@ -9425,9 +9540,18 @@ async function loadHttpProxyRoutes() {
 }
 function formatHttpProxyModelLines(routes, aliases = []) {
   if (routes.length === 0) return ["  (no compatible favorite models)"];
+  const routesById = new Map(routes.map((route) => [route.aliasId, route]));
+  const contextLabel = (contextWindow) => {
+    if (!contextWindow || contextWindow <= 0) return "";
+    const scaled = contextWindow >= 1e6 ? `${Number((contextWindow / 1e6).toFixed(2))}M` : contextWindow >= 1e3 ? `${Number((contextWindow / 1e3).toFixed(1))}K` : String(contextWindow);
+    return ` (${scaled} context)`;
+  };
   return [
-    ...aliases.map((alias) => `  ${alias.name}  ${pc3.dim(`${alias.displayName} \u2192 ${alias.routeId}`)}`),
-    ...routes.map((route) => `  ${route.aliasId}  ${pc3.dim(route.displayName)}`)
+    ...aliases.map((alias) => {
+      const route = routesById.get(alias.routeId);
+      return `  ${alias.name}  ${pc3.dim(`${alias.displayName}${contextLabel(route?.contextWindow)} \u2192 ${alias.routeId}`)}`;
+    }),
+    ...routes.map((route) => `  ${route.aliasId}  ${pc3.dim(`${route.displayName}${contextLabel(route.contextWindow)}`)}`)
   ];
 }
 function printHttpProxyModels(routes, aliases = []) {
@@ -10029,13 +10153,30 @@ async function handleAnthropicMessages(req, res, options, modelCache, plog) {
     } catch (err) {
       const message = formatUpstreamError(err);
       const status = auditSdkError(options, body.model, model, err, message);
+      const contextLengthExceeded = status === 400 && isContextLengthExceededError(err, message);
+      const clientMessage = contextLengthExceeded ? anthropicPromptTooLongMessage(
+        body,
+        resolveContextWindow(upstreamModelId(model), model.contextWindow)
+      ) : message;
       plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
       if (!res.headersSent) {
-        sendJson(res, status === 500 ? 502 : status, { error: { message } });
+        if (contextLengthExceeded) {
+          sendJson(res, 400, {
+            type: "error",
+            error: { type: "invalid_request_error", message: clientMessage },
+            request_id: requestId
+          });
+        } else {
+          sendJson(res, status === 500 ? 502 : status, { error: { message: clientMessage } });
+        }
       } else {
         const errorType = anthropicErrorType(status);
         res.write(`event: error
-data: ${JSON.stringify({ type: "error", error: { type: errorType, message } })}
+data: ${JSON.stringify({
+          type: "error",
+          error: { type: errorType, message: clientMessage },
+          ...contextLengthExceeded ? { request_id: requestId } : {}
+        })}
 
 `);
         res.end();
@@ -11710,16 +11851,16 @@ var CHATGPT_CODEX_UNSUPPORTED_MODELS = /* @__PURE__ */ new Set([
 ]);
 var OPENAI_OAUTH_MODEL_SEEDS = [
   // GPT-5.6 family (Sol / Terra / Luna)
-  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", reasoning: true },
-  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", reasoning: true },
-  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", reasoning: true, useResponsesLite: true, preferWebSockets: true },
+  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", contextWindow: 272e3, reasoning: true },
+  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", contextWindow: 272e3, reasoning: true },
+  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", contextWindow: 272e3, reasoning: true, useResponsesLite: true, preferWebSockets: true },
   // GPT-5.5 family (Pro)
-  { id: "gpt-5.5", name: "GPT-5.5", reasoning: true },
+  { id: "gpt-5.5", name: "GPT-5.5", contextWindow: 272e3, reasoning: true },
   // GPT-5.4 family
-  { id: "gpt-5.4", name: "GPT-5.4" },
-  { id: "gpt-5.4-mini", name: "GPT-5.4 Mini" },
+  { id: "gpt-5.4", name: "GPT-5.4", contextWindow: 272e3 },
+  { id: "gpt-5.4-mini", name: "GPT-5.4 Mini", contextWindow: 272e3 },
   // GPT-5 base (Pro / Plus)
-  { id: "gpt-5", name: "GPT-5", reasoning: true },
+  { id: "gpt-5", name: "GPT-5", contextWindow: 272e3, reasoning: true },
   // o-series reasoning (Plus+)
   { id: "o4-mini", name: "o4 Mini", reasoning: true },
   { id: "o3", name: "o3", reasoning: true },
@@ -11736,7 +11877,7 @@ function buildOpenAiOAuthModels() {
       upstreamModelId: seed.id,
       family: prefix,
       brand: deriveBrand(prefix),
-      contextWindow: resolveContextWindow(seed.id),
+      contextWindow: resolveContextWindow(seed.id, seed.contextWindow),
       modelFormat: "openai",
       npm: "@ai-sdk/openai",
       reasoning: seed.reasoning,
@@ -11902,6 +12043,7 @@ function buildDynamicOAuthModel(entry, seedById) {
   if (seed) {
     return {
       ...seed,
+      contextWindow: entry.context_window ?? seed.contextWindow,
       useResponsesLite: entry.useResponsesLite ?? seed.useResponsesLite,
       preferWebSockets: entry.preferWebSockets ?? seed.preferWebSockets
     };
@@ -13222,4 +13364,4 @@ export {
   quitClaudeAppGracefully,
   launchOrRestartClaudeApp
 };
-//# sourceMappingURL=chunk-VT5YWSMH.js.map
+//# sourceMappingURL=chunk-K634BCLH.js.map

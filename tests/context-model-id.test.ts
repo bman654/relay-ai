@@ -6,8 +6,13 @@ import {
 } from '../src/context-model-id.js';
 
 describe('claudeCodeClientModelId', () => {
-  it('appends [1m] when context exceeds 200K', () => {
+  it('appends [1m] for a genuine 1M context', () => {
     expect(claudeCodeClientModelId('gemini-3.5-flash', 1_000_000)).toBe('gemini-3.5-flash[1m]');
+  });
+
+  it('does not mislabel intermediate context sizes as 1M', () => {
+    expect(claudeCodeClientModelId('gpt-5.6-sol', 272_000)).toBe('gpt-5.6-sol');
+    expect(claudeCodeClientModelId('custom-model', 999_999)).toBe('custom-model');
   });
 
   it('leaves 200K models unchanged', () => {

@@ -37,11 +37,17 @@ import {
 import {
   anthropicErrorType,
   formatUpstreamError,
+  isContextLengthExceededError,
   sdkUpstreamErrorDetails,
   upstreamHttpStatus,
 } from './codex/upstream-error.js';
-import { anthropicMessagesEndpoint, estimateAnthropicInputTokens } from './anthropic-endpoints.js';
+import {
+  anthropicMessagesEndpoint,
+  anthropicPromptTooLongMessage,
+  estimateAnthropicInputTokens,
+} from './anthropic-endpoints.js';
 import { withResponsesWebSocketDiagnosticContext } from './oauth/responses-websocket.js';
+import { resolveContextWindow } from './context-window.js';
 
 type ProxyLog = (message: string | (() => string)) => void;
 
@@ -168,10 +174,11 @@ function makeProxyLog(debug: boolean, logPath?: string): ProxyLog {
 
 // ── HTTP server ─────────────────────────────────────────────────────
 
-function anthropicError(res: ServerResponse, status: number, message: string) {
+function anthropicError(res: ServerResponse, status: number, message: string, requestId?: string) {
   sendJson(res, status, {
     type: 'error',
     error: { type: anthropicErrorType(status), message },
+    ...(requestId ? { request_id: requestId } : {}),
   });
 }
 
@@ -558,6 +565,14 @@ export function startProxyCatalog(
           const message = formatUpstreamError(err);
           const details = sdkUpstreamErrorDetails(err);
           const upstreamStatus = details?.statusCode ?? upstreamHttpStatus(err, message);
+          const contextLengthExceeded = upstreamStatus === 400
+            && isContextLengthExceededError(err, message);
+          const clientMessage = contextLengthExceeded
+            ? anthropicPromptTooLongMessage(
+                anthropicBody,
+                resolveContextWindow(route.realModelId, route.contextWindow),
+              )
+            : message;
           plog(() => `sdk error: ${message}${details?.errorContent ? ` — body: ${details.errorContent}` : ''}`);
           if (inferenceLogPath && upstreamStatus >= 400) {
             writeInferenceResponseErrorLog(inferenceLogPath, {
@@ -572,10 +587,19 @@ export function startProxyCatalog(
             });
           }
           if (!res.headersSent) {
-            anthropicError(res, upstreamStatus === 500 ? 502 : upstreamStatus, message);
+            anthropicError(
+              res,
+              upstreamStatus === 500 ? 502 : upstreamStatus,
+              clientMessage,
+              contextLengthExceeded ? (relayRequestId ?? randomUUID()) : undefined,
+            );
           } else {
             const errorType = anthropicErrorType(upstreamStatus);
-            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: errorType, message } })}\n\n`);
+            res.write(`event: error\ndata: ${JSON.stringify({
+              type: 'error',
+              error: { type: errorType, message: clientMessage },
+              ...(contextLengthExceeded ? { request_id: relayRequestId ?? randomUUID() } : {}),
+            })}\n\n`);
             res.end();
           }
         }

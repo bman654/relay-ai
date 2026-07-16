@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createGatewayModelCatalog, type ServerModelInfo } from '../src/server/models.js';
 import { startServer, type ServerHandle } from '../src/server/router.js';
 import { createLanguageModel } from '../src/provider-factory.js';
+import { generateAnthropicResponse } from '../src/sdk-adapter.js';
 
 vi.mock('../src/provider-factory.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/provider-factory.js')>();
@@ -290,6 +291,51 @@ describe('server router', () => {
     expect(await response.json()).toMatchObject({
       error: { message: expect.stringContaining('No SDK provider') },
     });
+  });
+
+  it('returns Anthropic prompt-too-long shape for a translated context overflow', async () => {
+    const contextCatalog = createGatewayModelCatalog([{
+      id: 'small-context',
+      name: 'Small Context',
+      isFree: false,
+      brand: 'Test',
+      providerId: 'test-provider',
+      sourceBackend: 'test-provider',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai',
+      apiKey: 'provider-key',
+      contextWindow: 10,
+    }]);
+    vi.mocked(generateAnthropicResponse).mockRejectedValueOnce({
+      statusCode: 400,
+      data: {
+        error: {
+          code: 'context_length_exceeded',
+          message: 'Your input exceeds the context window of this model.',
+        },
+      },
+    });
+    const server = await startTestServer({ catalog: contextCatalog });
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'anthropic-test-provider__small-context',
+        messages: [{ role: 'user', content: 'This prompt is too long.' }],
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    const body = await response.json() as {
+      type: string;
+      error: { type: string; message: string };
+      request_id: string;
+    };
+    expect(body.type).toBe('error');
+    expect(body.error.type).toBe('invalid_request_error');
+    expect(body.error.message).toMatch(/^prompt is too long: \d+ tokens > 10 maximum$/);
+    expect(body.request_id).toEqual(expect.any(String));
   });
 
   it('forwards OpenAI chat completions for OpenAI-format models unchanged', async () => {

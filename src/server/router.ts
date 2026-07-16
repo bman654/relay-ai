@@ -20,7 +20,10 @@ import {
 } from '../openai-adapter.js';
 import { sendJson, readBody } from '../http-utils.js';
 import { relayAnthropicMessages } from '../upstream-forward.js';
-import { estimateAnthropicInputTokens } from '../anthropic-endpoints.js';
+import {
+  anthropicPromptTooLongMessage,
+  estimateAnthropicInputTokens,
+} from '../anthropic-endpoints.js';
 import { resolveProviderCredential } from '../env.js';
 import { oauthAuthRef } from '../registry/import-build.js';
 import {
@@ -43,9 +46,11 @@ import { createLanguageModel, isSdkMigratedNpm, maxToolsForNpm } from '../provid
 import {
   anthropicErrorType,
   formatUpstreamError,
+  isContextLengthExceededError,
   sdkUpstreamErrorDetails,
   upstreamHttpStatus,
 } from '../codex/upstream-error.js';
+import { resolveContextWindow } from '../context-window.js';
 import {
   translateRequest as sdkTranslateRequest,
   streamAnthropicResponse,
@@ -403,12 +408,32 @@ async function handleAnthropicMessages(
     } catch (err) {
       const message = formatUpstreamError(err);
       const status = auditSdkError(options, body.model, model, err, message);
+      const contextLengthExceeded = status === 400
+        && isContextLengthExceededError(err, message);
+      const clientMessage = contextLengthExceeded
+        ? anthropicPromptTooLongMessage(
+            body,
+            resolveContextWindow(upstreamModelId(model), model.contextWindow),
+          )
+        : message;
       plog(`sdk error npm=${model.npm} upstream=${upstreamModelId(model)}: ${message}`);
       if (!res.headersSent) {
-        sendJson(res, status === 500 ? 502 : status, { error: { message } });
+        if (contextLengthExceeded) {
+          sendJson(res, 400, {
+            type: 'error',
+            error: { type: 'invalid_request_error', message: clientMessage },
+            request_id: requestId,
+          });
+        } else {
+          sendJson(res, status === 500 ? 502 : status, { error: { message: clientMessage } });
+        }
       } else {
         const errorType = anthropicErrorType(status);
-        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: errorType, message } })}\n\n`);
+        res.write(`event: error\ndata: ${JSON.stringify({
+          type: 'error',
+          error: { type: errorType, message: clientMessage },
+          ...(contextLengthExceeded ? { request_id: requestId } : {}),
+        })}\n\n`);
         res.end();
       }
     }

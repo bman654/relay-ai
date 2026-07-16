@@ -517,6 +517,7 @@ describe('streamResponsesResponse idle timeout', () => {
     const { streamResponsesResponse } = await import('../src/codex-responses-adapter.js');
     await streamResponsesResponse({} as never, { messages: [] }, 'test-model', () => {});
     expect(streamText).toHaveBeenCalledOnce();
+    expect(streamText.mock.calls[0]![0].abortSignal.aborted).toBe(true);
 
     vi.doUnmock('ai');
     vi.resetModules();

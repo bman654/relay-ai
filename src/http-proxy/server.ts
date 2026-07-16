@@ -827,16 +827,32 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
       return;
     }
     const upstream = net.connect(target.port, target.host);
+    let tunnelEstablished = false;
     sockets.add(upstream);
-    upstream.once('close', () => sockets.delete(upstream));
+    clientSocket.once('close', () => {
+      if (!upstream.destroyed) upstream.destroy();
+    });
+    upstream.once('close', () => {
+      sockets.delete(upstream);
+      // stream.pipe() ends only the writable half of its destination. Some
+      // CONNECT clients allow half-open sockets, so an upstream close would
+      // otherwise leave the client socket (and its TLS buffers) retained.
+      if (tunnelEstablished && !clientSocket.destroyed) clientSocket.destroy();
+    });
     upstream.once('connect', () => {
+      tunnelEstablished = true;
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head.length > 0) upstream.write(head);
       clientSocket.pipe(upstream);
       upstream.pipe(clientSocket);
     });
     upstream.once('error', () => {
-      if (!clientSocket.destroyed) clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      if (clientSocket.destroyed) return;
+      if (tunnelEstablished) {
+        clientSocket.destroy();
+        return;
+      }
+      clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n', () => clientSocket.destroy());
     });
   });
 

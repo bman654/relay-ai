@@ -42,6 +42,16 @@ async function connectMitm(proxyPort: number, ca: string): Promise<tls.TLSSocket
   return secure;
 }
 
+function activeProxySockets(proxyPort: number): net.Socket[] {
+  const getActiveHandles = (process as typeof process & {
+    _getActiveHandles(): unknown[];
+  })._getActiveHandles;
+  return getActiveHandles.call(process).filter((handle): handle is net.Socket =>
+    handle instanceof net.Socket
+    && handle.localPort === proxyPort
+    && !handle.destroyed);
+}
+
 beforeAll(() => {
   process.env['RELAY_AI_HOME'] = testHome;
 });
@@ -70,6 +80,35 @@ describe('selective HTTP proxy', () => {
     expect(shouldInterceptConnect('api.anthropic.com:8443')).toBe(false);
     expect(shouldInterceptConnect('statsig.anthropic.com:443')).toBe(false);
     expect(shouldInterceptConnect('example.com:443')).toBe(false);
+  });
+
+  it('releases both sides of a passthrough CONNECT tunnel when upstream closes', async () => {
+    const upstream = net.createServer(socket => socket.end());
+    const upstreamPort = await listen(upstream);
+    const proxy = await startHttpProxy({ routes: [] });
+    const clients: net.Socket[] = [];
+
+    try {
+      for (let index = 0; index < 25; index += 1) {
+        const client = net.connect({
+          host: '127.0.0.1',
+          port: proxy.port,
+          allowHalfOpen: true,
+        });
+        clients.push(client);
+        await once(client, 'connect');
+        client.resume();
+        client.write(`CONNECT 127.0.0.1:${upstreamPort} HTTP/1.1\r\nHost: 127.0.0.1:${upstreamPort}\r\n\r\n`);
+        await once(client, 'end');
+      }
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(activeProxySockets(proxy.port)).toHaveLength(0);
+    } finally {
+      for (const client of clients) client.destroy();
+      await proxy.close();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
   });
 
   it('forwards first-party request bytes and auth unchanged', async () => {

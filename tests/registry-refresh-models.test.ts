@@ -205,8 +205,8 @@ describe('registry/refresh-models', () => {
         ok: true,
         json: async () => ({
           models: [
-            { slug: 'gpt-5.6-luna', title: 'GPT-5.6 Luna', use_responses_lite: true, prefer_websockets: true },
-            { slug: 'gpt-5.6-sol', title: 'GPT-5.6 Sol' },
+            { slug: 'gpt-5.6-luna', title: 'GPT-5.6 Luna', context_window: 272_000, use_responses_lite: true, prefer_websockets: true },
+            { slug: 'gpt-5.6-sol', title: 'GPT-5.6 Sol', context_window: 272_000 },
           ],
         }),
       } as Response);
@@ -219,6 +219,8 @@ describe('registry/refresh-models', () => {
       const sol = models.find(m => m.id === 'gpt-5.6-sol');
       expect(luna?.useResponsesLite).toBe(true);
       expect(luna?.preferWebSockets).toBe(true);
+      expect(luna?.contextWindow).toBe(272_000);
+      expect(sol?.contextWindow).toBe(272_000);
       // A model the backend does not flag stays on the HTTP path.
       expect(sol?.useResponsesLite).toBeUndefined();
       expect(sol?.preferWebSockets).toBeUndefined();
@@ -246,6 +248,7 @@ describe('registry/refresh-models', () => {
 
       const savedRegistry = vi.mocked(io.saveRegistry).mock.calls[0]?.[0] as ProviderRegistry;
       const luna = savedRegistry.providers[0]?.modelsCache?.models.find(m => m.id === 'gpt-5.6-luna');
+      expect(luna?.contextWindow).toBe(272_000);
       expect(luna?.useResponsesLite).toBe(true);
       expect(luna?.preferWebSockets).toBe(true);
     });
